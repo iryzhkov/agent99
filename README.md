@@ -9,6 +9,9 @@ hierarchy, code actions, and the unsaved state of your buffers — so it can
 explore the codebase the same way you do, with a warm index and no extra
 language-server processes.
 
+![The agent panel: tool activity streams while the agent explores, and the
+code window follows what it reads](doc/panel-chat-working.png)
+
 
 ## How it works
 
@@ -130,6 +133,9 @@ The primary interface: a vertical split on the right with a scrolling
 conversation pane above a prompt buffer, while the window you started from
 stays on the left as the code window.
 
+![A finished answer in the panel, with file:line citations and the cost
+line](doc/panel-chat.png)
+
 - `<leader>99` toggles the panel; `<CR>` in the prompt (or `<C-s>` in insert
   mode) sends; `i` in the conversation pane jumps to the prompt; `q` hides
   the panel without losing anything.
@@ -154,6 +160,12 @@ stays on the left as the code window.
 - Chat mode needs the openai provider (transcript continuity).
 
 ### Region flows
+
+![While the request runs, the selected region is highlighted with a working
+marker](doc/edit-working.png)
+
+![The proposal opens in a preview split: apply with CR, discard with
+q](doc/edit-preview.png)
 
 - Visually select lines, press `<leader>9v`, type an instruction. The whole
   region is highlighted (`Agent99Working`, links to `Visual`) with an
