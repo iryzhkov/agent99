@@ -1,0 +1,51 @@
+-- Ledger of buffer edits made by the agent's symbol-edit tools during one
+-- request. lsp.lua records into it; init.lua takes the list when the request
+-- finishes (for the summary notification) and keeps it for :Agent99Revert.
+-- Everything lives in editor buffers (unsaved), so reverting is just
+-- restoring the recorded lines in reverse order.
+
+local M = {}
+
+local current = {}
+
+--- Record one applied edit.
+--- entry = { file, bufnr, name_path, kind, first, last, old_lines, new_count }
+function M.record(entry)
+    current[#current + 1] = entry
+    -- Live UI: show the edit in the code window as it happens.
+    pcall(function()
+        require("agent99.ui").on_edit(entry)
+    end)
+end
+
+--- Number of edits recorded for the running request.
+function M.count()
+    return #current
+end
+
+--- Return the recorded edits and start a fresh ledger.
+function M.take()
+    local out = current
+    current = {}
+    return out
+end
+
+--- Undo a list of edits (as returned by take), newest first. Each entry's
+--- coordinates were valid when it was applied, so reverse order restores
+--- the original state as long as the user has not edited in between.
+function M.revert(edits)
+    local reverted = 0
+    for i = #edits, 1, -1 do
+        local e = edits[i]
+        if e.bufnr and vim.api.nvim_buf_is_valid(e.bufnr) then
+            local ok = pcall(vim.api.nvim_buf_set_lines, e.bufnr,
+                e.first - 1, e.first - 1 + e.new_count, false, e.old_lines)
+            if ok then
+                reverted = reverted + 1
+            end
+        end
+    end
+    return reverted
+end
+
+return M

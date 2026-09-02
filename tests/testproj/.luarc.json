@@ -1,0 +1,4 @@
+{
+  "runtime": { "version": "LuaJIT", "path": ["lua/?.lua", "lua/?/init.lua"] },
+  "workspace": { "library": [], "checkThirdParty": false }
+}
