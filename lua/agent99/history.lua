@@ -313,6 +313,7 @@ local function open_record(rec)
     vim.bo[buf].modifiable = false
     vim.bo[buf].bufhidden = "wipe"
     vim.bo[buf].filetype = "markdown"
+    pcall(vim.treesitter.start, buf, "markdown")
     pcall(vim.api.nvim_buf_set_name, buf, "agent99://record/" .. (rec.id or "?"))
     vim.cmd.split()
     local win = vim.api.nvim_get_current_win()
@@ -320,6 +321,8 @@ local function open_record(rec)
     vim.wo[win].winbar = "agent99 record — q close · gf on a path opens the raw file"
     vim.wo[win].conceallevel = 2
     vim.wo[win].concealcursor = "nc"
+    vim.wo[win].wrap = true
+    vim.wo[win].linebreak = true
     vim.keymap.set("n", "q", vim.cmd.close, { buffer = buf })
 end
 
@@ -346,7 +349,17 @@ local function telescope_browse(items)
                 vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false,
                     entry.value.preview)
                 vim.bo[self.state.bufnr].modifiable = false
+                -- Render like the chat panel: treesitter markdown (with
+                -- language injection for the diff fences) plus conceal in
+                -- the preview window - a bare filetype gives raw markup.
                 vim.bo[self.state.bufnr].filetype = "markdown"
+                pcall(vim.treesitter.start, self.state.bufnr, "markdown")
+                if self.state.winid and vim.api.nvim_win_is_valid(self.state.winid) then
+                    vim.wo[self.state.winid].conceallevel = 2
+                    vim.wo[self.state.winid].concealcursor = "nc"
+                    vim.wo[self.state.winid].wrap = true
+                    vim.wo[self.state.winid].linebreak = true
+                end
             end,
         }),
         attach_mappings = function(prompt_bufnr)
