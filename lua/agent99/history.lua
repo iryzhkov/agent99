@@ -366,9 +366,44 @@ local function picker_items(scope)
     end
     local files = record_files()
     table.sort(files, function(a, b) return a > b end)
+    -- One entry per chat conversation, not one per message: records
+    -- sharing a chat_session collapse into their newest member (whose
+    -- transcript holds the whole conversation). Older members enrich the
+    -- entry: message count in the display, their instructions searchable.
+    local chat_groups = {}
     for _, path in ipairs(files) do
         local rec = read_record(path)
+        if rec and rec.mode == "chat" then
+            local key = rec.chat_session or rec.id
+            local g = chat_groups[key]
+            if g then
+                g.count = g.count + 1
+                g.first_instruction = rec.instruction or g.first_instruction
+                g.extra_ordinal = g.extra_ordinal .. " " .. (rec.instruction or "")
+                g.skip[rec.id] = true
+            else
+                chat_groups[key] = { count = 1,
+                    first_instruction = rec.instruction,
+                    extra_ordinal = "", skip = {} }
+            end
+        end
+    end
+    for _, path in ipairs(files) do
+        local rec = read_record(path)
+        local group = rec and rec.mode == "chat"
+            and chat_groups[rec.chat_session or rec.id]
+        if rec and group and group.skip[rec.id] then
+            rec = nil -- an older message of a collapsed conversation
+        end
         if rec and (scope == "all" or in_workspace(rec)) then
+            if group then
+                rec = vim.tbl_extend("force", rec, {
+                    instruction = group.count > 1
+                        and ("%s (%d msgs)"):format(group.first_instruction or "?",
+                            group.count)
+                        or rec.instruction,
+                })
+            end
             -- @now / @past tokens make the fuzzy search session-aware:
             -- type "@past" for runs from earlier Neovim sessions.
             local session = session_ids[rec.id] and "@now" or "@past"
@@ -380,7 +415,8 @@ local function picker_items(scope)
                         and vim.fn.fnamemodify(rec.file, ":t"):sub(1, 14) or "-",
                     (rec.instruction or ""):sub(1, 60):gsub("\n", " ")),
                 ordinal = table.concat({ session, rec.time or "", rec.status or "",
-                    rec.mode or "", rec.file or "", rec.instruction or "" }, " "),
+                    rec.mode or "", rec.file or "", rec.instruction or "",
+                    group and group.extra_ordinal or "" }, " "),
                 preview = record_preview(rec),
                 rec = rec,
                 path = path,

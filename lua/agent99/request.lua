@@ -723,6 +723,7 @@ function M.start(buf, first, last, instruction, opts)
         transcript = provider.kind == "openai" and transcript or nil,
         followup_of = opts.followup_of,
         autofix = opts.autofix or nil,
+        chat_session = opts.chat_session,
         contexts = opts.contexts and #opts.contexts > 0 and vim.tbl_map(function(c)
             return { file = c.file, first = c.first, last = c.last, text = c.text }
         end, opts.contexts) or nil,

@@ -9,6 +9,7 @@ local M = {}
 local state = {
     messages = nil, -- full transcript (system + turns + tool calls)
     turns = 0,
+    session = nil,  -- groups this conversation's records in the history
 }
 
 -- Build the prompt for one chat message: staged selection first, otherwise
@@ -69,12 +70,15 @@ function M.send(text)
                 :format(tostring(resolved.model)))
         end)
     end
+    state.session = state.session
+        or (os.date("%Y%m%d-%H%M%S") .. "-s" .. math.random(1000, 9999))
     local prompt, ctx_buf = chat_context(text)
     local buf = ctx_buf or vim.api.nvim_get_current_buf()
     request.start(buf, nil, nil, text, {
         mode = "chat",
         prompt = prompt,
         provider = provider,
+        chat_session = state.session,
         messages = state.messages,
         system = state.messages == nil and require("agent99.prompts").CHAT_SYSTEM or nil,
         stream = true,
@@ -126,6 +130,8 @@ function M.restore(rec)
     end
     state.messages = msgs
     state.turns = 0
+    -- Continue the restored conversation's history grouping.
+    state.session = rec.chat_session or rec.id
     local ui = require("agent99.ui")
     ui.open() -- creates the panel buffers when this is the first open
     ui.clear()
@@ -153,12 +159,15 @@ function M.reset()
         vim.notify("agent99: cancel the running request first", vim.log.levels.WARN)
         return
     end
+    -- The conversation's records stay in the history (one entry per
+    -- session, restorable from the picker); this only starts a new one.
     state.messages = nil
     state.turns = 0
+    state.session = nil
     pcall(function()
         require("agent99.ui").clear()
     end)
-    vim.notify("agent99: conversation cleared")
+    vim.notify("agent99: new conversation (the old one stays in :Agent99History)")
 end
 
 return M
