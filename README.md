@@ -41,11 +41,14 @@ hidden buffers, which triggers normal LSP attach.
 
 ## Install
 
-lazy.nvim, from a local clone:
+lazy.nvim:
 
 ```lua
-{ dir = "~/src/agent99", opts = {} }
+{ "iryzhkov/agent99", build = "make build", opts = {} }
 ```
+
+or from a local clone: `{ dir = "~/src/agent99", opts = {} }` (run
+`make build` there once).
 
 ### Providers
 
@@ -53,7 +56,7 @@ lazy.nvim, from a local clone:
 
 ```lua
 provider = "deepseek"                     -- built-in preset (the default)
-provider = { preset = "ollama", base_url = "http://gaming-pc:11434/v1",
+provider = { preset = "ollama", base_url = "http://my-gpu-box:11434/v1",
              model = "qwen2.5-coder:14b", temperature = 0.2 }
 provider = { base_url = "https://my.gateway/v1", model = "my-model",
              api_key_env = "MY_KEY" }    -- no preset at all
