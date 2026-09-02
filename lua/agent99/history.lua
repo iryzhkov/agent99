@@ -494,6 +494,47 @@ local function record_sections(rec)
         info[#info + 1] = "- transcript: " .. rec.transcript
     end
     sec("info", info)
+    -- The agent's run, step by step, mined from the transcript: what it
+    -- said between tool calls, and every call with its result size.
+    if rec.transcript and vim.fn.filereadable(rec.transcript) == 1 then
+        local okt, msgs = pcall(function()
+            return vim.json.decode(table.concat(vim.fn.readfile(rec.transcript), "\n"))
+        end)
+        if okt and type(msgs) == "table" then
+            local sizes = {}
+            for _, m in ipairs(msgs) do
+                if m.role == "tool" and m.tool_call_id then
+                    sizes[m.tool_call_id] = #(m.content or "")
+                end
+            end
+            local out, step = {}, 0
+            for _, m in ipairs(msgs) do
+                if m.role == "assistant" then
+                    step = step + 1
+                    out[#out + 1] = ""
+                    out[#out + 1] = ("### step %d"):format(step)
+                    if m.content and m.content ~= "" and type(m.content) == "string" then
+                        vim.list_extend(out, vim.split(m.content, "\n", { plain = true }))
+                    end
+                    for _, tc in ipairs(m.tool_calls or {}) do
+                        local f = tc["function"] or {}
+                        local args = (f.arguments or ""):gsub("%s+", " ")
+                        if #args > 90 then
+                            args = args:sub(1, 90) .. "…"
+                        end
+                        local size = sizes[tc.id]
+                        out[#out + 1] = ("- `%s(%s)`%s"):format(f.name or "?", args,
+                            size and (" → %.1fk chars"):format(size / 1000) or "")
+                    end
+                end
+            end
+            if #out > 600 then
+                out = vim.list_slice(out, 1, 600)
+                out[#out + 1] = "... (truncated; gf on the transcript path in info for the rest)"
+            end
+            sec("work", out)
+        end
+    end
     local function ctx_section(file, first, last, text)
         local lang = (file and vim.filetype.match({ filename = file })) or ""
         local body = { ("%s:%s-%s"):format(vim.fn.fnamemodify(file, ":~:."),
@@ -685,7 +726,7 @@ function M.open_record(rec)
     end
     if default == 1 then
         for i, s in ipairs(sections) do
-            if s.name ~= "info" and not s.name:match("^ctx:") then
+            if s.name ~= "info" and s.name ~= "work" and not s.name:match("^ctx:") then
                 default = i
                 break
             end
