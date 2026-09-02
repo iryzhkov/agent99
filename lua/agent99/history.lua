@@ -278,11 +278,15 @@ local function picker_items()
     for _, path in ipairs(files) do
         local rec = read_record(path)
         if rec then
+            -- @now / @past tokens make the fuzzy search session-aware:
+            -- type "@past" for runs from earlier Neovim sessions.
+            local session = session_ids[rec.id] and "@now" or "@past"
             items[#items + 1] = {
-                display = ("%s │ %-12s │ %-5s │ %s"):format(
+                display = ("%s%s │ %-12s │ %-5s │ %s"):format(
+                    session_ids[rec.id] and "• " or "  ",
                     rec.time or "?", rec.status or "?", rec.mode or "edit",
                     (rec.instruction or ""):sub(1, 60):gsub("\n", " ")),
-                ordinal = table.concat({ rec.time or "", rec.status or "",
+                ordinal = table.concat({ session, rec.time or "", rec.status or "",
                     rec.mode or "", rec.file or "", rec.instruction or "" }, " "),
                 preview = record_preview(rec),
                 path = path,
