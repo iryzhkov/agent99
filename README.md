@@ -110,6 +110,9 @@ require("agent99").setup({
             width = 110, height = 24, preview_ratio = 0.55,
             prompt_height = 5, border = "rounded",
         },
+        record = {               -- record view layout
+            content_width = 120, list_width = 26, border = "rounded",
+        },
     },
     keymaps = {                  -- false disables all; set a key to false to drop one
         toggle_panel = "<leader>99",    -- n
@@ -119,6 +122,7 @@ require("agent99").setup({
         followup = "<leader>9f",
         cancel = "<leader>9x",
         history = "<leader>9h",
+        record = "<leader>9r",          -- re-open the last record view
         logs = "<leader>9l",
     },
     bridge_bin = nil,            -- default: <plugin>/bin/agent99-bridge
