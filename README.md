@@ -196,11 +196,12 @@ Safety and feedback around an apply:
   (openai provider; never chains a fix-of-a-fix).
 
 Every request — successes and failures alike — is persisted as a JSON record
-under `stdpath("state")/agent99/history/` (pruned to `history_keep`), with
+under `stdpath("state")/agent99/history/` (pruned to `history.keep`), with
 its outcome `status` (applied / discarded / stale_refused / no_replacement /
 error / empty_reply / cancelled / answered), per-tool call counts, rounds,
 token totals, duration, and the full agent transcript alongside.
-`:Agent99Stats` aggregates them: outcome rates, average cost per request,
+`:Agent99Stats` (or `/stats` in the panel; session-scoped, `all` for
+lifetime) aggregates them: outcome rates, average cost per request,
 tool-usage breakdown, and recent failures — the data to judge what to
 improve next. The records are plain JSON, so deeper analysis is a `jq` away.
 
@@ -266,4 +267,3 @@ lua-language-server must be on PATH or in mason's bin directory.
 - Charwise/blockwise selections (currently widened to whole lines).
 - `textDocument/rename` as an agent tool (safe multi-file refactor primitive).
 - FIM-based ghost-text completion as a separate fast path.
-- Ask mode: question about the code under cursor, answer in a scratch split.
