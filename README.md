@@ -102,6 +102,9 @@ opens — selection list top-left (first entry is the target), instruction
 prompt below it, syntax-highlighted preview of the highlighted selection on
 the right.
 
+![The compose picker: target and stacked context selections, the
+instruction draft, and a live preview](doc/compose.png)
+
 - Type the instruction, `<CR>` (insert: `<C-s>`) sends.
 - **Sticky drafts**: `q`/`<Esc>` closes without losing anything; invoking
   `<leader>99` (or `9e`/`9a`) again from another selection — any file —
@@ -130,6 +133,9 @@ Fuzzy search covers time, status, mode, target file, instruction, and the
 `@now`/`@past` session tokens; the preview shows what the agent was given
 and what came back. Chat conversations collapse to one entry each.
 
+![The requests picker: fuzzy search over workspace history with a
+what-was-asked / what-came-back preview](doc/history.png)
+
 `<CR>` opens the **record view** — a multi-pane float:
 
 ```
@@ -141,6 +147,9 @@ and what came back. Chat conversations collapse to one entry each.
 | ctx: …   |                     |   region's code) |
 +----------+---------------------+------------------+
 ```
+
+![The record view: sections, the rendered answer, and the prompt and
+target panes](doc/record.png)
 
 - Opens on the payload (answer or change); `j`/`k` walk the sections,
   `<Tab>` cycles panes. Edits render as Before/After blocks in the file's
