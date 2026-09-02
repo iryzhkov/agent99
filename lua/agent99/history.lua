@@ -764,7 +764,7 @@ function M.open_record(rec)
         style = "minimal", border = rc.border or "rounded",
         title = (" %s — %s "):format(rec.mode or "record", rec.status or "?"),
         title_pos = "center",
-        footer = " j/k · <CR> jump · gu undo run · C-h/l records · q ", footer_pos = "center",
+        footer = " j/k · <CR> jump · gc continue · gu undo · C-h/l · q ", footer_pos = "center",
     })
     vim.wo[list_win].cursorline = true
     pcall(vim.api.nvim_win_set_cursor, list_win, { default, 0 })
@@ -1005,6 +1005,10 @@ function M.open_record(rec)
         vim.keymap.set("n", "gu", function()
             require("agent99.request").undo_record(rec)
         end, { buffer = b, desc = "agent99: undo this run's edits" })
+        vim.keymap.set("n", "gc", function()
+            close()
+            require("agent99.compose").continue_record(rec)
+        end, { buffer = b, desc = "agent99: continue this run in compose" })
         -- <Tab> cycles list -> content -> prompt -> target -> list.
         vim.keymap.set("n", "<Tab>", function()
             for step = 1, #wins do
@@ -1042,7 +1046,7 @@ function M.open_record(rec)
     show_section()
 end
 
-local function telescope_browse(items, scope)
+local function telescope_browse(items, scope, on_select)
     local pickers = require("telescope.pickers")
     local finders = require("telescope.finders")
     local conf = require("telescope.config").values
@@ -1089,10 +1093,12 @@ local function telescope_browse(items, scope)
                 if not entry then
                     return
                 end
-                if entry.value.rec then
-                    M.open_record(entry.value.rec)
-                else
+                if not entry.value.rec then
                     vim.notify("agent99: request is still running (/cancel or <leader>9x to stop)")
+                elseif on_select then
+                    on_select(entry.value.rec)
+                else
+                    M.open_record(entry.value.rec)
                 end
             end)
             return true
@@ -1101,7 +1107,7 @@ local function telescope_browse(items, scope)
 end
 
 -- Plain-split fallback when telescope is not installed.
-local function split_browse(items)
+local function split_browse(items, on_select)
     local lines, targets = {}, {}
     for i, it in ipairs(items) do
         lines[i] = it.display
@@ -1117,7 +1123,8 @@ local function split_browse(items)
     vim.keymap.set("n", "<CR>", function()
         local target = targets[vim.api.nvim_win_get_cursor(0)[1]]
         if target then
-            M.open_record(target)
+            vim.cmd.close()
+            ;(on_select or M.open_record)(target)
         end
     end, { buffer = buf, desc = "agent99: open record" })
     vim.keymap.set("n", "q", vim.cmd.close, { buffer = buf })
@@ -1132,7 +1139,7 @@ M._picker_items = picker_items
 --- markdown preview, <CR> opens the record); plain split otherwise.
 --- Browse requests. Scoped to the current workspace (project roots that
 --- contain or are contained by the cwd) unless scope is "all".
-function M.browse(scope)
+function M.browse(scope, on_select)
     local items = picker_items(scope)
     if #items == 0 then
         vim.notify(scope == "all" and "agent99: no history yet"
@@ -1140,9 +1147,9 @@ function M.browse(scope)
         return
     end
     if pcall(require, "telescope") then
-        telescope_browse(items, scope)
+        telescope_browse(items, scope, on_select)
     else
-        split_browse(items)
+        split_browse(items, on_select)
     end
 end
 

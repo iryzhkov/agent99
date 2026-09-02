@@ -26,6 +26,8 @@ local state = {
     mode = nil,     -- "edit" or "ask", locked by the first staged selection
     target = nil,   -- { buf, file, first, last, text } - the edit/ask region
     contexts = {},  -- additional selections
+    continuation = nil, -- { id, transcript, label }: a past run whose
+                        -- conversation the next request continues
     buf = nil,      -- draft buffer (persists while hidden)
     win = nil,      -- prompt window
     list_buf = nil,
@@ -59,6 +61,8 @@ local function win_open()
     return state.win and vim.api.nvim_win_is_valid(state.win)
 end
 
+local update_list -- defined with the render helpers below
+
 -- Target first, then the stacked contexts.
 local function entries()
     local out = {}
@@ -90,7 +94,77 @@ function M.discard()
         vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, {})
     end
     state.mode, state.target, state.contexts = nil, nil, {}
+    state.continuation = nil
     vim.notify("agent99: draft discarded")
+end
+
+local function prompt_title()
+    local t = (" %s — <CR> send · <Tab> list · gx discard "):format(state.mode or "compose")
+    if state.continuation then
+        t = t .. ("· continuing %s "):format(state.continuation.label or "run")
+    end
+    return t
+end
+
+local function refresh_prompt_title()
+    if win_open() then
+        vim.api.nvim_win_set_config(state.win,
+            { title = prompt_title(), title_pos = "center" })
+    end
+end
+
+--- Flip between edit and ask before sending - e.g. continue an answered
+--- question as an edit of the same target, or ask about a staged region
+--- instead of editing it.
+function M.toggle_mode()
+    if not state.mode then
+        vim.notify("agent99: stage a selection first")
+        return
+    end
+    state.mode = state.mode == "edit" and "ask" or "edit"
+    refresh_prompt_title()
+    update_list()
+    vim.notify("agent99: mode is now " .. state.mode)
+end
+
+--- Attach a past run: the next request continues its conversation (the
+--- agent keeps everything it learned), whatever target is staged.
+function M.set_continuation(rec)
+    if not (rec and rec.transcript) then
+        vim.notify("agent99: that run has no transcript to continue "
+            .. "(claude-provider runs keep none)", vim.log.levels.WARN)
+        return
+    end
+    state.continuation = { id = rec.id, transcript = rec.transcript,
+        label = rec.time or rec.id }
+    refresh_prompt_title()
+    vim.notify("agent99: continuing the conversation of " .. state.continuation.label)
+end
+
+--- Continue a recorded run: its target region (re-read from the current
+--- buffer state) becomes the compose target, its conversation rides along,
+--- and only a new prompt is needed. Staging another selection afterwards
+--- adds context as usual - or restages the target if none was set.
+function M.continue_record(rec)
+    if not (rec.file and rec.file ~= "" and rec.first and rec.last) then
+        vim.notify("agent99: this record has no target region to continue from",
+            vim.log.levels.WARN)
+        return
+    end
+    local bufnr = vim.fn.bufadd(vim.fn.fnamemodify(rec.file, ":p"))
+    vim.fn.bufload(bufnr)
+    local total = vim.api.nvim_buf_line_count(bufnr)
+    state.mode = rec.mode == "ask" and "ask" or "edit"
+    state.target = capture(bufnr, math.min(rec.first, total), math.min(rec.last, total))
+    state.contexts = {}
+    state.continuation = rec.transcript
+        and { id = rec.id, transcript = rec.transcript, label = rec.time or rec.id }
+        or nil
+    if not state.continuation then
+        vim.notify("agent99: no transcript for this run - continuing with the target only",
+            vim.log.levels.WARN)
+    end
+    vim.schedule(M.open)
 end
 
 local function send()
@@ -112,13 +186,30 @@ local function send()
             vim.log.levels.WARN)
         return
     end
-    local mode = state.mode
-    local contexts = state.contexts
+    local opts = { mode = state.mode, contexts = state.contexts }
+    local cont = state.continuation
+    if cont then
+        opts.followup_of = cont.id
+        if cont.transcript and vim.fn.filereadable(cont.transcript) == 1 then
+            local okm, msgs = pcall(function()
+                return vim.json.decode(table.concat(
+                    vim.fn.readfile(cont.transcript), "\n"))
+            end)
+            if okm then
+                opts.messages = msgs
+            end
+        end
+        if not opts.messages then
+            vim.notify("agent99: the previous run has no readable transcript - "
+                .. "continuing with the target only", vim.log.levels.WARN)
+        end
+    end
     close_all()
     vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, {})
     state.mode, state.target, state.contexts = nil, nil, {}
+    state.continuation = nil
     require("agent99.request").start(target.buf, target.first, target.last,
-        text, { mode = mode, contexts = contexts })
+        text, opts)
 end
 
 -- ---------------------------------------------------------------- render --
@@ -154,7 +245,7 @@ local function update_preview()
     end
 end
 
-local function update_list()
+function update_list()
     if not (state.list_buf and vim.api.nvim_buf_is_valid(state.list_buf)) then
         return
     end
@@ -234,6 +325,11 @@ local function ensure_prompt_buf()
         vim.tbl_extend("force", o, { desc = "agent99: next selection" }))
     vim.keymap.set({ "n", "i" }, "<C-k>", function() move_selection(-1) end,
         vim.tbl_extend("force", o, { desc = "agent99: previous selection" }))
+    vim.keymap.set("n", "gr", function()
+        require("agent99.history").browse(nil, M.set_continuation)
+    end, vim.tbl_extend("force", o, { desc = "agent99: continue a past run" }))
+    vim.keymap.set("n", "gm", M.toggle_mode,
+        vim.tbl_extend("force", o, { desc = "agent99: toggle edit/ask mode" }))
 end
 
 local function make_scratch(name)
@@ -292,7 +388,7 @@ function M.open()
         relative = "editor", row = row + list_h + 2, col = col,
         width = lw, height = prompt_h,
         style = "minimal", border = border,
-        title = (" %s — <CR> send · <Tab> list · gx discard "):format(state.mode or "compose"),
+        title = prompt_title(),
         title_pos = "center",
     })
     vim.wo[state.win].wrap = true
@@ -310,6 +406,10 @@ function M.open()
     vim.keymap.set("n", "q", close_all, vim.tbl_extend("force", lo, {}))
     vim.keymap.set("n", "<Esc>", close_all, vim.tbl_extend("force", lo, {}))
     vim.keymap.set("n", "gx", M.discard, vim.tbl_extend("force", lo, {}))
+    vim.keymap.set("n", "gm", M.toggle_mode, vim.tbl_extend("force", lo, {}))
+    vim.keymap.set("n", "gr", function()
+        require("agent99.history").browse(nil, M.set_continuation)
+    end, vim.tbl_extend("force", lo, {}))
     vim.api.nvim_create_autocmd("CursorMoved", {
         buffer = state.list_buf,
         callback = update_preview,
