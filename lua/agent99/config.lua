@@ -84,6 +84,11 @@ M.defaults = {
     context_full_file_max = 200,
     context_lines = 50,
     timeout_ms = 5 * 60 * 1000,
+    -- <leader>9v stages selections in "auto" mode: the model itself decides
+    -- whether the instruction is an edit or a question, from the reply's
+    -- shape (no extra classification call). gm in compose hardcodes the
+    -- mode (cycles auto/edit/ask); false restores 9v = always edit.
+    auto_mode = true,
 
     history = {
         -- Request records kept on disk under stdpath("state")/agent99.

@@ -533,6 +533,17 @@ local function on_exit(result)
             return
         end
 
+        -- Auto mode: the reply's shape decides. A replacement (or symbol
+        -- edits) means it was an edit; a plain markdown reply means the
+        -- instruction was a question. The record keeps the resolved mode.
+        if record.mode == "auto" then
+            if extract_replacement(result.stdout) or #tool_edits > 0 then
+                record.mode = "edit"
+            else
+                record.mode = "ask"
+            end
+        end
+
         -- Ask-mode answers stay raw markdown; edits go through the
         -- <replacement> extraction. A reply without a replacement is accepted
         -- when the work was done through the symbol edit tools; otherwise it
@@ -635,9 +646,15 @@ function M.start(buf, first, last, instruction, opts)
     local prompt = opts.prompt
     if not prompt then
         local selection = table.concat(region_lines, "\n")
-        local builder = mode == "ask" and prompts.ask or prompts.edit
-        prompt = builder(buf, file, vim.bo[buf].filetype, root, first, last,
-            selection, prompt_instruction)
+        if mode == "ask" then
+            prompt = prompts.ask(buf, file, vim.bo[buf].filetype, root, first,
+                last, selection, prompt_instruction)
+        else
+            -- "auto" uses the edit contract with a question escape hatch;
+            -- the reply's shape decides the final mode in on_exit.
+            prompt = prompts.edit(buf, file, vim.bo[buf].filetype, root, first,
+                last, selection, prompt_instruction, mode == "auto")
+        end
     end
 
     local bin = check_bridge()
@@ -686,8 +703,8 @@ function M.start(buf, first, last, instruction, opts)
             full_tools = provider.full_tools or nil,
             system = opts.system,
             stream = opts.stream or nil,
-            final_reminder = (mode == "ask" or mode == "chat")
-                and prompts.MARKDOWN_REMINDER
+            final_reminder = mode == "auto" and prompts.AUTO_REMINDER
+                or (mode == "ask" or mode == "chat") and prompts.MARKDOWN_REMINDER
                 or prompts.REPLACEMENT_REMINDER,
         })
     end
@@ -733,7 +750,7 @@ function M.start(buf, first, last, instruction, opts)
         -- The selected region's text at request time: for edits the history
         -- view shows the change against it, for asks it is the "target"
         -- section (capped for huge regions).
-        before = (mode == "edit" or mode == "ask")
+        before = mode ~= "chat"
             and region_lines and #region_lines <= 400
             and table.concat(region_lines, "\n") or nil,
     }

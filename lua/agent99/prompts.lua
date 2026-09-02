@@ -106,7 +106,11 @@ local function tool_prefix()
     return config.options.provider.kind == "claude" and "MCP (mcp__lsp__*)" or "LSP"
 end
 
-function M.edit(buf, file, ft, root, first, last, selection, instruction)
+M.AUTO_REMINDER = "If you changed code, the replacement MUST be wrapped in "
+    .. "<replacement></replacement> tags; if you answered a question, reply "
+    .. "in plain markdown with no replacement tags."
+
+function M.edit(buf, file, ft, root, first, last, selection, instruction, auto)
     local parts = {
         "You are performing a surgical code edit inside the user's Neovim session.",
         ("Target file: %s (filetype: %s)"):format(file, ft),
@@ -126,6 +130,17 @@ function M.edit(buf, file, ft, root, first, last, selection, instruction)
         "",
     }
     vim.list_extend(parts, replacement_contract(first, last))
+    if auto then
+        vim.list_extend(parts, {
+            "",
+            "Second exception: if the instruction is a QUESTION about the code",
+            "rather than a request to change it, do not edit anything and do",
+            "not output <replacement> tags - answer the question directly in",
+            "concise markdown instead, citing locations as file:line. Never",
+            "remark on whether the instruction was a question or an edit;",
+            "just answer or just edit.",
+        })
+    end
     return table.concat(parts, "\n")
 end
 

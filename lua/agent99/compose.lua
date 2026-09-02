@@ -121,10 +121,12 @@ function M.toggle_mode()
         vim.notify("agent99: stage a selection first")
         return
     end
-    state.mode = state.mode == "edit" and "ask" or "edit"
+    local cycle = { auto = "edit", edit = "ask", ask = "auto" }
+    state.mode = cycle[state.mode] or "edit"
     refresh_prompt_title()
     update_list()
-    vim.notify("agent99: mode is now " .. state.mode)
+    vim.notify("agent99: mode is now " .. state.mode
+        .. (state.mode == "auto" and " (the model decides edit vs answer)" or ""))
 end
 
 --- Attach a past run: the next request continues its conversation (the

@@ -102,6 +102,8 @@ require("agent99").setup({
     context_full_file_max = 200, -- embed whole file in the prompt up to this size
     context_lines = 50,          -- else this many lines around the selection
     timeout_ms = 5 * 60 * 1000,
+    auto_mode = true,            -- <leader>9v infers edit-vs-question from the
+                                 -- reply itself (no extra call); gm hardcodes
     history = { keep = 100 },    -- request records kept on disk
     ui = {
         width = 0.4,             -- panel width (fraction of columns)

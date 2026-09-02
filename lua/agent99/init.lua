@@ -57,7 +57,8 @@ end
 --- selection as the edit target. Re-invoking from another selection stacks
 --- it as additional context; the typed draft survives closing the window.
 function M.edit_visual()
-    require("agent99.compose").from_visual("edit")
+    require("agent99.compose").from_visual(
+        require("agent99.config").options.auto_mode ~= false and "auto" or "edit")
 end
 
 --- Ask a question about the current visual selection (same compose window;
