@@ -174,13 +174,16 @@ marker](doc/edit-working.png)
 ![The proposal opens in a preview split: apply with CR, discard with
 q](doc/edit-preview.png)
 
-- Visually select lines, press `<leader>9v`: a floating compose window
-  opens with the selection as the edit target (shown in the title). Type
-  the instruction and `<CR>` (insert: `<C-s>`) to send. The draft is
-  sticky: `q`/`<Esc>` closes the window without losing it, and invoking
-  `<leader>9v` (or `9a`) again from another selection — any file — stacks
-  that selection as additional context (listed in the footer) instead of
-  starting over, so one request can carry several regions. `gx` discards
+- Visually select lines, press `<leader>9v`: a telescope-style compose
+  picker opens — selection list top-left (the first entry is the edit
+  target), instruction prompt below it, and a syntax-highlighted preview
+  of the highlighted selection on the right. Type the instruction and
+  `<CR>` (insert: `<C-s>`) to send. The draft is sticky: `q`/`<Esc>`
+  closes the picker without losing it, and invoking `<leader>9v` (or
+  `9a`) again from another selection — any file — stacks that selection
+  as additional context instead of starting over, so one request can
+  carry several regions. Navigate with `<C-j>`/`<C-k>` from the prompt or
+  `<Tab>` into the list and `j`/`k`; `x` removes a context, `gx` discards
   the draft and the stack. While the request runs the target region is
   highlighted (`Agent99Working`, links to `Visual`) with an
   `agent99 working…` marker; when the agent finishes, the proposal opens

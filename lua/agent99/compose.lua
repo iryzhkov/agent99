@@ -1,10 +1,22 @@
 -- The compose window: a telescope-style floating prompt for the region
--- flows (edit/ask). Invoking <leader>9v / <leader>9a from a visual
--- selection opens it with that selection as the edit/ask TARGET; invoking
--- it again from another selection (any file) stacks that selection as
--- additional context instead of starting over, and the typed draft
--- survives closing the window. <CR> sends target + contexts + draft as one
--- request; the draft and stack reset only on send or explicit clear.
+-- flows (edit/ask), laid out like a picker - selection list top-left,
+-- instruction prompt below it, live preview of the highlighted selection
+-- on the right:
+--
+--   +--------------------+------------------------------+
+--   | selections (j/k)   |  preview of the highlighted  |
+--   |  > target a.lua:.. |  selection, syntax-highlit   |
+--   |    ctx    b.go:..  |                              |
+--   +--------------------+                              |
+--   | instruction prompt |                              |
+--   +--------------------+------------------------------+
+--
+-- Invoking <leader>9v / <leader>9a from a visual selection opens it with
+-- that selection as the edit/ask TARGET; invoking again from another
+-- selection (any file) stacks it as additional context, and the typed
+-- draft survives closing. <CR> sends target + contexts + draft as one
+-- request; q/<Esc> keeps the draft, gx discards, x in the list removes a
+-- context, <Tab> hops between prompt and list.
 
 local M = {}
 
@@ -12,10 +24,15 @@ local MAX_SELECTION_LINES = 300
 
 local state = {
     mode = nil,     -- "edit" or "ask", locked by the first staged selection
-    target = nil,   -- { buf, file, first, last } - the region being edited/asked about
-    contexts = {},  -- additional { file, first, last, text } selections
+    target = nil,   -- { buf, file, first, last, text } - the edit/ask region
+    contexts = {},  -- additional selections
     buf = nil,      -- draft buffer (persists while hidden)
-    win = nil,
+    win = nil,      -- prompt window
+    list_buf = nil,
+    list_win = nil,
+    prev_buf = nil,
+    prev_win = nil,
+    closing = false,
 }
 
 local function capture(buf, first, last)
@@ -42,43 +59,33 @@ local function win_open()
     return state.win and vim.api.nvim_win_is_valid(state.win)
 end
 
-local function title()
-    if not state.target then
-        return " agent99 "
+-- Target first, then the stacked contexts.
+local function entries()
+    local out = {}
+    if state.target then
+        out[#out + 1] = state.target
     end
-    return (" agent99 %s — %s:%d-%d "):format(state.mode,
-        short(state.target.file), state.target.first, state.target.last)
+    vim.list_extend(out, state.contexts)
+    return out
 end
 
-local function footer()
-    local parts = {}
-    for _, c in ipairs(state.contexts) do
-        parts[#parts + 1] = ("%s:%d-%d"):format(short(c.file), c.first, c.last)
+local function close_all()
+    if state.closing then
+        return
     end
-    local hint = "<CR> send · q keep draft · gx discard"
-    if #parts == 0 then
-        return " " .. hint .. " "
+    state.closing = true
+    for _, w in ipairs({ state.win, state.list_win, state.prev_win }) do
+        if w and vim.api.nvim_win_is_valid(w) then
+            pcall(vim.api.nvim_win_close, w, true)
+        end
     end
-    return (" +context: %s · %s "):format(table.concat(parts, ", "), hint)
-end
-
-local function refresh_border()
-    if win_open() then
-        vim.api.nvim_win_set_config(state.win, { title = title(), title_pos = "center",
-            footer = footer(), footer_pos = "center" })
-    end
-end
-
-local function close_win()
-    if win_open() then
-        pcall(vim.api.nvim_win_close, state.win, true)
-    end
-    state.win = nil
+    state.win, state.list_win, state.prev_win = nil, nil, nil
+    state.closing = false
 end
 
 --- Drop the draft and every staged selection.
 function M.discard()
-    close_win()
+    close_all()
     if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
         vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, {})
     end
@@ -120,14 +127,100 @@ local function send()
         instruction = table.concat(parts, "\n")
     end
     local mode = state.mode
-    close_win()
+    close_all()
     vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, {})
     state.mode, state.target, state.contexts = nil, nil, {}
     require("agent99.request").start(target.buf, target.first, target.last,
         instruction, { mode = mode })
 end
 
-local function ensure_buf()
+-- ---------------------------------------------------------------- render --
+
+local function current_index()
+    if not (state.list_win and vim.api.nvim_win_is_valid(state.list_win)) then
+        return 1
+    end
+    return vim.api.nvim_win_get_cursor(state.list_win)[1]
+end
+
+local function update_preview()
+    if not (state.prev_buf and vim.api.nvim_buf_is_valid(state.prev_buf)) then
+        return
+    end
+    local entry = entries()[current_index()]
+    if not entry then
+        return
+    end
+    vim.bo[state.prev_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(state.prev_buf, 0, -1, false,
+        vim.split(entry.text, "\n", { plain = true }))
+    vim.bo[state.prev_buf].modifiable = false
+    local ft = vim.filetype.match({ filename = entry.file }) or ""
+    if vim.bo[state.prev_buf].filetype ~= ft then
+        vim.bo[state.prev_buf].filetype = ft
+    end
+    if state.prev_win and vim.api.nvim_win_is_valid(state.prev_win) then
+        vim.api.nvim_win_set_config(state.prev_win, {
+            title = (" %s:%d-%d "):format(short(entry.file), entry.first, entry.last),
+            title_pos = "center",
+        })
+    end
+end
+
+local function update_list()
+    if not (state.list_buf and vim.api.nvim_buf_is_valid(state.list_buf)) then
+        return
+    end
+    local lines = {}
+    for i, e in ipairs(entries()) do
+        lines[#lines + 1] = ("%s %s:%d-%d"):format(
+            i == 1 and (state.mode or "edit") or " ctx ",
+            short(e.file), e.first, e.last)
+    end
+    vim.bo[state.list_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(state.list_buf, 0, -1, false, lines)
+    vim.bo[state.list_buf].modifiable = false
+    update_preview()
+end
+
+local function move_selection(delta)
+    if not (state.list_win and vim.api.nvim_win_is_valid(state.list_win)) then
+        return
+    end
+    local n = #entries()
+    local row = math.min(math.max(current_index() + delta, 1), math.max(n, 1))
+    pcall(vim.api.nvim_win_set_cursor, state.list_win, { row, 0 })
+    update_preview()
+end
+
+local function remove_current()
+    local idx = current_index()
+    if idx == 1 then
+        vim.notify("agent99: the target cannot be removed (gx discards everything)")
+        return
+    end
+    table.remove(state.contexts, idx - 1)
+    update_list()
+    move_selection(0)
+end
+
+local function focus_prompt(insert)
+    if win_open() then
+        vim.api.nvim_set_current_win(state.win)
+        if insert then
+            vim.cmd.startinsert({ bang = true })
+        end
+    end
+end
+
+local function focus_list()
+    if state.list_win and vim.api.nvim_win_is_valid(state.list_win) then
+        vim.cmd.stopinsert()
+        vim.api.nvim_set_current_win(state.list_win)
+    end
+end
+
+local function ensure_prompt_buf()
     if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
         return
     end
@@ -142,45 +235,108 @@ local function ensure_buf()
         vim.cmd.stopinsert()
         send()
     end, vim.tbl_extend("force", o, { desc = "agent99: send" }))
-    vim.keymap.set("n", "q", close_win,
+    vim.keymap.set("n", "q", close_all,
         vim.tbl_extend("force", o, { desc = "agent99: close (keep draft)" }))
-    vim.keymap.set("n", "<Esc>", close_win,
+    vim.keymap.set("n", "<Esc>", close_all,
         vim.tbl_extend("force", o, { desc = "agent99: close (keep draft)" }))
     vim.keymap.set("n", "gx", M.discard,
         vim.tbl_extend("force", o, { desc = "agent99: discard draft" }))
+    vim.keymap.set({ "n", "i" }, "<Tab>", focus_list,
+        vim.tbl_extend("force", o, { desc = "agent99: to selection list" }))
+    vim.keymap.set({ "n", "i" }, "<C-j>", function() move_selection(1) end,
+        vim.tbl_extend("force", o, { desc = "agent99: next selection" }))
+    vim.keymap.set({ "n", "i" }, "<C-k>", function() move_selection(-1) end,
+        vim.tbl_extend("force", o, { desc = "agent99: previous selection" }))
 end
 
---- Open (or re-open) the compose float over the current draft.
+local function make_scratch(name)
+    local buf = vim.api.nvim_create_buf(false, true)
+    pcall(vim.api.nvim_buf_set_name, buf, name)
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].modifiable = false
+    return buf
+end
+
+--- Open (or re-focus) the compose picker over the current draft.
 function M.open()
-    ensure_buf()
+    ensure_prompt_buf()
     if win_open() then
-        vim.api.nvim_set_current_win(state.win)
-    else
-        local width = math.min(72, vim.o.columns - 8)
-        local height = 8
-        state.win = vim.api.nvim_open_win(state.buf, true, {
-            relative = "editor",
-            width = width,
-            height = height,
-            row = math.floor((vim.o.lines - height) / 2),
-            col = math.floor((vim.o.columns - width) / 2),
-            style = "minimal",
-            border = "rounded",
-            title = title(),
-            title_pos = "center",
-            footer = footer(),
-            footer_pos = "center",
-        })
-        vim.wo[state.win].wrap = true
-        vim.wo[state.win].linebreak = true
+        update_list()
+        focus_prompt(false)
+        return
     end
-    refresh_border()
+    local W = math.min(110, vim.o.columns - 6)
+    local H = math.min(24, vim.o.lines - 6)
+    local pw = math.floor(W * 0.55)
+    local lw = W - pw - 2
+    local prompt_h = 5
+    local list_h = math.max(H - prompt_h - 2, 3)
+    local row = math.floor((vim.o.lines - H) / 2) - 1
+    local col = math.floor((vim.o.columns - W) / 2)
+
+    state.list_buf = make_scratch("agent99://compose-list")
+    state.prev_buf = make_scratch("agent99://compose-preview")
+
+    state.list_win = vim.api.nvim_open_win(state.list_buf, false, {
+        relative = "editor", row = row, col = col, width = lw, height = list_h,
+        style = "minimal", border = "rounded",
+        title = " selections — j/k · x remove ", title_pos = "center",
+    })
+    vim.wo[state.list_win].cursorline = true
+
+    state.prev_win = vim.api.nvim_open_win(state.prev_buf, false, {
+        relative = "editor", row = row, col = col + lw + 2,
+        width = pw, height = H,
+        style = "minimal", border = "rounded",
+        title = " preview ", title_pos = "center",
+    })
+    vim.wo[state.prev_win].wrap = false
+    vim.wo[state.prev_win].number = true
+
+    state.win = vim.api.nvim_open_win(state.buf, true, {
+        relative = "editor", row = row + list_h + 2, col = col,
+        width = lw, height = prompt_h,
+        style = "minimal", border = "rounded",
+        title = (" %s — <CR> send · <Tab> list · gx discard "):format(state.mode or "compose"),
+        title_pos = "center",
+    })
+    vim.wo[state.win].wrap = true
+    vim.wo[state.win].linebreak = true
+
+    -- List-side keys: picker navigation plus the same lifecycle keys.
+    local lo = { buffer = state.list_buf }
+    vim.keymap.set("n", "x", remove_current,
+        vim.tbl_extend("force", lo, { desc = "agent99: remove context" }))
+    vim.keymap.set("n", "<CR>", send, vim.tbl_extend("force", lo, { desc = "agent99: send" }))
+    vim.keymap.set("n", "<Tab>", function() focus_prompt(false) end,
+        vim.tbl_extend("force", lo, { desc = "agent99: to prompt" }))
+    vim.keymap.set("n", "i", function() focus_prompt(true) end,
+        vim.tbl_extend("force", lo, { desc = "agent99: to prompt (insert)" }))
+    vim.keymap.set("n", "q", close_all, vim.tbl_extend("force", lo, {}))
+    vim.keymap.set("n", "<Esc>", close_all, vim.tbl_extend("force", lo, {}))
+    vim.keymap.set("n", "gx", M.discard, vim.tbl_extend("force", lo, {}))
+    vim.api.nvim_create_autocmd("CursorMoved", {
+        buffer = state.list_buf,
+        callback = update_preview,
+    })
+    -- Closing any pane (however it happens) closes the whole picker.
+    for _, w in ipairs({ state.win, state.list_win, state.prev_win }) do
+        vim.api.nvim_create_autocmd("WinClosed", {
+            pattern = tostring(w),
+            once = true,
+            callback = function()
+                vim.schedule(close_all)
+            end,
+        })
+    end
+
+    update_list()
     if vim.api.nvim_buf_get_lines(state.buf, 0, -1, false)[1] == "" then
         vim.cmd.startinsert()
     end
 end
 
---- Stage the current visual selection and open the compose window. The
+--- Stage the current visual selection and open the compose picker. The
 --- first staged selection becomes the edit/ask target and locks the mode;
 --- later ones (from any file) stack as additional context. Line numbers
 --- are captured now, so heavy editing of the target region before sending
@@ -197,15 +353,14 @@ function M.from_visual(mode)
         state.mode = mode
         state.target = entry
     else
-        local dup = false
+        local dup = state.target.file == entry.file
+            and state.target.first == entry.first and state.target.last == entry.last
         for _, c in ipairs(state.contexts) do
             if c.file == entry.file and c.first == entry.first and c.last == entry.last then
                 dup = true
             end
         end
-        local is_target = state.target.file == entry.file
-            and state.target.first == entry.first and state.target.last == entry.last
-        if not dup and not is_target then
+        if not dup then
             state.contexts[#state.contexts + 1] = entry
         end
     end
