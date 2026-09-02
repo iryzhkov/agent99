@@ -112,26 +112,13 @@ local function send()
             vim.log.levels.WARN)
         return
     end
-    -- Extra selections ride along inside the instruction, so the prompt
-    -- builder and engine stay unchanged.
-    local instruction = text
-    if #state.contexts > 0 then
-        local parts = { text, "",
-            "The user attached additional context selections:" }
-        for _, c in ipairs(state.contexts) do
-            parts[#parts + 1] = ("<context file=%q lines=%d-%d>"):format(
-                c.file, c.first, c.last)
-            parts[#parts + 1] = c.text
-            parts[#parts + 1] = "</context>"
-        end
-        instruction = table.concat(parts, "\n")
-    end
     local mode = state.mode
+    local contexts = state.contexts
     close_all()
     vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, {})
     state.mode, state.target, state.contexts = nil, nil, {}
     require("agent99.request").start(target.buf, target.first, target.last,
-        instruction, { mode = mode })
+        text, { mode = mode, contexts = contexts })
 end
 
 -- ---------------------------------------------------------------- render --

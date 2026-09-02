@@ -582,12 +582,27 @@ function M.start(buf, first, last, instruction, opts)
     local mode = opts.mode or "edit"
     local region_lines = first
         and vim.api.nvim_buf_get_lines(buf, first - 1, last, false) or nil
+    -- Attached context selections (the compose stack) go to the MODEL as
+    -- blocks appended to the instruction, but stay separate on the record
+    -- so the history view can list each one as its own section.
+    local prompt_instruction = instruction
+    if opts.contexts and #opts.contexts > 0 then
+        local parts = { instruction, "",
+            "The user attached additional context selections:" }
+        for _, c in ipairs(opts.contexts) do
+            parts[#parts + 1] = ("<context file=%q lines=%d-%d>"):format(
+                c.file, c.first, c.last)
+            parts[#parts + 1] = c.text
+            parts[#parts + 1] = "</context>"
+        end
+        prompt_instruction = table.concat(parts, "\n")
+    end
     local prompt = opts.prompt
     if not prompt then
         local selection = table.concat(region_lines, "\n")
         local builder = mode == "ask" and prompts.ask or prompts.edit
         prompt = builder(buf, file, vim.bo[buf].filetype, root, first, last,
-            selection, instruction)
+            selection, prompt_instruction)
     end
 
     local bin = check_bridge()
@@ -667,6 +682,9 @@ function M.start(buf, first, last, instruction, opts)
         transcript = provider.kind == "openai" and transcript or nil,
         followup_of = opts.followup_of,
         autofix = opts.autofix or nil,
+        contexts = opts.contexts and #opts.contexts > 0 and vim.tbl_map(function(c)
+            return { file = c.file, first = c.first, last = c.last, text = c.text }
+        end, opts.contexts) or nil,
         -- Guards against applying over a region the user edited mid-flight.
         region_hash = region_lines
             and vim.fn.sha256(table.concat(region_lines, "\n")) or nil,

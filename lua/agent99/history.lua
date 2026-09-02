@@ -435,7 +435,34 @@ local function record_sections(rec)
         info[#info + 1] = "- transcript: " .. rec.transcript
     end
     sec("info", info)
-    sec("instruction", vim.split(rec.instruction or "(none)", "\n", { plain = true }))
+    local function ctx_section(file, first, last, text)
+        local lang = (file and vim.filetype.match({ filename = file })) or ""
+        local body = { ("%s:%s-%s"):format(vim.fn.fnamemodify(file, ":~:."),
+            tostring(first), tostring(last)), "", "```" .. lang }
+        vim.list_extend(body, vim.split(text or "", "\n", { plain = true }))
+        body[#body + 1] = "```"
+        sec(("ctx: %s:%s-%s"):format(vim.fn.fnamemodify(file, ":t"),
+            tostring(first), tostring(last)), body)
+    end
+    local instruction = rec.instruction or "(none)"
+    if rec.contexts then
+        sec("instruction", vim.split(instruction, "\n", { plain = true }))
+        for _, c in ipairs(rec.contexts) do
+            ctx_section(c.file, c.first, c.last, c.text)
+        end
+    else
+        -- Older records inlined the compose contexts into the instruction;
+        -- split them back apart for the section list.
+        local head = instruction:match(
+            "^(.-)\n\nThe user attached additional context selections:")
+        sec("instruction", vim.split(head or instruction, "\n", { plain = true }))
+        if head then
+            for file, first, last, text in instruction:gmatch(
+                '<context file="(.-)" lines=(%d+)%-(%d+)>\n(.-)\n</context>') do
+                ctx_section(file, first, last, text)
+            end
+        end
+    end
     if rec.mode ~= "ask" and rec.mode ~= "chat" and rec.before and rec.result then
         sec("change", change_lines(rec.file, rec.before, rec.result, true))
     end
@@ -498,6 +525,24 @@ function M.open_record(rec)
         footer = " j/k · q close ", footer_pos = "center",
     })
     vim.wo[list_win].cursorline = true
+    -- Open on the payload - answer, change, or the first edit - not info.
+    local default = 1
+    for i, s in ipairs(sections) do
+        if s.name == "answer" or s.name == "change" or s.name == "replacement" then
+            default = i
+            break
+        end
+    end
+    if default == 1 then
+        for i, s in ipairs(sections) do
+            if s.name ~= "info" and s.name ~= "instruction"
+                and not s.name:match("^ctx:") then
+                default = i
+                break
+            end
+        end
+    end
+    pcall(vim.api.nvim_win_set_cursor, list_win, { default, 0 })
 
     local content_win = vim.api.nvim_open_win(content_buf, false, {
         relative = "editor", row = row, col = col + lw + 2,
