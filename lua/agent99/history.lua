@@ -300,6 +300,29 @@ local function record_preview(rec, running_secs, full)
     return lines
 end
 
+-- Relative age for the list ("just now", "10m ago", "2h ago", "3d ago"),
+-- undotree-style; falls back to the raw timestamp when it doesn't parse.
+-- The absolute time stays in the ordinal, so date searches keep working.
+local function rel_time(timestr)
+    local y, mo, d, h, mi, s = (timestr or ""):match(
+        "(%d+)-(%d+)-(%d+) (%d+):(%d+):(%d+)")
+    if not y then
+        return timestr or "?"
+    end
+    local age = os.time() - os.time({ year = y, month = mo, day = d,
+        hour = h, min = mi, sec = s })
+    if age < 60 then
+        return "just now"
+    elseif age < 3600 then
+        return ("%dm ago"):format(math.floor(age / 60))
+    elseif age < 86400 then
+        return ("%dh ago"):format(math.floor(age / 3600))
+    elseif age < 7 * 86400 then
+        return ("%dd ago"):format(math.floor(age / 86400))
+    end
+    return ("%s-%s-%s"):format(y, mo, d)
+end
+
 -- Running request first, then records newest-first. Each item carries its
 -- one-line display, a searchable ordinal, the preview lines, and the
 -- record path (nil while running).
@@ -325,9 +348,9 @@ local function picker_items()
             -- type "@past" for runs from earlier Neovim sessions.
             local session = session_ids[rec.id] and "@now" or "@past"
             items[#items + 1] = {
-                display = ("%s%s │ %-12s │ %-5s │ %s"):format(
+                display = ("%s%-10s │ %-12s │ %-5s │ %s"):format(
                     session_ids[rec.id] and "• " or "  ",
-                    rec.time or "?", rec.status or "?", rec.mode or "edit",
+                    rel_time(rec.time), rec.status or "?", rec.mode or "edit",
                     (rec.instruction or ""):sub(1, 60):gsub("\n", " ")),
                 ordinal = table.concat({ session, rec.time or "", rec.status or "",
                     rec.mode or "", rec.file or "", rec.instruction or "" }, " "),
@@ -345,6 +368,19 @@ end
 -- the fences render plain; fall back to line highlights so +/-/@@ still
 -- read as a diff.
 local diff_ns = vim.api.nvim_create_namespace("agent99_history_diff")
+
+-- Hide the raw ``` fence delimiter lines (conceal_lines). Treesitter's
+-- language injection highlights the fence CONTENT regardless; this removes
+-- the markup lines themselves in surfaces render-markdown does not cover
+-- (the telescope preview renders while the prompt is in insert mode).
+local function conceal_fences(buf, lines)
+    for i, l in ipairs(lines) do
+        if l:match("^```") then
+            vim.api.nvim_buf_set_extmark(buf, diff_ns, i - 1, 0,
+                { conceal_lines = "" })
+        end
+    end
+end
 
 local function colorize_diff_fences(buf, lines)
     if pcall(vim.treesitter.language.add, "diff") then
@@ -370,12 +406,17 @@ end
 
 -- The full rendered view of one record: the preview's markdown without
 -- truncation, in its own split. gf on the record/transcript lines opens
--- the raw JSON for anyone who wants it.
-local function open_record(rec)
+-- the raw JSON for anyone who wants it. Also serves as the answer window
+-- for finished ask requests.
+function M.open_record(rec)
     local buf = vim.api.nvim_create_buf(false, true)
     local lines = record_preview(rec, nil, true)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     colorize_diff_fences(buf, lines)
+    if not package.loaded["render-markdown"] then
+        -- Without render-markdown the fence delimiters would show raw.
+        conceal_fences(buf, lines)
+    end
     vim.bo[buf].modifiable = false
     vim.bo[buf].bufhidden = "wipe"
     vim.bo[buf].filetype = "markdown"
@@ -420,7 +461,9 @@ local function telescope_browse(items)
                 -- the preview window - a bare filetype gives raw markup.
                 vim.bo[self.state.bufnr].filetype = "markdown"
                 pcall(vim.treesitter.start, self.state.bufnr, "markdown")
+                vim.api.nvim_buf_clear_namespace(self.state.bufnr, diff_ns, 0, -1)
                 colorize_diff_fences(self.state.bufnr, entry.value.preview)
+                conceal_fences(self.state.bufnr, entry.value.preview)
                 if self.state.winid and vim.api.nvim_win_is_valid(self.state.winid) then
                     vim.wo[self.state.winid].conceallevel = 2
                     vim.wo[self.state.winid].concealcursor = "nc"
@@ -437,7 +480,7 @@ local function telescope_browse(items)
                     return
                 end
                 if entry.value.rec then
-                    open_record(entry.value.rec)
+                    M.open_record(entry.value.rec)
                 else
                     vim.notify("agent99: request is still running (/cancel or <leader>9x to stop)")
                 end
@@ -464,7 +507,7 @@ local function split_browse(items)
     vim.keymap.set("n", "<CR>", function()
         local target = targets[vim.api.nvim_win_get_cursor(0)[1]]
         if target then
-            open_record(target)
+            M.open_record(target)
         end
     end, { buffer = buf, desc = "agent99: open record" })
     vim.keymap.set("n", "q", vim.cmd.close, { buffer = buf })

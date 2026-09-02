@@ -327,29 +327,6 @@ local function open_preview(lines, record)
     })
 end
 
--- ----------------------------------------------------------------- answer --
-
--- Show an ask-mode answer in a markdown split. The original selection stays
--- marked as state.last, so <leader>9f can turn the discussion into an edit.
-local function open_answer(text)
-    local old = vim.fn.bufnr("agent99://answer")
-    if old ~= -1 then
-        pcall(vim.api.nvim_buf_delete, old, { force = true })
-    end
-    local abuf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_lines(abuf, 0, -1, false, vim.split(text, "\n", { plain = true }))
-    vim.bo[abuf].bufhidden = "wipe"
-    vim.bo[abuf].modifiable = false
-    vim.bo[abuf].filetype = "markdown"
-    vim.api.nvim_buf_set_name(abuf, "agent99://answer")
-    vim.cmd("botright 15split")
-    local win = vim.api.nvim_get_current_win()
-    vim.api.nvim_win_set_buf(win, abuf)
-    vim.wo[win].winbar = "agent99 answer — <leader>9f to turn into an edit · q close"
-    vim.wo[win].wrap = true
-    vim.keymap.set("n", "q", vim.cmd.close, { buffer = abuf })
-end
-
 -- ------------------------------------------------------------------- runs --
 
 -- Structured usage data mined from the runner's stderr, stored on the
@@ -565,11 +542,11 @@ local function on_exit(result)
         state.job = nil
         if record.mode == "ask" then
             -- No edit: keep the discussed region reachable for a follow-up,
-            -- then show the answer.
-            local answer = record.result
+            -- then show the answer as a rendered record view (the same
+            -- read-only window the history picker opens).
             keep_last_region()
             clear_request(false)
-            open_answer(answer)
+            require("agent99.history").open_record(record)
         elseif config.options.preview then
             open_preview(lines, record)
         else
