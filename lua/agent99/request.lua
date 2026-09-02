@@ -428,22 +428,60 @@ local function on_exit(result)
             "exit code: " .. tostring(result.code),
             "stdout:", result.stdout or "", "stderr:", result.stderr or "",
         })
-        -- The claude provider's JSON envelope: unwrap the answer text and
-        -- harvest the usage metadata plain text output would not carry.
+        -- The claude provider's stream-json output: one JSON event per
+        -- line - assistant turns (text + tool calls), tool results, and a
+        -- final result envelope with usage. Unwrap the answer, harvest the
+        -- usage, and synthesize a transcript so the record gets the same
+        -- work trace (and continuability) as openai-kind runs.
         if record.provider and record.provider:sub(1, 6) == "claude"
             and result.stdout and result.stdout:sub(1, 1) == "{" then
-            local okj, res = pcall(vim.json.decode, result.stdout)
-            if okj and type(res) == "table" and type(res.result) == "string" then
-                result.stdout = res.result
-                if res.is_error then
-                    record.error = res.result:sub(1, 500)
+            local msgs, final = {}, nil
+            for line in result.stdout:gmatch("[^\n]+") do
+                local okj, ev = pcall(vim.json.decode, line)
+                if okj and type(ev) == "table" then
+                    if ev.type == "assistant" and ev.message then
+                        local text, calls = {}, {}
+                        for _, b in ipairs(ev.message.content or {}) do
+                            if b.type == "text" and b.text ~= "" then
+                                text[#text + 1] = b.text
+                            elseif b.type == "tool_use" then
+                                calls[#calls + 1] = { id = b.id, type = "function",
+                                    ["function"] = { name = b.name,
+                                        arguments = vim.json.encode(b.input or vim.empty_dict()) } }
+                            end
+                        end
+                        msgs[#msgs + 1] = { role = "assistant",
+                            content = table.concat(text, "\n"),
+                            tool_calls = #calls > 0 and calls or nil }
+                    elseif ev.type == "user" and ev.message then
+                        for _, b in ipairs(ev.message.content or {}) do
+                            if type(b) == "table" and b.type == "tool_result" then
+                                local c = b.content
+                                if type(c) == "table" then
+                                    local parts = {}
+                                    for _, cb in ipairs(c) do
+                                        parts[#parts + 1] = cb.text or ""
+                                    end
+                                    c = table.concat(parts, "\n")
+                                end
+                                msgs[#msgs + 1] = { role = "tool",
+                                    tool_call_id = b.tool_use_id, content = c or "" }
+                            end
+                        end
+                    elseif ev.type == "result" then
+                        final = ev
+                    end
                 end
-                -- The envelope names the models actually used - the MAIN
-                -- one plus a haiku sidecar Claude Code runs for auxiliary
-                -- work. Prefer the non-haiku entry (by output volume as a
-                -- tiebreak), so the record names the model that did the job.
+            end
+            if final and type(final.result) == "string" then
+                result.stdout = final.result
+                if final.is_error then
+                    record.error = final.result:sub(1, 500)
+                end
+                -- Prefer the non-haiku model: Claude Code always runs a
+                -- haiku sidecar for auxiliary work beside the main model.
                 local model, best
-                for m, u in pairs(res.modelUsage or {}) do
+                for m, u in pairs(final.modelUsage or {}) do
                     local score = ((u.outputTokens or 0) + 1)
                         * (m:find("haiku", 1, true) and 1 or 1e6)
                     if not best or score > best then
@@ -453,20 +491,26 @@ local function on_exit(result)
                 if model then
                     record.provider = "claude/" .. model
                 end
-                local u = res.usage or {}
+                local u = final.usage or {}
                 local cached = u.cache_read_input_tokens or 0
-                record.rounds = res.num_turns
+                record.rounds = final.num_turns
                 record.tokens_in = (u.input_tokens or 0) + cached
                     + (u.cache_creation_input_tokens or 0)
                 record.tokens_cached = cached
                 record.tokens_out = u.output_tokens or 0
-                record.secs = res.duration_ms
-                    and math.floor(res.duration_ms / 1000) or nil
+                record.secs = final.duration_ms
+                    and math.floor(final.duration_ms / 1000) or nil
                 if (record.tokens_in or 0) > 0 then
                     record.stats = ("%d rounds · %.1fk in (%d%% cached) / %.1fk out · %ds")
                         :format(record.rounds or 0, record.tokens_in / 1000,
                             math.floor(cached * 100 / record.tokens_in + 0.5),
                             record.tokens_out / 1000, record.secs or 0)
+                end
+                if #msgs > 0 and record.transcript then
+                    table.insert(msgs, 1, { role = "user",
+                        content = "The user says:\n" .. (record.instruction or "") })
+                    vim.fn.writefile(
+                        { vim.json.encode(msgs) }, record.transcript)
                 end
             end
         end
@@ -674,10 +718,10 @@ function M.start(buf, first, last, instruction, opts)
     if provider.kind == "claude" then
         cmd = {
             provider.claude_cmd, "-p",
-            -- JSON output wraps the answer with usage metadata (tokens,
-            -- turns, duration) that plain text output omits; unwrapped in
-            -- on_exit.
-            "--output-format", "json",
+            -- stream-json emits every step (assistant turns, tool calls,
+            -- tool results) plus a final result envelope with usage - the
+            -- material for the record's work trace; parsed in on_exit.
+            "--output-format", "stream-json", "--verbose",
             "--mcp-config", write_mcp_config(),
             "--strict-mcp-config",
             "--allowedTools", table.concat(provider.allowed_tools, ","),
@@ -746,7 +790,7 @@ function M.start(buf, first, last, instruction, opts)
         instruction = instruction,
         provider = provider.kind .. "/" .. (provider.model
             or (provider.kind == "claude" and "default" or "?")),
-        transcript = provider.kind == "openai" and transcript or nil,
+        transcript = transcript,
         followup_of = opts.followup_of,
         autofix = opts.autofix or nil,
         chat_session = opts.chat_session,
