@@ -147,6 +147,21 @@ local function define_commands()
     cmd("Agent99Stats", function(o)
         M.stats(vim.trim(o.args) == "all" and "all" or nil)
     end, { nargs = "?", complete = function() return { "all" } end })
+    cmd("Agent99Provider", function(o)
+        local cfg = config()
+        local name = vim.trim(o.args)
+        if name == "" then
+            vim.notify("agent99: provider is " .. cfg.provider_label()
+                .. " (switch: :Agent99Provider " .. table.concat(cfg.provider_names(), "|") .. ")")
+            return
+        end
+        local ok, err = pcall(cfg.switch_provider, name)
+        if ok then
+            vim.notify("agent99: provider switched to " .. cfg.provider_label())
+        else
+            vim.notify(tostring(err), vim.log.levels.ERROR)
+        end
+    end, { nargs = "?", complete = function() return config().provider_names() end })
     cmd("Agent99SetKey", M.set_key, {})
     cmd("Agent99Logs", M.view_logs, {})
 end

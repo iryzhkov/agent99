@@ -75,6 +75,10 @@ providers = { mylab = { base_url = "http://mylab:8000/v1", model = "m", api_key 
 provider = "mylab",
 ```
 
+`:Agent99Provider <name>` switches presets at runtime (tab-completes;
+no argument shows the active provider) — e.g. a cheap default for chat and
+`:Agent99Provider claude` for a hard edit.
+
 Provider fields (all overridable per preset): `kind` (`"openai"` for any
 OpenAI-compatible chat-completions API, `"claude"`), `base_url`, `model`,
 `api_key` / `api_key_env` / `keyring_service` (resolution order; see below),

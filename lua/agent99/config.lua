@@ -161,6 +161,33 @@ function M.setup(opts)
     return merged
 end
 
+--- Switch the active provider at runtime (:Agent99Provider). `name` is a
+--- preset name - built-in or from options.providers. Requests already
+--- running are unaffected; the next request uses the new provider.
+function M.switch_provider(name)
+    M.options.provider = resolve_provider(name, M.options.providers)
+    return M.options.provider
+end
+
+--- Preset names available for switching (built-ins + user-defined).
+function M.provider_names()
+    local names = {}
+    for name in pairs(vim.tbl_extend("force", M.presets, M.options.providers or {})) do
+        names[#names + 1] = name
+    end
+    table.sort(names)
+    return names
+end
+
+--- One-line human description of the active provider.
+function M.provider_label()
+    local p = M.options.provider
+    if p.kind == "claude" then
+        return ("claude (%s)"):format(p.model or "CLI default model")
+    end
+    return ("%s @ %s"):format(tostring(p.model), tostring(p.base_url))
+end
+
 -- ------------------------------------------------------------------ paths --
 
 function M.state_dir()
