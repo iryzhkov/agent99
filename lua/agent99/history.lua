@@ -180,6 +180,36 @@ function M.history_lines(n)
     return lines
 end
 
+-- A change rendered as code in the file's own language: one Added or
+-- Removed block when a side is empty, Before/After blocks otherwise.
+local function change_lines(file, before, after, full)
+    local out = {}
+    local lang = (file and vim.filetype.match({ filename = file })) or ""
+    local function block(title, text)
+        out[#out + 1] = ""
+        out[#out + 1] = "**" .. title .. "**"
+        out[#out + 1] = "```" .. lang
+        local body = vim.split(text, "\n", { plain = true })
+        if not full and #body > 60 then
+            body = vim.list_slice(body, 1, 60)
+            body[#body + 1] = "... (truncated; <CR> opens the full view)"
+        end
+        vim.list_extend(out, body)
+        out[#out + 1] = "```"
+    end
+    local b = vim.trim(before or "")
+    local a = vim.trim(after or "")
+    if b == "" and a ~= "" then
+        block("Added", after)
+    elseif a == "" and b ~= "" then
+        block("Removed", before)
+    else
+        block("Before", before)
+        block("After", after)
+    end
+    return out
+end
+
 -- What was given to the agent and what came back, rendered as read-only
 -- markdown for the picker preview. `full` lifts the truncation caps and
 -- adds gf-able paths to the raw record and transcript (the opened view).
@@ -188,32 +218,8 @@ local function record_preview(rec, running_secs, full)
     local function add(s)
         vim.list_extend(lines, vim.split(s, "\n", { plain = true }))
     end
-    -- A change rendered as code in the file's own language: one Added or
-    -- Removed block when a side is empty, Before/After blocks otherwise.
     local function add_change(file, before, after)
-        local lang = (file and vim.filetype.match({ filename = file })) or ""
-        local function block(title, text)
-            add("")
-            add("**" .. title .. "**")
-            add("```" .. lang)
-            local body = vim.split(text, "\n", { plain = true })
-            if not full and #body > 60 then
-                body = vim.list_slice(body, 1, 60)
-                body[#body + 1] = "... (truncated; <CR> opens the full view)"
-            end
-            vim.list_extend(lines, body)
-            add("```")
-        end
-        local b = vim.trim(before or "")
-        local a = vim.trim(after or "")
-        if b == "" and a ~= "" then
-            block("Added", after)
-        elseif a == "" and b ~= "" then
-            block("Removed", before)
-        else
-            block("Before", before)
-            block("After", after)
-        end
+        vim.list_extend(lines, change_lines(file, before, after, full))
     end
     if running_secs then
         add(("# RUNNING — %ds elapsed"):format(running_secs))
@@ -404,52 +410,170 @@ local function colorize_diff_fences(buf, lines)
     end
 end
 
--- The full rendered view of one record: the preview's markdown without
--- truncation, in its own split. gf on the record/transcript lines opens
--- the raw JSON for anyone who wants it. Also serves as the answer window
--- for finished ask requests.
-function M.open_record(rec)
-    local buf = vim.api.nvim_create_buf(false, true)
-    local lines = record_preview(rec, nil, true)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    colorize_diff_fences(buf, lines)
-    if not package.loaded["render-markdown"] then
-        -- Without render-markdown the fence delimiters would show raw.
-        conceal_fences(buf, lines)
-    end
-    vim.bo[buf].modifiable = false
-    vim.bo[buf].bufhidden = "wipe"
-    vim.bo[buf].filetype = "markdown"
-    pcall(vim.treesitter.start, buf, "markdown")
-    pcall(vim.api.nvim_buf_set_name, buf, "agent99://record/" .. (rec.id or "?"))
-    -- Telescope-style centered float rather than a split.
-    local width = math.min(100, vim.o.columns - 8)
-    local height = math.min(math.max(#lines + 2, 10), vim.o.lines - 6)
-    local win = vim.api.nvim_open_win(buf, true, {
-        relative = "editor",
-        width = width,
-        height = height,
-        row = math.floor((vim.o.lines - height) / 2) - 1,
-        col = math.floor((vim.o.columns - width) / 2),
-        style = "minimal",
-        border = "rounded",
-        title = (" agent99 %s — %s "):format(rec.mode or "record",
-            rec.status or rec.id or "?"),
-        title_pos = "center",
-        footer = " q close · gf on a path opens the raw file ",
-        footer_pos = "center",
-    })
-    vim.wo[win].conceallevel = 2
-    vim.wo[win].concealcursor = "nc"
-    vim.wo[win].wrap = true
-    vim.wo[win].linebreak = true
-    local function close()
-        if vim.api.nvim_win_is_valid(win) then
-            pcall(vim.api.nvim_win_close, win, true)
+-- The record broken into named sections for the two-pane view: info,
+-- instruction, one section per edit, answer/replacement, error.
+local function record_sections(rec)
+    local sections = {}
+    local function sec(name, lines)
+        if lines and #lines > 0 then
+            sections[#sections + 1] = { name = name, lines = lines }
         end
     end
-    vim.keymap.set("n", "q", close, { buffer = buf })
-    vim.keymap.set("n", "<Esc>", close, { buffer = buf })
+    local info = {
+        ("# %s — %s"):format(rec.time or "?", rec.status or "?"),
+        ("- mode: %s · provider: %s"):format(rec.mode or "edit", rec.provider or "?"),
+    }
+    if rec.file and rec.file ~= "" then
+        info[#info + 1] = ("- target: %s:%s-%s"):format(
+            vim.fn.fnamemodify(rec.file, ":~:."), tostring(rec.first), tostring(rec.last))
+    end
+    if rec.stats then
+        info[#info + 1] = "- " .. rec.stats
+    end
+    info[#info + 1] = "- record: " .. config.history_dir() .. "/" .. (rec.id or "?") .. ".json"
+    if rec.transcript then
+        info[#info + 1] = "- transcript: " .. rec.transcript
+    end
+    sec("info", info)
+    sec("instruction", vim.split(rec.instruction or "(none)", "\n", { plain = true }))
+    if rec.mode ~= "ask" and rec.mode ~= "chat" and rec.before and rec.result then
+        sec("change", change_lines(rec.file, rec.before, rec.result, true))
+    end
+    for _, e in ipairs(rec.edits or {}) do
+        sec(e.label or "edit", change_lines(e.file, e.before, e.after, true))
+    end
+    for _, d in ipairs(rec.edit_diffs or {}) do
+        local body = { "```diff" }
+        vim.list_extend(body, vim.split(d.diff, "\n", { plain = true }))
+        body[#body + 1] = "```"
+        sec(d.label or "edit", body)
+    end
+    if rec.result and rec.result ~= "" then
+        if rec.mode == "ask" or rec.mode == "chat" then
+            sec("answer", vim.split(rec.result, "\n", { plain = true }))
+        elseif not rec.before then
+            sec("replacement", vim.split(rec.result, "\n", { plain = true }))
+        end
+    end
+    if rec.error then
+        sec("error", vim.split(rec.error, "\n", { plain = true }))
+    end
+    return sections
+end
+
+-- The full rendered view of one record: a telescope-style two-pane float -
+-- section list on the left (j/k), the selected section rendered as
+-- markdown on the right. Also serves as the answer window for finished
+-- ask requests. gf on the record/transcript lines opens the raw JSON.
+function M.open_record(rec)
+    local sections = record_sections(rec)
+    local W = math.min(110, vim.o.columns - 6)
+    local H = math.min(28, vim.o.lines - 6)
+    local lw = 26
+    local cw = W - lw - 2
+    local row = math.floor((vim.o.lines - H) / 2) - 1
+    local col = math.floor((vim.o.columns - W) / 2)
+
+    local list_buf = vim.api.nvim_create_buf(false, true)
+    local names = {}
+    for i, s in ipairs(sections) do
+        names[i] = s.name:sub(1, lw - 2)
+    end
+    vim.api.nvim_buf_set_lines(list_buf, 0, -1, false, names)
+    vim.bo[list_buf].modifiable = false
+    vim.bo[list_buf].bufhidden = "wipe"
+
+    local content_buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[content_buf].bufhidden = "wipe"
+    vim.bo[content_buf].filetype = "markdown"
+    pcall(vim.treesitter.start, content_buf, "markdown")
+    pcall(vim.api.nvim_buf_set_name, content_buf,
+        "agent99://record/" .. (rec.id or "?"))
+
+    local list_win = vim.api.nvim_open_win(list_buf, true, {
+        relative = "editor", row = row, col = col, width = lw, height = H,
+        style = "minimal", border = "rounded",
+        title = (" %s — %s "):format(rec.mode or "record", rec.status or "?"),
+        title_pos = "center",
+        footer = " j/k · q close ", footer_pos = "center",
+    })
+    vim.wo[list_win].cursorline = true
+
+    local content_win = vim.api.nvim_open_win(content_buf, false, {
+        relative = "editor", row = row, col = col + lw + 2,
+        width = cw, height = H,
+        style = "minimal", border = "rounded",
+        title = " " .. (sections[1] and sections[1].name or "record") .. " ",
+        title_pos = "center",
+        footer = " <Tab> scroll pane · gf opens raw file ", footer_pos = "center",
+    })
+    vim.wo[content_win].conceallevel = 2
+    vim.wo[content_win].concealcursor = "nc"
+    vim.wo[content_win].wrap = true
+    vim.wo[content_win].linebreak = true
+
+    local function show_section()
+        if not vim.api.nvim_win_is_valid(list_win) then
+            return
+        end
+        local s = sections[vim.api.nvim_win_get_cursor(list_win)[1]]
+        if not (s and vim.api.nvim_buf_is_valid(content_buf)) then
+            return
+        end
+        vim.bo[content_buf].modifiable = true
+        vim.api.nvim_buf_set_lines(content_buf, 0, -1, false, s.lines)
+        vim.bo[content_buf].modifiable = false
+        vim.api.nvim_buf_clear_namespace(content_buf, diff_ns, 0, -1)
+        colorize_diff_fences(content_buf, s.lines)
+        if not package.loaded["render-markdown"] then
+            conceal_fences(content_buf, s.lines)
+        end
+        if vim.api.nvim_win_is_valid(content_win) then
+            vim.api.nvim_win_set_config(content_win,
+                { title = " " .. s.name .. " ", title_pos = "center" })
+            pcall(vim.api.nvim_win_set_cursor, content_win, { 1, 0 })
+        end
+    end
+
+    local closing = false
+    local function close()
+        if closing then
+            return
+        end
+        closing = true
+        for _, w in ipairs({ list_win, content_win }) do
+            if vim.api.nvim_win_is_valid(w) then
+                pcall(vim.api.nvim_win_close, w, true)
+            end
+        end
+    end
+
+    for _, b in ipairs({ list_buf, content_buf }) do
+        vim.keymap.set("n", "q", close, { buffer = b })
+        vim.keymap.set("n", "<Esc>", close, { buffer = b })
+    end
+    vim.keymap.set("n", "<Tab>", function()
+        vim.api.nvim_set_current_win(content_win)
+    end, { buffer = list_buf, desc = "agent99: to content" })
+    vim.keymap.set("n", "<Tab>", function()
+        if vim.api.nvim_win_is_valid(list_win) then
+            vim.api.nvim_set_current_win(list_win)
+        end
+    end, { buffer = content_buf, desc = "agent99: to sections" })
+    vim.api.nvim_create_autocmd("CursorMoved", {
+        buffer = list_buf,
+        callback = show_section,
+    })
+    for _, w in ipairs({ list_win, content_win }) do
+        vim.api.nvim_create_autocmd("WinClosed", {
+            pattern = tostring(w),
+            once = true,
+            callback = function()
+                vim.schedule(close)
+            end,
+        })
+    end
+    show_section()
 end
 
 local function telescope_browse(items)
