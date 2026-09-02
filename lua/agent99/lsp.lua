@@ -1143,7 +1143,7 @@ local function resolve_symbol(file, name_path)
     return bufnr, candidates[1].entry
 end
 
-local function record_edit(bufnr, entry_path, kind, first, last, old_lines, new_count)
+local function record_edit(bufnr, entry_path, kind, first, last, old_lines, new_lines)
     require("agent99.edits").record({
         file = vim.api.nvim_buf_get_name(bufnr),
         bufnr = bufnr,
@@ -1152,7 +1152,8 @@ local function record_edit(bufnr, entry_path, kind, first, last, old_lines, new_
         first = first,
         last = last,
         old_lines = old_lines,
-        new_count = new_count,
+        new_lines = new_lines,
+        new_count = #new_lines,
     })
 end
 
@@ -1164,7 +1165,7 @@ local function replace_symbol_body(args)
     local new_lines = vim.split((args.body:gsub("\n+$", "")), "\n", { plain = true })
     local old = vim.api.nvim_buf_get_lines(bufnr, entry.first - 1, entry.last, false)
     vim.api.nvim_buf_set_lines(bufnr, entry.first - 1, entry.last, false, new_lines)
-    record_edit(bufnr, entry.path, "replace", entry.first, entry.last, old, #new_lines)
+    record_edit(bufnr, entry.path, "replace", entry.first, entry.last, old, new_lines)
     return {
         replaced = entry.path,
         file = vim.api.nvim_buf_get_name(bufnr),
@@ -1198,7 +1199,7 @@ local function replace_symbol_lines(args)
     local old = vim.api.nvim_buf_get_lines(bufnr, abs_first - 1, abs_last, false)
     vim.api.nvim_buf_set_lines(bufnr, abs_first - 1, abs_last, false, new_lines)
     record_edit(bufnr, ("%s:%d-%d"):format(entry.path, first, last), "replace_lines",
-        abs_first, abs_last, old, #new_lines)
+        abs_first, abs_last, old, new_lines)
     return {
         replaced = ("lines %d-%d of %s"):format(first, last, entry.path),
         file = vim.api.nvim_buf_get_name(bufnr),
@@ -1224,7 +1225,7 @@ local function insert_symbol_tool(where)
             table.insert(lines, "")
         end
         vim.api.nvim_buf_set_lines(bufnr, row, row, false, lines)
-        record_edit(bufnr, entry.path, "insert_" .. where, row + 1, row, {}, #lines)
+        record_edit(bufnr, entry.path, "insert_" .. where, row + 1, row, {}, lines)
         return {
             inserted = ("%s %s"):format(where, entry.path),
             file = vim.api.nvim_buf_get_name(bufnr),

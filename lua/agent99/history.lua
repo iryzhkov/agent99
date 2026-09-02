@@ -203,7 +203,22 @@ local function record_preview(rec, running_secs)
     add("")
     add("## Instruction")
     add(rec.instruction or "(none)")
-    if rec.symbol_edits and #rec.symbol_edits > 0 then
+    if rec.edit_diffs and #rec.edit_diffs > 0 then
+        add("")
+        add("## Symbol edits")
+        for _, d in ipairs(rec.edit_diffs) do
+            add("")
+            add("**" .. d.label .. "**")
+            add("```diff")
+            local body = vim.split(d.diff, "\n", { plain = true })
+            if #body > 60 then
+                body = vim.list_slice(body, 1, 60)
+                body[#body + 1] = "... (edit truncated)"
+            end
+            vim.list_extend(lines, body)
+            add("```")
+        end
+    elseif rec.symbol_edits and #rec.symbol_edits > 0 then
         add("")
         add("## Symbol edits")
         for _, e in ipairs(rec.symbol_edits) do

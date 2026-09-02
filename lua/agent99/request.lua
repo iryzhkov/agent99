@@ -474,12 +474,24 @@ local function on_exit(result)
         local tool_edits = require("agent99.edits").take()
         if #tool_edits > 0 then
             state.last_edits = tool_edits
-            local summary = {}
+            local summary, diffs = {}, {}
             for _, e in ipairs(tool_edits) do
-                summary[#summary + 1] = ("%s %s in %s (lines %d+)"):format(
+                local label = ("%s %s in %s (lines %d+)"):format(
                     e.kind, e.name_path, vim.fn.fnamemodify(e.file, ":t"), e.first)
+                summary[#summary + 1] = label
+                -- Old and new text were captured at apply time (the ledger),
+                -- so the diff is exact even if later edits shifted lines.
+                if e.new_lines and #diffs < 20 then
+                    local d = vim.diff(
+                        table.concat(e.old_lines or {}, "\n") .. "\n",
+                        table.concat(e.new_lines, "\n") .. "\n", {}) or ""
+                    diffs[#diffs + 1] = { label = label, diff = d:gsub("\n$", "") }
+                end
             end
             record.symbol_edits = summary
+            if #diffs > 0 then
+                record.edit_diffs = diffs
+            end
         end
 
         -- Chat mode: the answer goes to the panel, edits already happened
