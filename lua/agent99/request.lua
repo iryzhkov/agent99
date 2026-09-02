@@ -438,9 +438,18 @@ local function on_exit(result)
                 if res.is_error then
                     record.error = res.result:sub(1, 500)
                 end
-                -- The envelope names the model actually used; nicer than
-                -- "default" when the provider did not pin one.
-                local model = next(res.modelUsage or {})
+                -- The envelope names the models actually used - the MAIN
+                -- one plus a haiku sidecar Claude Code runs for auxiliary
+                -- work. Prefer the non-haiku entry (by output volume as a
+                -- tiebreak), so the record names the model that did the job.
+                local model, best
+                for m, u in pairs(res.modelUsage or {}) do
+                    local score = ((u.outputTokens or 0) + 1)
+                        * (m:find("haiku", 1, true) and 1 or 1e6)
+                    if not best or score > best then
+                        model, best = m, score
+                    end
+                end
                 if model then
                     record.provider = "claude/" .. model
                 end
