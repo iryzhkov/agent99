@@ -304,12 +304,42 @@ local function picker_items()
     return items
 end
 
+-- Markdown highlights ```diff fences through language injection, which
+-- needs a diff treesitter parser (not bundled with Neovim). Without one
+-- the fences render plain; fall back to line highlights so +/-/@@ still
+-- read as a diff.
+local diff_ns = vim.api.nvim_create_namespace("agent99_history_diff")
+
+local function colorize_diff_fences(buf, lines)
+    if pcall(vim.treesitter.language.add, "diff") then
+        return -- injection will do a better job
+    end
+    local in_diff = false
+    for i, l in ipairs(lines) do
+        if l == "```diff" then
+            in_diff = true
+        elseif l == "```" then
+            in_diff = false
+        elseif in_diff then
+            local hl = (l:sub(1, 1) == "+" and "DiffAdd")
+                or (l:sub(1, 1) == "-" and "DiffDelete")
+                or (l:sub(1, 2) == "@@" and "DiffText")
+            if hl then
+                vim.api.nvim_buf_set_extmark(buf, diff_ns, i - 1, 0,
+                    { line_hl_group = hl })
+            end
+        end
+    end
+end
+
 -- The full rendered view of one record: the preview's markdown without
 -- truncation, in its own split. gf on the record/transcript lines opens
 -- the raw JSON for anyone who wants it.
 local function open_record(rec)
     local buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, record_preview(rec, nil, true))
+    local lines = record_preview(rec, nil, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    colorize_diff_fences(buf, lines)
     vim.bo[buf].modifiable = false
     vim.bo[buf].bufhidden = "wipe"
     vim.bo[buf].filetype = "markdown"
@@ -354,6 +384,7 @@ local function telescope_browse(items)
                 -- the preview window - a bare filetype gives raw markup.
                 vim.bo[self.state.bufnr].filetype = "markdown"
                 pcall(vim.treesitter.start, self.state.bufnr, "markdown")
+                colorize_diff_fences(self.state.bufnr, entry.value.preview)
                 if self.state.winid and vim.api.nvim_win_is_valid(self.state.winid) then
                     vim.wo[self.state.winid].conceallevel = 2
                     vim.wo[self.state.winid].concealcursor = "nc"
