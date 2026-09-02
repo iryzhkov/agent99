@@ -438,6 +438,12 @@ local function on_exit(result)
                 if res.is_error then
                     record.error = res.result:sub(1, 500)
                 end
+                -- The envelope names the model actually used; nicer than
+                -- "default" when the provider did not pin one.
+                local model = next(res.modelUsage or {})
+                if model then
+                    record.provider = "claude/" .. model
+                end
                 local u = res.usage or {}
                 local cached = u.cache_read_input_tokens or 0
                 record.rounds = res.num_turns
@@ -712,7 +718,8 @@ function M.start(buf, first, last, instruction, opts)
         first = first,
         last = last,
         instruction = instruction,
-        provider = provider.kind .. "/" .. tostring(provider.model),
+        provider = provider.kind .. "/" .. (provider.model
+            or (provider.kind == "claude" and "default" or "?")),
         transcript = provider.kind == "openai" and transcript or nil,
         followup_of = opts.followup_of,
         autofix = opts.autofix or nil,

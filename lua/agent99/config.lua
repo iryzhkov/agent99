@@ -102,9 +102,10 @@ M.defaults = {
         },
         -- Layout of the compose picker (<leader>9v / 9a).
         compose = {
-            width = 110,          -- max total columns (clamped to the screen)
+            width = 170,          -- max total columns (clamped to the screen)
             height = 24,          -- max total rows
-            preview_ratio = 0.55, -- fraction of the width given to the preview
+            preview_ratio = 0.7,  -- fraction of the width given to the preview
+                                  -- (the prompt column keeps at least 36 cols)
             prompt_height = 5,    -- instruction pane rows
             border = "rounded",
         },

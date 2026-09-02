@@ -254,10 +254,16 @@ function M.open()
     end
     local cc = (require("agent99.config").options.ui or {}).compose or {}
     local border = cc.border or "rounded"
-    local W = math.min(cc.width or 110, vim.o.columns - 6)
+    -- Wide preview so context code is not squished, while the prompt/list
+    -- column keeps a readable minimum width.
+    local W = math.min(cc.width or 170, vim.o.columns - 6)
     local H = math.min(cc.height or 24, vim.o.lines - 6)
-    local pw = math.floor(W * (cc.preview_ratio or 0.55))
+    local pw = math.floor(W * (cc.preview_ratio or 0.7))
     local lw = W - pw - 2
+    if lw < 36 then
+        lw = math.min(36, W - 42)
+        pw = W - lw - 2
+    end
     local prompt_h = cc.prompt_height or 5
     local list_h = math.max(H - prompt_h - 2, 3)
     local row = math.floor((vim.o.lines - H) / 2) - 1

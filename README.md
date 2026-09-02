@@ -107,7 +107,7 @@ require("agent99").setup({
         width = 0.4,             -- panel width (fraction of columns)
         input_height = 5,        -- panel prompt height
         compose = {              -- compose picker layout
-            width = 110, height = 24, preview_ratio = 0.55,
+            width = 170, height = 24, preview_ratio = 0.7,
             prompt_height = 5, border = "rounded",
         },
         record = {               -- record view layout
