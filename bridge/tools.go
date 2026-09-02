@@ -153,6 +153,22 @@ var lspTools = []tool{
 		},
 	},
 	{
+		Name: "workspace_map",
+		Description: "The whole workspace's shape in ONE cheap call: every project file " +
+			"with its line count and TOP-LEVEL declarations only (functions/classes, one " +
+			"line each - no nesting, no annotations). The intended FIRST move in an " +
+			"unfamiliar repo: learn what exists, then skim the few files that matter. " +
+			"Far cheaper than broad greps or reading files.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{"type": "string", "description": "Optional subdirectory to map (default: project root)."},
+				"glob": map[string]any{"type": "string", "description": "Optional filename filter, e.g. \"**/*.go\"."},
+			},
+			"required": []string{},
+		},
+	},
+	{
 		Name: "ts_query",
 		Description: "Structural search: run a treesitter s-expression query over many " +
 			"files in one call. Precise where grep is textual - distinguish declarations " +
@@ -772,7 +788,7 @@ func callTool(name string, args map[string]any, root string) (string, error) {
 			resolved["file"] = resolveInRoot(root, args["file"])
 			args = resolved
 		}
-		if name == "ts_query" || name == "find_symbol" {
+		if name == "ts_query" || name == "find_symbol" || name == "workspace_map" {
 			resolved := map[string]any{}
 			for k, v := range args {
 				resolved[k] = v

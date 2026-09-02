@@ -442,6 +442,112 @@ local function skim(args)
     return { files = out }
 end
 
+-- Workspace map: the whole repo's shape in one cheap call - every project
+-- file with its line count and TOP-LEVEL declarations only. Parses straight
+-- from disk with string parsers, so no buffers are created and no language
+-- servers attach; files without a parser are listed with name and size only.
+local MAX_MAP_FILES = 200
+local MAX_MAP_ENTRIES = 400
+
+local function top_level_outline(path, budget)
+    local ok, lines = pcall(vim.fn.readfile, path)
+    if not ok or #lines == 0 then
+        return nil, 0
+    end
+    local ft = vim.filetype.match({ filename = path, contents = lines })
+    if not ft then
+        return nil, #lines
+    end
+    local lang = vim.treesitter.language.get_lang(ft) or ft
+    local okp, parser = pcall(vim.treesitter.get_string_parser,
+        table.concat(lines, "\n"), lang)
+    if not okp or not parser then
+        return nil, #lines
+    end
+    local okt, trees = pcall(function() return parser:parse() end)
+    if not okt or not trees or not trees[1] then
+        return nil, #lines
+    end
+    local out = {}
+    -- Emit declaration-shaped nodes but never descend into them: only the
+    -- top level of each file, which is what a first look needs.
+    local function walk(node)
+        for child in node:iter_children() do
+            if #out >= budget then
+                return
+            end
+            if child:named() then
+                if ts_wanted(child:type()) then
+                    local srow = child:range()
+                    local text = (lines[srow + 1] or ""):gsub("^%s+", "")
+                    if #text > 100 then
+                        text = text:sub(1, 100) .. "…"
+                    end
+                    out[#out + 1] = ("%d: %s"):format(srow + 1, text)
+                else
+                    walk(child)
+                end
+            end
+        end
+    end
+    walk(trees[1]:root())
+    return out, #lines
+end
+
+local function workspace_map(args)
+    local root = args.root
+    if type(root) ~= "string" or root == "" then
+        err("missing project root")
+    end
+    local target = root
+    if type(args.path) == "string" and args.path ~= "" then
+        target = args.path:sub(1, 1) == "/" and args.path or (root .. "/" .. args.path)
+    end
+    local files = vim.fn.systemlist({ "git", "-C", target,
+        "ls-files", "--cached", "--others", "--exclude-standard" })
+    if vim.v.shell_error ~= 0 then
+        files = {}
+        for _, f in ipairs(vim.fn.globpath(target, "**/*", true, true)) do
+            if vim.fn.isdirectory(f) == 0 then
+                files[#files + 1] = f:sub(#target + 2)
+            end
+        end
+    end
+    if type(args.glob) == "string" and args.glob ~= "" then
+        local re = vim.regex(vim.fn.glob2regpat(args.glob))
+        files = vim.tbl_filter(function(f)
+            return re:match_str(f) ~= nil
+        end, files)
+    end
+    local total_files = #files
+    local out, entries = {}, 0
+    for i, rel in ipairs(files) do
+        if i > MAX_MAP_FILES then
+            break
+        end
+        if i % 10 == 0 then
+            sleep(0) -- yield so the editor stays responsive on big repos
+        end
+        local entry = { file = rel }
+        local outline, nlines = top_level_outline(target .. "/" .. rel,
+            MAX_MAP_ENTRIES - entries)
+        entry.lines = nlines
+        if outline and #outline > 0 and entries < MAX_MAP_ENTRIES then
+            entry.outline = outline
+            entries = entries + #outline
+        end
+        out[#out + 1] = entry
+    end
+    local note
+    if total_files > MAX_MAP_FILES then
+        note = ("showing first %d of %d files; narrow with path or glob")
+            :format(MAX_MAP_FILES, total_files)
+    elseif entries >= MAX_MAP_ENTRIES then
+        note = "outline budget exhausted; later files are listed without outlines"
+    end
+    return { file_count = total_files, files = out, note = note }
+end
+
 local function hover(args)
     local bufnr = load_buf(args.file)
     local client = get_client(bufnr, "textDocument/hover")
@@ -1350,6 +1456,7 @@ local dispatch_table = {
     code_actions = code_actions,
     apply_code_action = apply_code_action,
     skim = skim,
+    workspace_map = workspace_map,
     ts_query = ts_query,
     find_symbol = find_symbol,
     replace_symbol_body = replace_symbol_body,

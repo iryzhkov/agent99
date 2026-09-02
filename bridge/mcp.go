@@ -44,10 +44,15 @@ func mcpHandle(method string, params map[string]any) (map[string]any, bool) {
 	case "tools/call":
 		name, _ := params["name"].(string)
 		arguments, _ := params["arguments"].(map[string]any)
-		if (name == "ts_query" || name == "find_symbol") && arguments != nil && arguments["root"] == nil {
-			// The MCP server runs with the project as its working directory.
-			if cwd, err := os.Getwd(); err == nil {
-				arguments["root"] = cwd
+		if name == "ts_query" || name == "find_symbol" || name == "workspace_map" {
+			if arguments == nil {
+				arguments = map[string]any{}
+			}
+			if arguments["root"] == nil {
+				// The MCP server runs with the project as its working directory.
+				if cwd, err := os.Getwd(); err == nil {
+					arguments["root"] = cwd
+				}
 			}
 		}
 		text := ""

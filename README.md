@@ -224,6 +224,7 @@ improve next. The records are plain JSON, so deeper analysis is a `jq` away.
 | `definition`, `type_definition`, `implementation` | `textDocument/*` via live client |
 | `hover` | `textDocument/hover` (signatures + docs) |
 | `expand_symbol` | definition + full source of the defining symbol + hover, in one round-trip |
+| `workspace_map` | the whole workspace's shape in one call: every project file with its line count and top-level declarations only (string parsers on disk content — no buffers created, no servers attached); the intended first move in an unfamiliar repo, ahead of skim/grep |
 | `skim` | structure of up to 20 files in one call: every function/class/method declaration line with line numbers, nested (treesitter, LSP-symbol fallback) — the intended first move when exploring; measures ~6-25% of the tokens of reading the same files |
 | `ts_query` | structural multi-file search: a treesitter s-expression query over a file list or glob, with `@captures` and `#eq?`/`#match?` predicates — for questions grep can't ask (declaration vs usage, match by shape); a non-compiling query returns a clear error pointing at skim |
 | `find_symbol` | look up symbols by `/`-joined name path across files/globs, optionally returning the full body — fetch exactly one function instead of a whole file |
