@@ -631,8 +631,31 @@ function M.open_record(rec)
     local cw = math.max(math.min(rc.content_width or 120, avail - 30), 40)
     local sidew = math.min(avail - cw, rc.side_width or 64)
     local W = lw + cw + sidew + 4
-    local H = vim.o.lines - 5
-    local row = 1
+    -- Open on the payload - answer, change, or the first edit - not info.
+    local default = 1
+    for i, s in ipairs(sections) do
+        if s.name == "answer" or s.name == "change" or s.name == "replacement" then
+            default = i
+            break
+        end
+    end
+    if default == 1 then
+        for i, s in ipairs(sections) do
+            if s.name ~= "info" and not s.name:match("^ctx:") then
+                default = i
+                break
+            end
+        end
+    end
+    -- Height tracks the content: enough for the opening section, the side
+    -- column, and the section list - never a mostly-empty full screen.
+    local instr_n = #(side.instruction or {})
+    local side_need = side.target
+        and (instr_n + #side.target.lines + 5) or (instr_n + 2)
+    local H = math.min(vim.o.lines - 5,
+        math.max(#(sections[default] or {}).lines + 2, side_need,
+            #sections + 2, 10))
+    local row = math.max(math.floor((vim.o.lines - H) / 2) - 1, 1)
     local col = math.floor((vim.o.columns - W) / 2)
 
     local list_buf = vim.api.nvim_create_buf(false, true)
@@ -659,23 +682,6 @@ function M.open_record(rec)
         footer = " j/k · <CR> jump to file · C-h/C-l records · q ", footer_pos = "center",
     })
     vim.wo[list_win].cursorline = true
-    -- Open on the payload - answer, change, or the first edit - not info.
-    local default = 1
-    for i, s in ipairs(sections) do
-        if s.name == "answer" or s.name == "change" or s.name == "replacement" then
-            default = i
-            break
-        end
-    end
-    if default == 1 then
-        for i, s in ipairs(sections) do
-            if s.name ~= "info" and s.name ~= "instruction"
-                and not s.name:match("^ctx:") then
-                default = i
-                break
-            end
-        end
-    end
     pcall(vim.api.nvim_win_set_cursor, list_win, { default, 0 })
 
     local content_win = vim.api.nvim_open_win(content_buf, false, {
