@@ -690,7 +690,29 @@ function M.open_record(rec)
         style = "minimal", border = rc.border or "rounded",
         title = " " .. (sections[1] and sections[1].name or "record") .. " ",
         title_pos = "center",
-        footer = " <CR> jump to file · <Tab> panes · gf opens path ", footer_pos = "center",
+        footer = (function()
+            -- Compact run stats: age, tokens in/out, model, rounds, time.
+            local function k(n)
+                return n >= 1000 and ("%.1fk"):format(n / 1000) or tostring(n)
+            end
+            local parts = { rel_time(rec.time) }
+            if rec.tokens_in then
+                parts[#parts + 1] = ("%s/%s tokens"):format(
+                    k(rec.tokens_in), k(rec.tokens_out or 0))
+            end
+            local model = rec.provider and rec.provider:match("/(.+)$") or rec.provider
+            if model then
+                parts[#parts + 1] = model
+            end
+            if rec.rounds then
+                parts[#parts + 1] = rec.rounds .. " rounds"
+            end
+            if rec.secs then
+                parts[#parts + 1] = rec.secs .. "s"
+            end
+            return " " .. table.concat(parts, " · ") .. " "
+        end)(),
+        footer_pos = "center",
     })
     vim.wo[content_win].conceallevel = 2
     vim.wo[content_win].concealcursor = "nc"
@@ -856,6 +878,7 @@ function M.open_record(rec)
     -- Jump straight to the target region from its pane.
     local function jump_to_target()
         if not (side.target and side.target.jump) then
+            vim.notify("agent99: this record has no target region")
             return
         end
         local saved = side.target.jump
@@ -890,6 +913,8 @@ function M.open_record(rec)
             { buffer = b, desc = "agent99: older record" })
         vim.keymap.set("n", "<C-l>", function() nav(1) end,
             { buffer = b, desc = "agent99: newer record" })
+        vim.keymap.set("n", "gt", jump_to_target,
+            { buffer = b, desc = "agent99: go to target region" })
         -- <Tab> cycles list -> content -> prompt -> target -> list.
         vim.keymap.set("n", "<Tab>", function()
             for step = 1, #wins do
