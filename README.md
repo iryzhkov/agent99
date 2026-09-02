@@ -9,7 +9,6 @@ hierarchy, code actions, and the unsaved state of your buffers — so it can
 explore the codebase the same way you do, with a warm index and no extra
 language-server processes.
 
-This is a prototype.
 
 ## How it works
 
@@ -45,34 +44,64 @@ hidden buffers, which triggers normal LSP attach.
 lazy.nvim, from a local clone:
 
 ```lua
-{ dir = "~/src/agent99" }
+{ dir = "~/src/agent99", opts = {} }
 ```
 
-then somewhere in your config:
+### Providers
+
+`provider` is a preset name, a preset with overrides, or a full table:
+
+```lua
+provider = "deepseek"                     -- built-in preset (the default)
+provider = { preset = "ollama", base_url = "http://gaming-pc:11434/v1",
+             model = "qwen2.5-coder:14b", temperature = 0.2 }
+provider = { base_url = "https://my.gateway/v1", model = "my-model",
+             api_key_env = "MY_KEY" }    -- no preset at all
+```
+
+Built-in presets: `deepseek`, `openai`, `openrouter`, `ollama` (local, no
+key), `claude` (spawns `claude -p` over MCP; uses your Claude quota, no
+chat/follow-ups). Define your own under `providers` and refer to them by
+name:
+
+```lua
+providers = { mylab = { base_url = "http://mylab:8000/v1", model = "m", api_key = "x" } },
+provider = "mylab",
+```
+
+Provider fields (all overridable per preset): `kind` (`"openai"` for any
+OpenAI-compatible chat-completions API, `"claude"`), `base_url`, `model`,
+`api_key` / `api_key_env` / `keyring_service` (resolution order; see below),
+`temperature` (default 0.0), `max_tokens`, `max_rounds` (30), `full_tools`
+(advertise the full tool roster, see below), and for claude: `claude_cmd`,
+`allowed_tools`.
+
+### Options
 
 ```lua
 require("agent99").setup({
     -- everything below is the default
-    provider = {
-        kind = "openai",                          -- or "claude"
-        base_url = "https://api.deepseek.com/v1", -- any OpenAI-compatible API
-        model = "deepseek-chat",
-        api_key_env = "DEEPSEEK_API_KEY",
-        keyring_service = "deepseek",             -- keyring fallback (see below)
-        full_tools = false,  -- advertise the trimmed default roster (see below)
-        max_rounds = 30,
-        claude_cmd = "claude",                    -- used when kind = "claude"
-        allowed_tools = { "mcp__lsp", "Read", "Grep", "Glob" },
-    },
-    preview = true,        -- proposal split with <CR> apply / q discard
-    auto_fix = true,       -- new ERRORs after an apply trigger one automatic fix round
+    provider = "deepseek",
+    providers = {},              -- your own presets, by name
+    preview = true,              -- proposal split with <CR> apply / q discard
+    auto_fix = true,             -- new ERRORs after an apply trigger one automatic fix round
     auto_fix_delay_ms = 2000,
     context_full_file_max = 200, -- embed whole file in the prompt up to this size
     context_lines = 50,          -- else this many lines around the selection
-    history_keep = 100,    -- request records kept on disk
     timeout_ms = 5 * 60 * 1000,
-    keymaps = true,
-    bridge_bin = nil,      -- default: <plugin>/bin/agent99-bridge
+    history = { keep = 100 },    -- request records kept on disk
+    ui = { width = 0.4, input_height = 5 },
+    keymaps = {                  -- false disables all; set a key to false to drop one
+        toggle_panel = "<leader>99",    -- n
+        panel_selection = "<leader>99", -- x
+        edit = "<leader>9v",            -- x
+        ask = "<leader>9a",             -- x
+        followup = "<leader>9f",
+        cancel = "<leader>9x",
+        history = "<leader>9h",
+        logs = "<leader>9l",
+    },
+    bridge_bin = nil,            -- default: <plugin>/bin/agent99-bridge
 })
 ```
 
@@ -81,8 +110,9 @@ directory produces `bin/agent99-bridge`), an API key, and working LSP in the
 buffers you edit. A missing binary is reported with a clear error on first
 use.
 
-**API key resolution**: the configured environment variable wins; when it is
-unset, the key is read from the system keyring via
+**API key resolution**: a literal `api_key` in the provider wins (meant for
+local servers, not real secrets); then the configured environment variable;
+then the key is read from the system keyring via
 `secret-tool lookup service <keyring_service>` (libsecret). Store it from
 inside Neovim with `:Agent99SetKey` — it prompts with concealed input and
 writes to the keyring, no dotfile plain text. A request without any

@@ -43,6 +43,8 @@ type payload struct {
 	Model         string           `json:"model"`
 	APIKeyEnv     string           `json:"api_key_env"`
 	MaxRounds     int              `json:"max_rounds"`
+	Temperature   *float64         `json:"temperature"`
+	MaxTokens     int              `json:"max_tokens"`
 	Messages      []map[string]any `json:"messages"`
 	TranscriptOut string           `json:"transcript_out"`
 	FinalReminder string           `json:"final_reminder"`
@@ -356,12 +358,19 @@ func runAgent() {
 	degenerateRetried := false
 	forceFinal := false
 
+	temperature := 0.0
+	if p.Temperature != nil {
+		temperature = *p.Temperature
+	}
 	for round := 0; round < p.MaxRounds; round++ {
 		body := map[string]any{
 			"model":       p.Model,
 			"messages":    messages,
 			"tools":       tools,
-			"temperature": 0.0,
+			"temperature": temperature,
+		}
+		if p.MaxTokens > 0 {
+			body["max_tokens"] = p.MaxTokens
 		}
 		if forceFinal {
 			forceFinal = false
