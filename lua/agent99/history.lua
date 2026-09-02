@@ -354,9 +354,11 @@ local function picker_items()
             -- type "@past" for runs from earlier Neovim sessions.
             local session = session_ids[rec.id] and "@now" or "@past"
             items[#items + 1] = {
-                display = ("%s%-10s │ %-12s │ %-5s │ %s"):format(
+                display = ("%s%-10s │ %-12s │ %-5s │ %-14s │ %s"):format(
                     session_ids[rec.id] and "• " or "  ",
                     rel_time(rec.time), rec.status or "?", rec.mode or "edit",
+                    (rec.file and rec.file ~= "")
+                        and vim.fn.fnamemodify(rec.file, ":t"):sub(1, 14) or "-",
                     (rec.instruction or ""):sub(1, 60):gsub("\n", " ")),
                 ordinal = table.concat({ session, rec.time or "", rec.status or "",
                     rec.mode or "", rec.file or "", rec.instruction or "" }, " "),
@@ -445,10 +447,11 @@ local function record_sections(rec)
             tostring(first), tostring(last)), body)
     end
     local instruction = rec.instruction or "(none)"
+    local pending_ctx = {}
     if rec.contexts then
         sec("instruction", vim.split(instruction, "\n", { plain = true }))
         for _, c in ipairs(rec.contexts) do
-            ctx_section(c.file, c.first, c.last, c.text)
+            pending_ctx[#pending_ctx + 1] = c
         end
     else
         -- Older records inlined the compose contexts into the instruction;
@@ -459,9 +462,24 @@ local function record_sections(rec)
         if head then
             for file, first, last, text in instruction:gmatch(
                 '<context file="(.-)" lines=(%d+)%-(%d+)>\n(.-)\n</context>') do
-                ctx_section(file, first, last, text)
+                pending_ctx[#pending_ctx + 1] =
+                    { file = file, first = first, last = last, text = text }
             end
         end
+    end
+    -- The main/target selection as its own section. For edits the change
+    -- section already shows it (as Before); asks get it explicitly.
+    if rec.mode == "ask" and rec.before and rec.file and rec.file ~= "" then
+        local lang = vim.filetype.match({ filename = rec.file }) or ""
+        local body = { ("%s:%s-%s"):format(vim.fn.fnamemodify(rec.file, ":~:."),
+            tostring(rec.first), tostring(rec.last)), "", "```" .. lang }
+        vim.list_extend(body, vim.split(rec.before, "\n", { plain = true }))
+        body[#body + 1] = "```"
+        sec(("target: %s:%s-%s"):format(vim.fn.fnamemodify(rec.file, ":t"),
+            tostring(rec.first), tostring(rec.last)), body)
+    end
+    for _, c in ipairs(pending_ctx) do
+        ctx_section(c.file, c.first, c.last, c.text)
     end
     if rec.mode ~= "ask" and rec.mode ~= "chat" and rec.before and rec.result then
         sec("change", change_lines(rec.file, rec.before, rec.result, true))
@@ -573,9 +591,10 @@ function M.open_record(rec)
         vim.bo[content_buf].modifiable = false
         vim.api.nvim_buf_clear_namespace(content_buf, diff_ns, 0, -1)
         colorize_diff_fences(content_buf, s.lines)
-        if not package.loaded["render-markdown"] then
-            conceal_fences(content_buf, s.lines)
-        end
+        -- Always conceal the fence delimiters here: render-markdown only
+        -- re-renders the CURRENT buffer on text changes, and section
+        -- switches rewrite this pane while focus sits in the list.
+        conceal_fences(content_buf, s.lines)
         if vim.api.nvim_win_is_valid(content_win) then
             vim.api.nvim_win_set_config(content_win,
                 { title = " " .. s.name .. " ", title_pos = "center" })
