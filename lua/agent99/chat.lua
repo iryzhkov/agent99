@@ -95,6 +95,57 @@ function M.absorb(record)
     state.turns = state.turns + 1
 end
 
+--- Restore a past chat conversation from its history record: the stored
+--- transcript becomes the live conversation and the panel is rebuilt from
+--- it, so the chat continues where it left off. Returns true on success;
+--- false (with a notification) when a request is running, the transcript
+--- is gone, or the user keeps the current conversation.
+function M.restore(rec)
+    if require("agent99.request").busy() then
+        vim.notify("agent99: a request is running - showing the record instead",
+            vim.log.levels.WARN)
+        return false
+    end
+    local path = rec.transcript
+    if not (path and vim.fn.filereadable(path) == 1) then
+        vim.notify("agent99: this chat's transcript is gone - showing the record instead",
+            vim.log.levels.WARN)
+        return false
+    end
+    local ok, msgs = pcall(function()
+        return vim.json.decode(table.concat(vim.fn.readfile(path), "\n"))
+    end)
+    if not (ok and type(msgs) == "table") then
+        vim.notify("agent99: could not read the transcript - showing the record instead",
+            vim.log.levels.WARN)
+        return false
+    end
+    if state.messages and vim.fn.confirm(
+        "agent99: replace the current panel conversation?", "&Yes\n&No", 2) ~= 1 then
+        return false
+    end
+    state.messages = msgs
+    state.turns = 0
+    local ui = require("agent99.ui")
+    ui.open() -- creates the panel buffers when this is the first open
+    ui.clear()
+    for _, m in ipairs(msgs) do
+        if m.role == "user" then
+            local text = (m.content or ""):match("The user says:\n(.*)$") or m.content
+            ui.append({ "", "## You", "" })
+            ui.append(text or "")
+        elseif m.role == "assistant" and m.content and m.content ~= "" then
+            state.turns = state.turns + 1
+            ui.append({ "", "## Agent", "" })
+            ui.append(m.content)
+        end
+    end
+    ui.append({ "", ("*conversation restored from %s — continue below*")
+        :format(rec.time or "history"), "" })
+    ui.open()
+    return true
+end
+
 --- Start a fresh conversation (the panel's /clear): resets the transcript
 --- sent to the agent and wipes the conversation pane.
 function M.reset()

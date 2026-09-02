@@ -428,6 +428,33 @@ local function on_exit(result)
             "exit code: " .. tostring(result.code),
             "stdout:", result.stdout or "", "stderr:", result.stderr or "",
         })
+        -- The claude provider's JSON envelope: unwrap the answer text and
+        -- harvest the usage metadata plain text output would not carry.
+        if record.provider and record.provider:sub(1, 6) == "claude"
+            and result.stdout and result.stdout:sub(1, 1) == "{" then
+            local okj, res = pcall(vim.json.decode, result.stdout)
+            if okj and type(res) == "table" and type(res.result) == "string" then
+                result.stdout = res.result
+                if res.is_error then
+                    record.error = res.result:sub(1, 500)
+                end
+                local u = res.usage or {}
+                local cached = u.cache_read_input_tokens or 0
+                record.rounds = res.num_turns
+                record.tokens_in = (u.input_tokens or 0) + cached
+                    + (u.cache_creation_input_tokens or 0)
+                record.tokens_cached = cached
+                record.tokens_out = u.output_tokens or 0
+                record.secs = res.duration_ms
+                    and math.floor(res.duration_ms / 1000) or nil
+                if (record.tokens_in or 0) > 0 then
+                    record.stats = ("%d rounds · %.1fk in (%d%% cached) / %.1fk out · %ds")
+                        :format(record.rounds or 0, record.tokens_in / 1000,
+                            math.floor(cached * 100 / record.tokens_in + 0.5),
+                            record.tokens_out / 1000, record.secs or 0)
+                end
+            end
+        end
         harvest_usage(record, result.stderr)
         if not (state.buf and vim.api.nvim_buf_is_valid(state.buf)) then
             record.status = "buffer_gone"
@@ -615,6 +642,10 @@ function M.start(buf, first, last, instruction, opts)
     if provider.kind == "claude" then
         cmd = {
             provider.claude_cmd, "-p",
+            -- JSON output wraps the answer with usage metadata (tokens,
+            -- turns, duration) that plain text output omits; unwrapped in
+            -- on_exit.
+            "--output-format", "json",
             "--mcp-config", write_mcp_config(),
             "--strict-mcp-config",
             "--allowedTools", table.concat(provider.allowed_tools, ","),

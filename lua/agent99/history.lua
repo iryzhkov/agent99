@@ -612,6 +612,14 @@ end
 
 function M.open_record(rec)
     last_record = rec
+    -- A chat record IS a conversation: opening it reopens the panel with
+    -- that conversation restored, ready to continue. Falls back to the
+    -- record view when the transcript is gone or a request is running.
+    if rec.mode == "chat" and rec.transcript then
+        if require("agent99.chat").restore(rec) then
+            return
+        end
+    end
     view_open = true
     -- Opening (however triggered) supersedes a queued copy of the same rec.
     for i = #pending_open, 1, -1 do
@@ -844,7 +852,9 @@ function M.open_record(rec)
             local out = {}
             for _, path in ipairs(files) do
                 local r = read_record(path)
-                if r and (not scoped or in_workspace(r)) then
+                -- Chat records open the panel, not this view: navigating
+                -- into one would end the browsing flow, so skip them.
+                if r and r.mode ~= "chat" and (not scoped or in_workspace(r)) then
                     out[#out + 1] = { path = path, rec = r }
                 end
             end
