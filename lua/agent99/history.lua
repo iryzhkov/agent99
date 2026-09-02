@@ -180,26 +180,139 @@ function M.history_lines(n)
     return lines
 end
 
---- Open a browsable list of past requests; <CR> opens the record under the
---- cursor (the transcript path inside it holds the full conversation).
-function M.browse()
+-- What was given to the agent and what came back, rendered as read-only
+-- markdown for the picker preview.
+local function record_preview(rec, running_secs)
+    local lines = {}
+    local function add(s)
+        vim.list_extend(lines, vim.split(s, "\n", { plain = true }))
+    end
+    if running_secs then
+        add(("# RUNNING — %ds elapsed"):format(running_secs))
+    else
+        add(("# %s — %s"):format(rec.time or "?", rec.status or "?"))
+    end
+    add(("- mode: %s · provider: %s"):format(rec.mode or "edit", rec.provider or "?"))
+    if rec.file and rec.file ~= "" then
+        add(("- target: %s:%s-%s"):format(vim.fn.fnamemodify(rec.file, ":~:."),
+            tostring(rec.first), tostring(rec.last)))
+    end
+    if rec.stats then
+        add("- " .. rec.stats)
+    end
+    add("")
+    add("## Instruction")
+    add(rec.instruction or "(none)")
+    if rec.symbol_edits and #rec.symbol_edits > 0 then
+        add("")
+        add("## Symbol edits")
+        for _, e in ipairs(rec.symbol_edits) do
+            add("- " .. e)
+        end
+    end
+    if rec.result and rec.result ~= "" then
+        add("")
+        add("## Result")
+        local res = vim.split(rec.result, "\n", { plain = true })
+        if #res > 120 then
+            res = vim.list_slice(res, 1, 120)
+            res[#res + 1] = "... (truncated; open the record for the rest)"
+        end
+        vim.list_extend(lines, res)
+    end
+    if rec.error then
+        add("")
+        add("## Error")
+        add(rec.error)
+    end
+    return lines
+end
+
+-- Running request first, then records newest-first. Each item carries its
+-- one-line display, a searchable ordinal, the preview lines, and the
+-- record path (nil while running).
+local function picker_items()
+    local items = {}
+    local running, secs = require("agent99.request").current()
+    if running then
+        items[#items + 1] = {
+            display = ("● running %3ds │ %-5s │ %s"):format(secs,
+                running.mode or "edit",
+                (running.instruction or ""):sub(1, 60):gsub("\n", " ")),
+            ordinal = "running " .. (running.instruction or ""),
+            preview = record_preview(running, secs),
+            path = nil,
+        }
+    end
     local files = record_files()
     table.sort(files, function(a, b) return a > b end)
-    local lines, targets = {}, {}
     for _, path in ipairs(files) do
         local rec = read_record(path)
         if rec then
-            lines[#lines + 1] = ("%s │ %-13s │ %s:%d-%d │ %s"):format(
-                rec.time or "?", rec.status or "?",
-                vim.fn.fnamemodify(rec.file or "?", ":t"),
-                rec.first or 0, rec.last or 0,
-                (rec.instruction or ""):sub(1, 70):gsub("\n", " "))
-            targets[#lines] = path
+            items[#items + 1] = {
+                display = ("%s │ %-12s │ %-5s │ %s"):format(
+                    rec.time or "?", rec.status or "?", rec.mode or "edit",
+                    (rec.instruction or ""):sub(1, 60):gsub("\n", " ")),
+                ordinal = table.concat({ rec.time or "", rec.status or "",
+                    rec.mode or "", rec.file or "", rec.instruction or "" }, " "),
+                preview = record_preview(rec),
+                path = path,
+            }
         end
     end
-    if #lines == 0 then
-        vim.notify("agent99: no history yet")
-        return
+    return items
+end
+
+local function telescope_browse(items)
+    local pickers = require("telescope.pickers")
+    local finders = require("telescope.finders")
+    local conf = require("telescope.config").values
+    local previewers = require("telescope.previewers")
+    local actions = require("telescope.actions")
+    local action_state = require("telescope.actions.state")
+    pickers.new({}, {
+        prompt_title = "agent99 requests",
+        finder = finders.new_table({
+            results = items,
+            entry_maker = function(it)
+                return { value = it, display = it.display, ordinal = it.ordinal }
+            end,
+        }),
+        sorter = conf.generic_sorter({}),
+        previewer = previewers.new_buffer_previewer({
+            title = "request",
+            define_preview = function(self, entry)
+                vim.bo[self.state.bufnr].modifiable = true
+                vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false,
+                    entry.value.preview)
+                vim.bo[self.state.bufnr].modifiable = false
+                vim.bo[self.state.bufnr].filetype = "markdown"
+            end,
+        }),
+        attach_mappings = function(prompt_bufnr)
+            actions.select_default:replace(function()
+                local entry = action_state.get_selected_entry()
+                actions.close(prompt_bufnr)
+                if not entry then
+                    return
+                end
+                if entry.value.path then
+                    vim.cmd.edit(entry.value.path)
+                else
+                    vim.notify("agent99: request is still running (/cancel or <leader>9x to stop)")
+                end
+            end)
+            return true
+        end,
+    }):find()
+end
+
+-- Plain-split fallback when telescope is not installed.
+local function split_browse(items)
+    local lines, targets = {}, {}
+    for i, it in ipairs(items) do
+        lines[i] = it.display
+        targets[i] = it.path
     end
     local buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -215,6 +328,26 @@ function M.browse()
         end
     end, { buffer = buf, desc = "agent99: open record" })
     vim.keymap.set("n", "q", vim.cmd.close, { buffer = buf })
+end
+
+-- Exposed for tests.
+M._picker_items = picker_items
+
+--- Browse requests: the running one (live, previewed with what it was
+--- given) plus past records, newest first. Uses telescope when installed
+--- (fuzzy search over time/status/mode/file/instruction, read-only
+--- markdown preview, <CR> opens the record); plain split otherwise.
+function M.browse()
+    local items = picker_items()
+    if #items == 0 then
+        vim.notify("agent99: no history yet")
+        return
+    end
+    if pcall(require, "telescope") then
+        telescope_browse(items)
+    else
+        split_browse(items)
+    end
 end
 
 return M

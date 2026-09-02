@@ -93,6 +93,14 @@ M.defaults = {
     ui = {
         width = 0.4,      -- fraction of columns for the agent panel
         input_height = 5, -- prompt pane height in lines
+        -- Layout of the compose picker (<leader>9v / 9a).
+        compose = {
+            width = 110,          -- max total columns (clamped to the screen)
+            height = 24,          -- max total rows
+            preview_ratio = 0.55, -- fraction of the width given to the preview
+            prompt_height = 5,    -- instruction pane rows
+            border = "rounded",
+        },
     },
 
     -- false disables all keymaps; true uses these defaults; a table merges

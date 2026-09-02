@@ -856,6 +856,17 @@ function M.busy()
     return state.job ~= nil
 end
 
+--- The in-flight request's record and elapsed seconds (nil when idle),
+--- for the requests picker.
+function M.current()
+    if not state.job or not state.record then
+        return nil
+    end
+    local secs = state.started_at
+        and math.floor((vim.uv.now() - state.started_at) / 1000) or 0
+    return state.record, secs
+end
+
 function M.pending_preview()
     return state.preview ~= nil
 end

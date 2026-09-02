@@ -265,11 +265,13 @@ function M.open()
         focus_prompt(false)
         return
     end
-    local W = math.min(110, vim.o.columns - 6)
-    local H = math.min(24, vim.o.lines - 6)
-    local pw = math.floor(W * 0.55)
+    local cc = (require("agent99.config").options.ui or {}).compose or {}
+    local border = cc.border or "rounded"
+    local W = math.min(cc.width or 110, vim.o.columns - 6)
+    local H = math.min(cc.height or 24, vim.o.lines - 6)
+    local pw = math.floor(W * (cc.preview_ratio or 0.55))
     local lw = W - pw - 2
-    local prompt_h = 5
+    local prompt_h = cc.prompt_height or 5
     local list_h = math.max(H - prompt_h - 2, 3)
     local row = math.floor((vim.o.lines - H) / 2) - 1
     local col = math.floor((vim.o.columns - W) / 2)
@@ -279,7 +281,7 @@ function M.open()
 
     state.list_win = vim.api.nvim_open_win(state.list_buf, false, {
         relative = "editor", row = row, col = col, width = lw, height = list_h,
-        style = "minimal", border = "rounded",
+        style = "minimal", border = border,
         title = " selections — j/k · x remove ", title_pos = "center",
     })
     vim.wo[state.list_win].cursorline = true
@@ -287,7 +289,7 @@ function M.open()
     state.prev_win = vim.api.nvim_open_win(state.prev_buf, false, {
         relative = "editor", row = row, col = col + lw + 2,
         width = pw, height = H,
-        style = "minimal", border = "rounded",
+        style = "minimal", border = border,
         title = " preview ", title_pos = "center",
     })
     vim.wo[state.prev_win].wrap = false
@@ -296,7 +298,7 @@ function M.open()
     state.win = vim.api.nvim_open_win(state.buf, true, {
         relative = "editor", row = row + list_h + 2, col = col,
         width = lw, height = prompt_h,
-        style = "minimal", border = "rounded",
+        style = "minimal", border = border,
         title = (" %s — <CR> send · <Tab> list · gx discard "):format(state.mode or "compose"),
         title_pos = "center",
     })

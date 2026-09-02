@@ -103,7 +103,14 @@ require("agent99").setup({
     context_lines = 50,          -- else this many lines around the selection
     timeout_ms = 5 * 60 * 1000,
     history = { keep = 100 },    -- request records kept on disk
-    ui = { width = 0.4, input_height = 5 },
+    ui = {
+        width = 0.4,             -- panel width (fraction of columns)
+        input_height = 5,        -- panel prompt height
+        compose = {              -- compose picker layout
+            width = 110, height = 24, preview_ratio = 0.55,
+            prompt_height = 5, border = "rounded",
+        },
+    },
     keymaps = {                  -- false disables all; set a key to false to drop one
         toggle_panel = "<leader>99",    -- n
         panel_selection = "<leader>99", -- x
@@ -199,8 +206,13 @@ q](doc/edit-preview.png)
   with `<leader>9f`. Openai-provider only.
 - `<leader>9x` (or `:Agent99Cancel`) cancels an in-flight request, or
   discards a pending preview.
-- `<leader>9h` (or `:Agent99History`) lists past requests; `<CR>` on a line
-  opens the stored record (instruction, result, transcript path).
+- `<leader>9h` (or `:Agent99History`) searches requests — the running one
+  (live, with elapsed time) plus past records, newest first. With
+  telescope installed it is a fuzzy picker over time/status/mode/file/
+  instruction whose preview shows exactly what the agent was given
+  (instruction, target, provider, stats) and what came back; `<CR>` opens
+  the stored record. Without telescope, a plain split. No hard
+  dependency either way.
 - `<leader>9l` (or `:Agent99Logs`) opens the log, including a per-request
   trace of every tool call the agent made and token usage per round.
 
