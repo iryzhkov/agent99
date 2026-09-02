@@ -65,6 +65,10 @@ M.defaults = {
     -- Additional presets, merged over M.presets: providers = { mylab = {...} }
     -- makes provider = "mylab" resolvable.
     providers = {},
+    -- Preset name the chat panel uses when the main provider cannot chat
+    -- (the claude provider returns no transcript, so the panel needs an
+    -- openai-kind provider). nil: the panel refuses with a hint instead.
+    chat_provider = nil,
 
     -- Show the proposed replacement in a preview split (<CR> apply, q
     -- discard) instead of editing the buffer directly.
@@ -161,6 +165,12 @@ function M.setup(opts)
     return merged
 end
 
+--- Resolve a preset name to a full provider table without changing the
+--- active provider (used by the chat panel's chat_provider fallback).
+function M.resolve(name)
+    return resolve_provider(name, M.options.providers)
+end
+
 --- Switch the active provider at runtime (:Agent99Provider). `name` is a
 --- preset name - built-in or from options.providers. Requests already
 --- running are unaffected; the next request uses the new provider.
@@ -226,11 +236,12 @@ end
 
 -- ---------------------------------------------------------------- api key --
 
---- Resolve the provider's API key: a literal api_key wins, then the
---- environment variable, then the system keyring (secret-tool/libsecret).
---- Returns nil when nothing resolves.
-function M.resolve_api_key()
-    local p = M.options.provider
+--- Resolve a provider's API key (the active one unless `provider` is
+--- given): a literal api_key wins, then the environment variable, then the
+--- system keyring (secret-tool/libsecret). Returns nil when nothing
+--- resolves.
+function M.resolve_api_key(provider)
+    local p = provider or M.options.provider
     if p.api_key and p.api_key ~= "" then
         return p.api_key
     end

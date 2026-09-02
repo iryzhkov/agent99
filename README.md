@@ -93,6 +93,9 @@ require("agent99").setup({
     -- everything below is the default
     provider = "deepseek",
     providers = {},              -- your own presets, by name
+    chat_provider = nil,         -- preset the panel falls back to when the main
+                                 -- provider cannot chat (e.g. "deepseek" with a
+                                 -- claude main provider)
     preview = true,              -- proposal split with <CR> apply / q discard
     auto_fix = true,             -- new ERRORs after an apply trigger one automatic fix round
     auto_fix_delay_ms = 2000,

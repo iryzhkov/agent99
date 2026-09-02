@@ -41,22 +41,40 @@ local function chat_context(text)
     return table.concat(parts, "\n"), buf
 end
 
---- Send one panel message through the request engine.
+--- Send one panel message through the request engine. When the active
+--- provider cannot chat (claude: no transcript comes back), fall back to
+--- the configured chat_provider preset for this request only.
 function M.send(text)
     local request = require("agent99.request")
     if request.busy() then
         vim.notify("agent99: a request is already running", vim.log.levels.WARN)
         return
     end
+    local provider
     if config.options.provider.kind ~= "openai" then
-        vim.notify("agent99: the chat panel needs an openai-kind provider", vim.log.levels.WARN)
-        return
+        local fallback = config.options.chat_provider
+        local ok, resolved = false, nil
+        if fallback then
+            ok, resolved = pcall(config.resolve, fallback)
+        end
+        if not (ok and resolved and resolved.kind == "openai") then
+            vim.notify("agent99: the chat panel needs an openai-kind provider - switch with "
+                .. ":Agent99Provider, or set chat_provider = \"deepseek\" to let the panel "
+                .. "fall back automatically", vim.log.levels.WARN)
+            return
+        end
+        provider = resolved
+        pcall(function()
+            require("agent99.ui").activity(("chat via %s (chat_provider)")
+                :format(tostring(resolved.model)))
+        end)
     end
     local prompt, ctx_buf = chat_context(text)
     local buf = ctx_buf or vim.api.nvim_get_current_buf()
     request.start(buf, nil, nil, text, {
         mode = "chat",
         prompt = prompt,
+        provider = provider,
         messages = state.messages,
         system = state.messages == nil and require("agent99.prompts").CHAT_SYSTEM or nil,
         stream = true,

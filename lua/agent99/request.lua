@@ -565,11 +565,13 @@ end
 
 --- Start a request. opts: mode ("edit"/"ask"/"chat"), prompt (overrides the
 --- built one), messages (prior transcript for follow-ups/chat), system,
---- stream, followup_of, autofix.
+--- stream, followup_of, autofix, provider (a resolved provider table
+--- overriding the configured one for this request only - the chat panel's
+--- chat_provider fallback).
 function M.start(buf, first, last, instruction, opts)
     opts = opts or {}
     local cfg = config.options
-    local provider = cfg.provider
+    local provider = opts.provider or cfg.provider
     local prompts = require("agent99.prompts")
     local file = vim.api.nvim_buf_get_name(buf)
     if file == "" and opts.mode ~= "chat" then
@@ -614,7 +616,7 @@ function M.start(buf, first, last, instruction, opts)
         -- swallow a trailing positional argument.
         stdin = prompt
     else
-        local api_key = config.resolve_api_key()
+        local api_key = config.resolve_api_key(provider)
         if not api_key then
             vim.notify(("agent99: no API key found. Run :Agent99SetKey to store one in the "
                 .. "keyring, or export $%s before starting Neovim.")
