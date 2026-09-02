@@ -544,10 +544,11 @@ local function on_exit(result)
         if record.mode == "ask" then
             -- No edit: keep the discussed region reachable for a follow-up,
             -- then show the answer as a rendered record view (the same
-            -- read-only window the history picker opens).
+            -- read-only window the history picker opens) - deferred until
+            -- the user is in normal mode with no other record view up.
             keep_last_region()
             clear_request(false)
-            require("agent99.history").open_record(record)
+            require("agent99.history").open_record_deferred(record)
         elseif config.options.preview then
             open_preview(lines, record)
         else
