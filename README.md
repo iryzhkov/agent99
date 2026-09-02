@@ -1,46 +1,51 @@
 # agent99
 
-Agentic code edits in Neovim with LSP-aware context gathering, in the style of
-[ThePrimeagen/99](https://github.com/ThePrimeagen/99): select a region, give an
-instruction, and an LLM agent proposes a rewrite of the selection. The twist is
-that the agent gets tools backed by the LSP clients **already running inside
-your Neovim** — definition, references, hover, symbols, diagnostics, call
-hierarchy, code actions, and the unsaved state of your buffers — so it can
-explore the codebase the same way you do, with a warm index and no extra
-language-server processes.
+Agentic code edits and code questions inside Neovim, in the spirit of
+[ThePrimeagen/99](https://github.com/ThePrimeagen/99) — grown into a small
+background coding agent that lives in your editor.
+
+Select a region, type an instruction, keep working: the request runs in the
+background against an LLM whose tools are backed by the LSP clients
+**already running inside your Neovim** — definition, references, hover,
+symbols, diagnostics, code actions, and the unsaved state of your buffers —
+so the agent explores the codebase the way you do, with a warm index and no
+extra language-server processes. Edits land in your buffers; answers pop up
+when you are free. Every run becomes a record you can search, inspect,
+continue, or undo.
 
 ![The agent panel: tool activity streams while the agent explores, and the
 code window follows what it reads](doc/panel-chat-working.png)
 
-
-## How it works
+## The core loop
 
 ```
-Neovim (your editor, LSP clients attached)
-  │  <leader>99 on a visual selection → compose prompt
-  │  spawns bin/agent99-bridge (one static Go binary, stdlib only)…
-  ├─ agent99-bridge agent             (provider "openai", default: DeepSeek)
-  │    OpenAI-compatible function-calling loop.
-  │    LSP tools call back into Neovim over a NON-BLOCKING protocol:
-  │    `--remote-expr Agent99RpcStart(...)` kicks off the tool in a coroutine
-  │    and returns immediately; the bridge polls Agent99RpcPoll(...) for the
-  │    result, so the editor UI never freezes during a tool call.
-  │
-  └─ or `claude -p` + agent99-bridge mcp      (provider "claude")
-       Same LSP tools exposed as an MCP stdio server.
-       Note: consumes your Claude subscription/API quota; no follow-ups.
-
-  The agent's reply (wrapped in <replacement> tags) shows up in a preview
-  split — <CR> applies it over the selected lines, q discards. Extmarks
-  track the region, so edits elsewhere in the buffer while the request
-  runs don't corrupt the target range.
+select region ──> compose picker ──> request runs in background
+   <leader>99       type prompt          you keep editing
+                    stack more                 │
+                    selections           ┌─────┴──────┐
+                                         ▼            ▼
+                                   edit: applied   question: answer pops up
+                                   to your buffer  when you are in normal
+                                   (or preview)    mode with nothing open
+                                         │            │
+                                         └─────┬──────┘
+                                               ▼
+                                     a RECORD in the history:
+                                     searchable · inspectable ·
+                                     continuable · undoable
 ```
 
-The bridge is a single Go binary with no dependencies outside the standard
-library (no pynvim, no MCP SDK, no HTTP client library). Build it once with
-`make build`. The Lua side of the RPC lives in `lua/agent99/lsp.lua` and
-reuses whatever clients are attached; files not yet open are loaded into
-hidden buffers, which triggers normal LSP attach.
+- **Auto mode**: `<leader>99` does not ask whether you want an edit or an
+  answer — the model decides from your instruction (no extra classification
+  call; the reply's shape resolves it). `<leader>9e` / `<leader>9a`
+  hardcode edit / ask when you want certainty.
+- **Nothing blocks**: tool calls reach the editor over a non-blocking RPC
+  (start/poll, microseconds per poll), the request runs as a background
+  job, and a finished answer waits until you are in normal mode with no
+  other record open before appearing.
+- **Everything is a record**: instruction, attached contexts, target
+  region, the agent's step-by-step work, the diff or the answer, cost.
+  Records are the unit of history, continuation, and undo.
 
 ## Install
 
@@ -53,7 +58,11 @@ lazy.nvim:
 or from a local clone: `{ dir = "~/src/agent99", opts = {} }` (run
 `make build` there once).
 
-### Providers
+Requirements: Neovim ≥ 0.11, Go (build time only — `make build` produces
+`bin/agent99-bridge`, a static binary with no dependencies outside the Go
+standard library), an API key, and working LSP in the buffers you edit.
+
+## Providers
 
 `provider` is a preset name, a preset with overrides, or a full table:
 
@@ -66,54 +75,158 @@ provider = { base_url = "https://my.gateway/v1", model = "my-model",
 ```
 
 Built-in presets: `deepseek`, `openai`, `openrouter`, `ollama` (local, no
-key), `claude` (spawns `claude -p` over MCP; uses your Claude quota, no
-chat/follow-ups). Define your own under `providers` and refer to them by
-name:
+key), `claude` (spawns `claude -p` with the LSP tools over MCP — on a
+Claude subscription this costs nothing per token; usage still lands on the
+record via its JSON output; no chat/follow-ups). Define your own under
+`providers = { mylab = {...} }` and refer to them by name.
 
-```lua
-providers = { mylab = { base_url = "http://mylab:8000/v1", model = "m", api_key = "x" } },
-provider = "mylab",
-```
-
-`:Agent99Provider <name>` switches presets at runtime (tab-completes;
-no argument shows the active provider) — e.g. a cheap default for chat and
-`:Agent99Provider claude` for a hard edit.
+`:Agent99Provider <name>` switches presets at runtime (tab-completes; no
+argument shows the active provider). A practical split: a cheap default
+for chat, `:Agent99Provider claude` for hard edits. `chat_provider` names
+a preset the chat panel falls back to automatically when the main provider
+cannot chat.
 
 Provider fields (all overridable per preset): `kind` (`"openai"` for any
 OpenAI-compatible chat-completions API, `"claude"`), `base_url`, `model`,
-`api_key` / `api_key_env` / `keyring_service` (resolution order; see below),
-`temperature` (default 0.0), `max_tokens`, `max_rounds` (30), `full_tools`
-(advertise the full tool roster, see below), and for claude: `claude_cmd`,
+`api_key` / `api_key_env` / `keyring_service` (resolution order: literal
+key — for local servers, not real secrets — then environment, then the
+system keyring via `secret-tool`; `:Agent99SetKey` stores a key in the
+keyring with concealed input, no dotfile plain text), `temperature`,
+`max_tokens`, `max_rounds`, `full_tools`, and for claude: `claude_cmd`,
 `allowed_tools`.
 
-### Options
+## Composing a request
+
+Visually select lines, press `<leader>99`: a telescope-style compose picker
+opens — selection list top-left (first entry is the target), instruction
+prompt below it, syntax-highlighted preview of the highlighted selection on
+the right.
+
+- Type the instruction, `<CR>` (insert: `<C-s>`) sends.
+- **Sticky drafts**: `q`/`<Esc>` closes without losing anything; invoking
+  `<leader>99` (or `9e`/`9a`) again from another selection — any file —
+  stacks it as additional context instead of starting over, so one request
+  can carry several regions. `<leader>99` in normal mode reopens the draft.
+- Navigate with `<C-j>`/`<C-k>` from the prompt or `<Tab>` into the list
+  and `j`/`k`; `x` removes a context, `gx` discards draft and stack.
+- `gm` cycles the mode: auto → edit → ask.
+- `gr` opens the requests picker and attaches a past run's conversation to
+  the current draft — continue a previous discussion against a new target.
+
+While an edit runs, the target region is highlighted with an
+`agent99 working…` marker. The selection is the primary edit target
+(changed via the reply's `<replacement>` contract), but not the boundary:
+changes that belong elsewhere go through symbol-addressed edit tools, land
+in editor buffers immediately, and are all tracked. With `preview = true`
+(default) the replacement opens in a split — `<CR>` applies, `q` discards.
+
+## Requests and records
+
+`<leader>9h` (`:Agent99History`) searches requests — a telescope picker
+scoped to the current workspace (project roots containing or contained by
+the cwd; `:Agent99History all` lifts the filter). The running request leads
+the list live; past ones follow, newest first, with undotree-style ages.
+Fuzzy search covers time, status, mode, target file, instruction, and the
+`@now`/`@past` session tokens; the preview shows what the agent was given
+and what came back. Chat conversations collapse to one entry each.
+
+`<CR>` opens the **record view** — a multi-pane float:
+
+```
++----------+---------------------+------------------+
+| sections | answer / change /   |  prompt          |
+| info     | ctx (selected, 120  +------------------+
+| work     | unwrapped columns)  |  target: file:…  |
+|> answer  |                     |  (the selected   |
+| ctx: …   |                     |   region's code) |
++----------+---------------------+------------------+
+```
+
+- Opens on the payload (answer or change); `j`/`k` walk the sections,
+  `<Tab>` cycles panes. Edits render as Before/After blocks in the file's
+  own language (a pure insertion is a single Added block); answers as
+  markdown. `work` is the agent's run, step by step: what it said between
+  tool calls and every call with its result size. The footer carries the
+  run's stats (`10m ago · 12.3k/2.9k tokens · deepseek-chat · 6 rounds`).
+- `<CR>` on a section with a location (target, ctx, change, an edit) — or
+  `gt` for the target from anywhere — leaves the view and visually selects
+  that region in your last active window.
+- `gc` **continues** the run: compose opens with the target restaged and
+  the conversation attached; type the new prompt (flip mode with `gm`).
+- `gu` **undoes** the run: the replacement and every symbol edit are
+  reverted — each block only if the buffer still contains exactly what the
+  run wrote (found by unique search if lines shifted); anything since
+  modified is skipped and reported.
+- `<C-h>`/`<C-l>` step to the chronologically older/newer record in the
+  workspace without leaving the view.
+- `<leader>9r` (`:Agent99Record`) reopens the last shown record.
+
+A finished question opens this same view — but never interrupts: if you
+are mid-edit or already reading a record, it queues with a notification
+and appears at the next quiet moment. Opening a **chat** record instead
+restores that conversation into the panel, ready to continue.
+
+## The chat panel (`<leader>9c`)
+
+A vertical split on the right — scrolling conversation above a prompt —
+while your code window stays on the left and **follows the agent**:
+deliberate reads move it to the file being read, edits jump it there with
+a brief highlight.
+
+![A finished answer in the panel, with file:line citations and the cost
+line](doc/panel-chat.png)
+
+- Everything streams live: tool activity, then the answer token by token,
+  then a cost line. The pane renders as markdown.
+- `<leader>9c` from a visual selection stages it as context for the next
+  message — mid-conversation, from any file.
+- `/help` lists panel commands: `/clear` (starts a new conversation — the
+  old one stays in the history as a single restorable entry), `/revert`,
+  `/cancel`, `/stats` (session usage; `/stats all` lifetime), `/history`,
+  `/hide`.
+- The conversation persists for the whole Neovim session; chat needs an
+  openai-kind provider (see `chat_provider`).
+
+## Safety and telemetry
+
+- If the selected region changed while the agent worked, the apply is
+  refused (hash guard) and the proposal is kept in the history.
+- After an apply, new ERROR diagnostics trigger one automatic fix round
+  with the agent's full conversation (never a fix-of-a-fix).
+- An applied edit reverted by the user within 30s is marked on its record —
+  the strongest "bad edit" signal — and undo via `gu` is tracked the same.
+- Every request persists as JSON under `stdpath("state")/agent99/history/`
+  (pruned to `history.keep`) with outcome, per-tool call counts, token
+  totals, duration, and the full transcript alongside. `:Agent99Stats`
+  aggregates outcome rates, cost, and tool usage; the records are plain
+  JSON, so deeper analysis is a `jq` away. `<leader>9l` opens the log with
+  a per-request trace.
+
+## Options
 
 ```lua
 require("agent99").setup({
     -- everything below is the default
     provider = "deepseek",
     providers = {},              -- your own presets, by name
-    chat_provider = nil,         -- preset the panel falls back to when the main
-                                 -- provider cannot chat (e.g. "deepseek" with a
-                                 -- claude main provider)
+    chat_provider = nil,         -- panel fallback when the main provider cannot chat
     preview = true,              -- proposal split with <CR> apply / q discard
-    auto_fix = true,             -- new ERRORs after an apply trigger one automatic fix round
+    auto_fix = true,             -- new ERRORs after an apply trigger one fix round
     auto_fix_delay_ms = 2000,
     context_full_file_max = 200, -- embed whole file in the prompt up to this size
     context_lines = 50,          -- else this many lines around the selection
     timeout_ms = 5 * 60 * 1000,
-    auto_mode = true,            -- <leader>9v infers edit-vs-question from the
-                                 -- reply itself (no extra call); gm hardcodes
+    auto_mode = true,            -- <leader>99 lets the model infer edit vs question
     history = { keep = 100 },    -- request records kept on disk
     ui = {
-        width = 0.4,             -- panel width (fraction of columns)
-        input_height = 5,        -- panel prompt height
+        width = 0.4,             -- chat panel width (fraction of columns)
+        input_height = 5,        -- chat prompt height
+        record = {               -- record view layout
+            content_width = 120, list_width = 26, border = "rounded",
+        },
         compose = {              -- compose picker layout
             width = 170, height = 24, preview_ratio = 0.7,
             prompt_height = 5, border = "rounded",
-        },
-        record = {               -- record view layout
-            content_width = 120, list_width = 26, border = "rounded",
         },
     },
     keymaps = {                  -- false disables all; set a key to false to drop one
@@ -123,165 +236,61 @@ require("agent99").setup({
         ask = "<leader>9a",             -- x: compose, hardcoded ask
         chat = "<leader>9c",            -- n: toggle the chat panel
         chat_selection = "<leader>9c",  -- x: panel with selection as context
-        followup = "<leader>9f",
-        cancel = "<leader>9x",
-        history = "<leader>9h",
-        record = "<leader>9r",          -- re-open the last record view
-        logs = "<leader>9l",
+        followup = "<leader>9f",        -- n: follow up on last edit/answer
+        cancel = "<leader>9x",          -- n: cancel request / discard preview
+        history = "<leader>9h",         -- n: search requests
+        record = "<leader>9r",          -- n: re-open the last record view
+        logs = "<leader>9l",            -- n: view logs
     },
     bridge_bin = nil,            -- default: <plugin>/bin/agent99-bridge
 })
 ```
 
-Requirements: Neovim ≥ 0.11, Go (build time only — `make build` in the plugin
-directory produces `bin/agent99-bridge`), an API key, and working LSP in the
-buffers you edit. A missing binary is reported with a clear error on first
-use.
+telescope.nvim is an optional integration (the requests picker uses it
+when installed, with a plain-split fallback), never a dependency.
 
-**API key resolution**: a literal `api_key` in the provider wins (meant for
-local servers, not real secrets); then the configured environment variable;
-then the key is read from the system keyring via
-`secret-tool lookup service <keyring_service>` (libsecret). Store it from
-inside Neovim with `:Agent99SetKey` — it prompts with concealed input and
-writes to the keyring, no dotfile plain text. A request without any
-resolvable key fails immediately with an error message instead of spawning
-the agent.
+## How it works
 
-## Use
-
-### The agent panel (`<leader>9c`)
-
-The primary interface: a vertical split on the right with a scrolling
-conversation pane above a prompt buffer, while the window you started from
-stays on the left as the code window.
-
-![A finished answer in the panel, with file:line citations and the cost
-line](doc/panel-chat.png)
-
-- `<leader>9c` toggles the panel; `<CR>` in the prompt (or `<C-s>` in insert
-  mode) sends; `i` in the conversation pane jumps to the prompt; `q` hides
-  the panel without losing anything.
-- The conversation persists for the whole Neovim session — `gn` or
-  `:Agent99Clear` is the explicit reset.
-- Everything streams live: tool activity as it happens, and the answer
-  itself token-by-token (SSE), followed by a cost line
-  (`3 rounds · 11.2k in (94% cached) …`).
-- The pane renders as markdown (treesitter + conceal; if
-  render-markdown.nvim is installed it picks the pane up automatically for
-  fully rendered headings/bullets/code blocks).
-- `/help` in the prompt lists panel commands: `/clear`, `/revert`,
-  `/cancel`, `/stats`, `/history`, `/hide`.
-- The code window follows the agent: deliberate reads (read_file,
-  buffer_lines, find_symbol bodies) move it to the file and position being
-  read; edits jump it there with a brief highlight. Edits land unsaved in
-  buffers; `:Agent99Revert` (or `/revert`) undoes the last batch.
-- `<leader>9c` from a visual selection stages the selection (file, range,
-  text) as context for the next message — including mid-conversation: leave
-  the panel, select something else in any file, hit `<leader>9c` again, and
-  the conversation continues with the new context attached.
-- Chat mode needs the openai provider (transcript continuity).
-
-### Region flows
-
-![While the request runs, the selected region is highlighted with a working
-marker](doc/edit-working.png)
-
-![The proposal opens in a preview split: apply with CR, discard with
-q](doc/edit-preview.png)
-
-- Visually select lines, press `<leader>99`: a telescope-style compose
-  picker opens — selection list top-left (the first entry is the edit
-  target), instruction prompt below it, and a syntax-highlighted preview
-  of the highlighted selection on the right. Type the instruction and
-  `<CR>` (insert: `<C-s>`) to send. The draft is sticky: `q`/`<Esc>`
-  closes the picker without losing it, and invoking `<leader>99` (or
-  `9a`/`9e`) again from another selection — any file — stacks that selection
-  as additional context instead of starting over, so one request can
-  carry several regions. Navigate with `<C-j>`/`<C-k>` from the prompt or
-  `<Tab>` into the list and `j`/`k`; `x` removes a context, `gx` discards
-  the draft and the stack. While the request runs the target region is
-  highlighted (`Agent99Working`, links to `Visual`) with an
-  `agent99 working…` marker; when the agent finishes, the proposal opens
-  in a preview split — `<CR>` applies it, `q` discards (or is applied
-  directly with `preview = false`).
-- In auto mode the model itself decides whether the instruction is an
-  edit or a question (`auto_mode = false` disables). `<leader>9e` hardcodes
-  edit; `<leader>9a` hardcodes a question:
-  the agent investigates with the same tools and the answer opens in a
-  markdown split (`q` closes it), with locations cited as file:line.
-- `<leader>9f` follows up on the last edit **or answer**: the agent keeps its
-  full conversation (everything it already learned about your code) and
-  targets the discussed region, even if you have edited elsewhere since.
-  This is the ask-then-act flow: discuss with `<leader>9a`, then "now do it"
-  with `<leader>9f`. Openai-provider only.
-- `<leader>9x` (or `:Agent99Cancel`) cancels an in-flight request, or
-  discards a pending preview.
-- `<leader>9h` (or `:Agent99History`) searches requests — scoped to the
-  current workspace (project roots containing or contained by the cwd;
-  `:Agent99History all` lifts the filter) — the running one
-  (live, with elapsed time) plus past records, newest first. With
-  telescope installed it is a fuzzy picker over time/status/mode/file/
-  instruction whose preview shows exactly what the agent was given
-  (instruction, target, provider, stats) and what came back; `<CR>` opens
-  the stored record. Without telescope, a plain split. No hard
-  dependency either way.
-- `<leader>9l` (or `:Agent99Logs`) opens the log, including a per-request
-  trace of every tool call the agent made and token usage per round.
-
-The selection is the agent's main context and its primary edit target, but
-it is not the boundary: changes that belong elsewhere (a helper below an
-existing function, an import, another file) are made through the
-symbol-addressed edit tools during the run, land in editor buffers
-(unsaved), are listed in the completion notification, and can all be undone
-at once with `:Agent99Revert`.
-
-Safety and feedback around an apply:
-
-- A line-numbered snapshot of the file (or a window around the selection) is
-  embedded in the initial prompt, so the agent usually skips a read round.
-- When a request finishes, a stats line is shown: rounds, tokens in/out,
-  wall-clock seconds (also stored in the history record).
-- If the selected region changed while the agent worked, the apply is
-  refused and the proposal is kept in history (hash guard).
-- After an apply, agent99 waits `auto_fix_delay_ms`, compares ERROR
-  diagnostics against the pre-edit set, and if the edit introduced new ones,
-  automatically runs one follow-up round asking the agent to fix them
-  (openai provider; never chains a fix-of-a-fix).
-
-Every request — successes and failures alike — is persisted as a JSON record
-under `stdpath("state")/agent99/history/` (pruned to `history.keep`), with
-its outcome `status` (applied / discarded / stale_refused / no_replacement /
-error / empty_reply / cancelled / answered), per-tool call counts, rounds,
-token totals, duration, and the full agent transcript alongside.
-`:Agent99Stats` (or `/stats` in the panel; session-scoped, `all` for
-lifetime) aggregates them: outcome rates, average cost per request,
-tool-usage breakdown, and recent failures — the data to judge what to
-improve next. The records are plain JSON, so deeper analysis is a `jq` away.
+```
+Neovim (your editor, LSP clients attached)
+  │  compose / chat / followup
+  │  spawns bin/agent99-bridge (one static Go binary, stdlib only)…
+  ├─ agent99-bridge agent             (openai-kind providers)
+  │    OpenAI-compatible function-calling loop with loop hygiene:
+  │    repeated calls nudged, byte-identical results deduplicated,
+  │    stalled rounds force an answer.
+  │    LSP tools call back into Neovim over a NON-BLOCKING protocol:
+  │    `--remote-expr Agent99RpcStart(...)` starts the tool in a coroutine
+  │    and returns immediately; the bridge polls Agent99RpcPoll(...) for
+  │    the result, so the editor UI never freezes during a tool call.
+  │
+  └─ or `claude -p` + agent99-bridge mcp      (claude provider)
+       The same LSP tools exposed as an MCP stdio server.
+```
 
 ## Tools exposed to the agent
 
 | Tool | Backed by |
 |---|---|
+| `workspace_map` | the whole workspace's shape in one call: every project file with its line count and top-level declarations only (string parsers on disk content — no buffers created, no servers attached); the intended first move in an unfamiliar repo, ahead of skim/grep |
+| `skim` | structure of up to 20 files in one call: every function/class/method declaration line with line numbers, nested (treesitter, LSP-symbol fallback) — measures ~6-25% of the tokens of reading the same files |
+| `find_symbol` | look up symbols by `/`-joined name path across files/globs, optionally returning the full body — fetch exactly one function instead of a whole file |
+| `ts_query` | structural multi-file search: a treesitter s-expression query with `@captures` and `#eq?`/`#match?` predicates — for questions grep can't ask |
 | `definition`, `type_definition`, `implementation` | `textDocument/*` via live client |
 | `hover` | `textDocument/hover` (signatures + docs) |
 | `expand_symbol` | definition + full source of the defining symbol + hover, in one round-trip |
-| `workspace_map` | the whole workspace's shape in one call: every project file with its line count and top-level declarations only (string parsers on disk content — no buffers created, no servers attached); the intended first move in an unfamiliar repo, ahead of skim/grep |
-| `skim` | structure of up to 20 files in one call: every function/class/method declaration line with line numbers, nested (treesitter, LSP-symbol fallback) — the intended first move when exploring; measures ~6-25% of the tokens of reading the same files |
-| `ts_query` | structural multi-file search: a treesitter s-expression query over a file list or glob, with `@captures` and `#eq?`/`#match?` predicates — for questions grep can't ask (declaration vs usage, match by shape); a non-compiling query returns a clear error pointing at skim |
-| `find_symbol` | look up symbols by `/`-joined name path across files/globs, optionally returning the full body — fetch exactly one function instead of a whole file |
-| `replace_symbol_body`, `replace_symbol_lines`, `insert_after_symbol`, `insert_before_symbol` | symbol-addressed edits, applied to editor buffers immediately and tracked; `replace_symbol_lines` edits a slice by symbol-relative line numbers (the numbering `find_symbol` bodies use), so small changes in big functions cost only the changed lines. Every edit tool returns fresh post-edit diagnostics in its own result. The user reverts the whole batch with `:Agent99Revert`; the selection itself stays reserved for the `<replacement>` reply |
-| `document_symbols` | file outline (LSP symbols, each with its declaration line) |
-| `workspace_symbols` | project-wide symbol search |
-| `diagnostics` | `vim.diagnostic.get` (what the editor shows); each error/warning also lists the `quick_fixes` the language server can apply itself, steering the agent to `apply_code_action` instead of hand-writing fixes |
-| `incoming_calls`, `outgoing_calls` | call hierarchy (server support varies; lua_ls lacks it) |
-| `code_actions`, `apply_code_action` | list the editor's quick fixes/refactorings, apply one by token+index; the edit is performed by Neovim itself (safe, possibly multi-file) |
-| `buffer_lines` | editor's live buffer content, **including unsaved changes** |
 | `references` | `textDocument/references`, each hit annotated with its enclosing symbol path |
-| `read_file`, `grep`, `list_files` | plain file access rooted at the project ("openai" provider; the claude provider uses its own Read/Grep/Glob). A plain `read_file` of a large file returns its skim instead of 2000 lines. Grep takes `glob`, `context`, and `blame` arguments and annotates every hit: `file:line [Symbol kind @pos/len dN !SEV ~age · signature · doc-comment]` — what the hit *is* (def/call/comment/string), where it sits in its symbol, how deeply nested, whether the line already carries a diagnostic, `test:` for test files, when it last changed (blame, partial-clone-safe), with signature+doc shown once per symbol. Partial reads (`read_file` offset, `buffer_lines` first/last) are prefixed with a breadcrumb naming the enclosing symbol |
+| `document_symbols`, `workspace_symbols` | file outline / project-wide symbol search |
+| `diagnostics` | `vim.diagnostic.get` (what the editor shows); fixable ones list their `quick_fixes`, steering the agent to `apply_code_action` instead of hand-writing fixes |
+| `incoming_calls`, `outgoing_calls` | call hierarchy (server support varies) |
+| `code_actions`, `apply_code_action` | list the editor's quick fixes/refactorings, apply one by token+index; the edit is performed by Neovim itself (safe, possibly multi-file) |
+| `replace_symbol_body`, `replace_symbol_lines`, `insert_after_symbol`, `insert_before_symbol` | symbol-addressed edits, applied to editor buffers immediately and tracked (undoable per run); every edit tool returns fresh post-edit diagnostics in its own result |
+| `buffer_lines` | editor's live buffer content, **including unsaved changes** |
+| `read_file`, `grep`, `list_files` | plain file access rooted at the project (openai-kind providers; claude brings its own Read/Grep/Glob). A plain read of a large file returns its skim instead of thousands of lines. Grep output is deterministic and every hit is annotated: `file:line [Symbol kind @pos/len dN !SEV ~age · signature · doc-comment]` — what the hit *is*, where it sits, its nesting depth, existing diagnostics, `test:` for test files, blame age on request — so most hits need no follow-up read |
 
-Positions are addressed as `(file, line, symbol-text-on-that-line)` instead of
-raw columns — far more reliable for an LLM, with UTF-16 conversion handled on
-the Lua side.
+Positions are addressed as `(file, line, symbol-text-on-that-line)` instead
+of raw columns — far more reliable for an LLM, with UTF-16 conversion
+handled on the Lua side.
 
 **Slim default roster**: `type_definition`, `implementation`,
 `incoming_calls`, `outgoing_calls`, `document_symbols`, and `expand_symbol`
@@ -299,25 +308,26 @@ make e2e     # one real agent edit through DeepSeek; needs DEEPSEEK_API_KEY
 ```
 
 `tests/smoke.sh` starts a throwaway headless Neovim with a minimal config
-(`tests/minimal_init.lua`, native vim.lsp.config, no lspconfig) on the bundled
-`tests/testproj`, then asserts on real lua_ls results through the MCP bridge.
-lua-language-server must be on PATH or in mason's bin directory.
+on the bundled `tests/testproj`, then asserts on real lua_ls results
+through the MCP bridge. lua-language-server must be on PATH or in mason's
+bin directory.
 
 ## Known limitations
 
 - One request at a time.
-- The reply replaces the selection; agent-driven multi-file editing exists
-  only through `apply_code_action`.
-- First LSP query in a cold project can return empty results while the server
-  is still indexing; the agent usually retries (the smoke test does too).
-- Auto-fix compares diagnostics by severity+message, so a pre-existing error
-  message that the edit duplicates on another line still counts as new, and
-  an edit that merely moves an error is not flagged.
+- The reply replaces the selection; agent-driven multi-file editing goes
+  through the symbol tools and `apply_code_action`.
+- First LSP query in a cold project can return empty results while the
+  server is still indexing; the agent usually retries.
+- Auto-fix compares diagnostics by severity+message, so a pre-existing
+  error the edit duplicates on another line still counts as new.
 
 ## Ideas / next steps
 
 - Hunk-based diff preview (show only what changed, via vim.diff).
-- Streaming tool-call progress into the virtual text.
 - Charwise/blockwise selections (currently widened to whole lines).
-- `textDocument/rename` as an agent tool (safe multi-file refactor primitive).
+- `textDocument/rename` as an agent tool (safe multi-file refactor
+  primitive).
 - FIM-based ghost-text completion as a separate fast path.
+- A CLI entry point driving a running (or headless) editor — most of a
+  standalone coding agent already exists here.
