@@ -696,26 +696,45 @@ function M.open_record(rec)
         vim.cmd(("normal! %dGV%dG"):format(first, last))
     end
 
-    -- Chronological neighbors: <C-h> older, <C-l> newer, same view.
+    -- Chronological neighbors: <C-h> older, <C-l> newer, same view. Walks
+    -- workspace-relevant records (the picker's scope); when the current
+    -- record itself is outside the workspace - opened from the "all" view -
+    -- it walks everything instead.
     local function nav(delta)
         local files = record_files()
         table.sort(files)
-        local idx
-        for i, path in ipairs(files) do
-            if rec.id and path:find(rec.id, 1, true) then
-                idx = i
-                break
+        local function build(scoped)
+            local out = {}
+            for _, path in ipairs(files) do
+                local r = read_record(path)
+                if r and (not scoped or in_workspace(r)) then
+                    out[#out + 1] = { path = path, rec = r }
+                end
+            end
+            return out
+        end
+        local function find(list)
+            for i, e in ipairs(list) do
+                if rec.id and e.path:find(rec.id, 1, true) then
+                    return i
+                end
             end
         end
-        local target = idx and files[idx + delta]
-        local nrec = target and read_record(target)
-        if not nrec then
-            vim.notify("agent99: no " .. (delta < 0 and "older" or "newer") .. " record")
+        local list = build(true)
+        local idx = find(list)
+        if not idx then
+            list = build(false)
+            idx = find(list)
+        end
+        local target = idx and list[idx + delta]
+        if not target then
+            vim.notify("agent99: no " .. (delta < 0 and "older" or "newer")
+                .. " record in this workspace")
             return
         end
         close()
         vim.schedule(function()
-            M.open_record(nrec)
+            M.open_record(target.rec)
         end)
     end
 
