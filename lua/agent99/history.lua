@@ -416,9 +416,11 @@ end
 -- instruction, one section per edit, answer/replacement, error.
 local function record_sections(rec)
     local sections = {}
-    local function sec(name, lines)
+    -- `jump` = { file, first, last }: <CR> on the section leaves the record
+    -- view and visually selects that region in the last active window.
+    local function sec(name, lines, jump)
         if lines and #lines > 0 then
-            sections[#sections + 1] = { name = name, lines = lines }
+            sections[#sections + 1] = { name = name, lines = lines, jump = jump }
         end
     end
     local info = {
@@ -444,7 +446,8 @@ local function record_sections(rec)
         vim.list_extend(body, vim.split(text or "", "\n", { plain = true }))
         body[#body + 1] = "```"
         sec(("ctx: %s:%s-%s"):format(vim.fn.fnamemodify(file, ":t"),
-            tostring(first), tostring(last)), body)
+            tostring(first), tostring(last)), body,
+            { file = file, first = tonumber(first), last = tonumber(last) })
     end
     local instruction = rec.instruction or "(none)"
     local pending_ctx = {}
@@ -476,16 +479,23 @@ local function record_sections(rec)
         vim.list_extend(body, vim.split(rec.before, "\n", { plain = true }))
         body[#body + 1] = "```"
         sec(("target: %s:%s-%s"):format(vim.fn.fnamemodify(rec.file, ":t"),
-            tostring(rec.first), tostring(rec.last)), body)
+            tostring(rec.first), tostring(rec.last)), body,
+            { file = rec.file, first = rec.first, last = rec.last })
     end
     for _, c in ipairs(pending_ctx) do
         ctx_section(c.file, c.first, c.last, c.text)
     end
     if rec.mode ~= "ask" and rec.mode ~= "chat" and rec.before and rec.result then
-        sec("change", change_lines(rec.file, rec.before, rec.result, true))
+        sec("change", change_lines(rec.file, rec.before, rec.result, true),
+            { file = rec.file, first = rec.first, last = rec.last })
     end
     for _, e in ipairs(rec.edits or {}) do
-        sec(e.label or "edit", change_lines(e.file, e.before, e.after, true))
+        local jump
+        if e.first then
+            local n = #vim.split(e.after or "", "\n", { plain = true })
+            jump = { file = e.file, first = e.first, last = e.first + math.max(n - 1, 0) }
+        end
+        sec(e.label or "edit", change_lines(e.file, e.before, e.after, true), jump)
     end
     for _, d in ipairs(rec.edit_diffs or {}) do
         local body = { "```diff" }
@@ -510,7 +520,22 @@ end
 -- section list on the left (j/k), the selected section rendered as
 -- markdown on the right. Also serves as the answer window for finished
 -- ask requests. gf on the record/transcript lines opens the raw JSON.
+-- The record shown most recently (via the picker or as a fresh answer),
+-- for :Agent99Record.
+local last_record = nil
+
+--- Re-open the most recently shown record.
+function M.open_last()
+    if last_record then
+        M.open_record(last_record)
+    else
+        vim.notify("agent99: no record shown yet (open one from :Agent99History)")
+    end
+end
+
 function M.open_record(rec)
+    last_record = rec
+    local origin_win = vim.api.nvim_get_current_win()
     local sections = record_sections(rec)
     local rc = (config.options.ui or {}).record or {}
     -- Near-full height, and a content pane wide enough that code up to
@@ -543,7 +568,7 @@ function M.open_record(rec)
         style = "minimal", border = rc.border or "rounded",
         title = (" %s — %s "):format(rec.mode or "record", rec.status or "?"),
         title_pos = "center",
-        footer = " j/k · q close ", footer_pos = "center",
+        footer = " j/k · <CR> jump to file · C-h/C-l records · q ", footer_pos = "center",
     })
     vim.wo[list_win].cursorline = true
     -- Open on the payload - answer, change, or the first edit - not info.
@@ -571,7 +596,7 @@ function M.open_record(rec)
         style = "minimal", border = rc.border or "rounded",
         title = " " .. (sections[1] and sections[1].name or "record") .. " ",
         title_pos = "center",
-        footer = " <Tab> scroll pane · gf opens raw file ", footer_pos = "center",
+        footer = " <CR> jump to file · <Tab> panes · gf opens path ", footer_pos = "center",
     })
     vim.wo[content_win].conceallevel = 2
     vim.wo[content_win].concealcursor = "nc"
@@ -615,10 +640,78 @@ function M.open_record(rec)
         end
     end
 
+    -- <CR> on a section with a file location: leave the record view and
+    -- visually select that region in the last active window.
+    local function jump_to_section()
+        local s = vim.api.nvim_win_is_valid(list_win)
+            and sections[vim.api.nvim_win_get_cursor(list_win)[1]]
+        local j = s and s.jump
+        if not j then
+            vim.notify("agent99: this section has no file location")
+            return
+        end
+        close()
+        local win = origin_win
+        if not (win and vim.api.nvim_win_is_valid(win)
+                and vim.api.nvim_win_get_config(win).relative == "") then
+            win = nil
+            for _, w in ipairs(vim.api.nvim_list_wins()) do
+                if vim.api.nvim_win_get_config(w).relative == "" then
+                    win = w
+                    break
+                end
+            end
+        end
+        if not win then
+            return
+        end
+        vim.api.nvim_set_current_win(win)
+        local ok = pcall(vim.cmd.edit, vim.fn.fnameescape(j.file))
+        if not ok then
+            vim.notify("agent99: cannot open " .. j.file, vim.log.levels.ERROR)
+            return
+        end
+        local total = vim.api.nvim_buf_line_count(0)
+        local first = math.min(math.max(j.first or 1, 1), total)
+        local last = math.min(j.last or first, total)
+        vim.cmd(("normal! %dGV%dG"):format(first, last))
+    end
+
+    -- Chronological neighbors: <C-h> older, <C-l> newer, same view.
+    local function nav(delta)
+        local files = record_files()
+        table.sort(files)
+        local idx
+        for i, path in ipairs(files) do
+            if rec.id and path:find(rec.id, 1, true) then
+                idx = i
+                break
+            end
+        end
+        local target = idx and files[idx + delta]
+        local nrec = target and read_record(target)
+        if not nrec then
+            vim.notify("agent99: no " .. (delta < 0 and "older" or "newer") .. " record")
+            return
+        end
+        close()
+        vim.schedule(function()
+            M.open_record(nrec)
+        end)
+    end
+
     for _, b in ipairs({ list_buf, content_buf }) do
         vim.keymap.set("n", "q", close, { buffer = b })
         vim.keymap.set("n", "<Esc>", close, { buffer = b })
+        vim.keymap.set("n", "<CR>", jump_to_section,
+            { buffer = b, desc = "agent99: go to section's file region" })
+        vim.keymap.set("n", "<C-h>", function() nav(-1) end,
+            { buffer = b, desc = "agent99: older record" })
+        vim.keymap.set("n", "<C-l>", function() nav(1) end,
+            { buffer = b, desc = "agent99: newer record" })
     end
+    vim.keymap.set("n", "gf", jump_to_section,
+        { buffer = list_buf, desc = "agent99: go to section's file region" })
     vim.keymap.set("n", "<Tab>", function()
         vim.api.nvim_set_current_win(content_win)
     end, { buffer = list_buf, desc = "agent99: to content" })

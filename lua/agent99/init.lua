@@ -98,6 +98,7 @@ function M.chat_send(text) require("agent99.chat").send(text) end
 function M.chat_reset() require("agent99.chat").reset() end
 
 function M.history() require("agent99.history").browse() end
+function M.last_record() require("agent99.history").open_last() end
 function M.stats(scope) require("agent99.history").stats(scope) end
 function M.stats_lines(scope) return require("agent99.history").stats_lines(scope) end
 function M.history_lines(n) return require("agent99.history").history_lines(n) end
@@ -118,6 +119,7 @@ local function define_commands()
     cmd("Agent99Apply", M.accept, {})
     cmd("Agent99Revert", M.revert_edits, {})
     cmd("Agent99History", M.history, {})
+    cmd("Agent99Record", M.last_record, {})
     cmd("Agent99Stats", function(o)
         M.stats(vim.trim(o.args) == "all" and "all" or nil)
     end, { nargs = "?", complete = function() return { "all" } end })
@@ -155,6 +157,7 @@ local function define_keymaps(maps)
     map("n", maps.followup, M.followup, "follow up on last edit/answer")
     map("n", maps.cancel, M.cancel, "cancel request / discard preview")
     map("n", maps.history, M.history, "request history")
+    map("n", maps.record, M.last_record, "re-open last record")
     map("n", maps.logs, M.view_logs, "view logs")
 end
 

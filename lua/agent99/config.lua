@@ -120,6 +120,7 @@ M.defaults = {
         followup = "<leader>9f",        -- n: follow up on last edit/answer
         cancel = "<leader>9x",          -- n: cancel request / discard preview
         history = "<leader>9h",         -- n: request history
+        record = "<leader>9r",          -- n: re-open the last record view
         logs = "<leader>9l",            -- n: view logs
     },
 

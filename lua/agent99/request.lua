@@ -464,6 +464,7 @@ local function on_exit(result)
                     changes[#changes + 1] = {
                         label = label,
                         file = e.file,
+                        first = e.first,
                         before = table.concat(e.old_lines or {}, "\n"),
                         after = table.concat(e.new_lines, "\n"),
                     }
