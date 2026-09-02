@@ -287,10 +287,10 @@ local HELP = {
     "- `/cancel` — cancel the running request (also `<leader>9x`)",
     "- `/stats` — usage this session (`/stats all` — lifetime)",
     "- `/history` — past requests",
-    "- `/hide` — hide the panel (also `q`; reopen with `<leader>99`)",
+    "- `/hide` — hide the panel (also `q`; reopen with `<leader>9c`)",
     "",
     "**Keys**: `<CR>` send (insert: `<C-s>`) · `i` in the conversation jumps",
-    "to the prompt · visual `<leader>99` attaches the selection as context",
+    "to the prompt · visual `<leader>9c` attaches the selection as context",
     "for the next message, from any file, mid-conversation too.",
     "",
 }

@@ -53,12 +53,22 @@ function M.panel_visual()
     })
 end
 
---- Edit the current visual selection: opens the compose float with the
---- selection as the edit target. Re-invoking from another selection stacks
---- it as additional context; the typed draft survives closing the window.
-function M.edit_visual()
+--- Compose from the current visual selection in auto mode: the model
+--- decides whether the instruction is an edit or a question. Re-invoking
+--- from another selection stacks it as context; the draft survives closing.
+function M.auto_visual()
     require("agent99.compose").from_visual(
         require("agent99.config").options.auto_mode ~= false and "auto" or "edit")
+end
+
+--- Compose from the current visual selection, hardcoded as an edit.
+function M.edit_visual()
+    require("agent99.compose").from_visual("edit")
+end
+
+--- Reopen the compose picker over the current draft/stack.
+function M.compose_open()
+    require("agent99.compose").open()
 end
 
 --- Ask a question about the current visual selection (same compose window;
@@ -151,12 +161,14 @@ local function define_keymaps(maps)
             vim.keymap.set(mode, lhs, rhs, { desc = "agent99: " .. desc })
         end
     end
-    map("n", maps.toggle_panel, M.toggle_panel,
-        "toggle agent panel (chat persists; gn / :Agent99Clear resets)")
-    map("x", maps.panel_selection, M.panel_visual,
-        "open panel with the selection as context for the next message")
-    map("x", maps.edit, M.edit_visual, "edit selection")
-    map("x", maps.ask, M.ask_visual, "ask about selection (answer in split)")
+    map("n", maps.chat or maps.toggle_panel, M.toggle_panel,
+        "toggle chat panel (conversation persists; gn / :Agent99Clear resets)")
+    map("x", maps.chat_selection or maps.panel_selection, M.panel_visual,
+        "chat panel with the selection as context for the next message")
+    map("x", maps.auto, M.auto_visual, "compose (model infers edit vs question)")
+    map("n", maps.compose, M.compose_open, "reopen the compose draft")
+    map("x", maps.edit, M.edit_visual, "compose: edit selection")
+    map("x", maps.ask, M.ask_visual, "compose: ask about selection")
     map("n", maps.followup, M.followup, "follow up on last edit/answer")
     map("n", maps.cancel, M.cancel, "cancel request / discard preview")
     map("n", maps.history, M.history, "request history")

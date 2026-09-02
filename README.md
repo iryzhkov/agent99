@@ -17,7 +17,7 @@ code window follows what it reads](doc/panel-chat-working.png)
 
 ```
 Neovim (your editor, LSP clients attached)
-  │  <leader>9v on a visual selection → instruction prompt
+  │  <leader>99 on a visual selection → compose prompt
   │  spawns bin/agent99-bridge (one static Go binary, stdlib only)…
   ├─ agent99-bridge agent             (provider "openai", default: DeepSeek)
   │    OpenAI-compatible function-calling loop.
@@ -117,10 +117,12 @@ require("agent99").setup({
         },
     },
     keymaps = {                  -- false disables all; set a key to false to drop one
-        toggle_panel = "<leader>99",    -- n
-        panel_selection = "<leader>99", -- x
-        edit = "<leader>9v",            -- x
-        ask = "<leader>9a",             -- x
+        auto = "<leader>99",            -- x: compose, model infers edit/ask
+        compose = "<leader>99",         -- n: reopen the compose draft
+        edit = "<leader>9e",            -- x: compose, hardcoded edit
+        ask = "<leader>9a",             -- x: compose, hardcoded ask
+        chat = "<leader>9c",            -- n: toggle the chat panel
+        chat_selection = "<leader>9c",  -- x: panel with selection as context
         followup = "<leader>9f",
         cancel = "<leader>9x",
         history = "<leader>9h",
@@ -147,7 +149,7 @@ the agent.
 
 ## Use
 
-### The agent panel (`<leader>99`)
+### The agent panel (`<leader>9c`)
 
 The primary interface: a vertical split on the right with a scrolling
 conversation pane above a prompt buffer, while the window you started from
@@ -156,7 +158,7 @@ stays on the left as the code window.
 ![A finished answer in the panel, with file:line citations and the cost
 line](doc/panel-chat.png)
 
-- `<leader>99` toggles the panel; `<CR>` in the prompt (or `<C-s>` in insert
+- `<leader>9c` toggles the panel; `<CR>` in the prompt (or `<C-s>` in insert
   mode) sends; `i` in the conversation pane jumps to the prompt; `q` hides
   the panel without losing anything.
 - The conversation persists for the whole Neovim session — `gn` or
@@ -173,9 +175,9 @@ line](doc/panel-chat.png)
   buffer_lines, find_symbol bodies) move it to the file and position being
   read; edits jump it there with a brief highlight. Edits land unsaved in
   buffers; `:Agent99Revert` (or `/revert`) undoes the last batch.
-- `<leader>99` from a visual selection stages the selection (file, range,
+- `<leader>9c` from a visual selection stages the selection (file, range,
   text) as context for the next message — including mid-conversation: leave
-  the panel, select something else in any file, hit `<leader>99` again, and
+  the panel, select something else in any file, hit `<leader>9c` again, and
   the conversation continues with the new context attached.
 - Chat mode needs the openai provider (transcript continuity).
 
@@ -187,13 +189,13 @@ marker](doc/edit-working.png)
 ![The proposal opens in a preview split: apply with CR, discard with
 q](doc/edit-preview.png)
 
-- Visually select lines, press `<leader>9v`: a telescope-style compose
+- Visually select lines, press `<leader>99`: a telescope-style compose
   picker opens — selection list top-left (the first entry is the edit
   target), instruction prompt below it, and a syntax-highlighted preview
   of the highlighted selection on the right. Type the instruction and
   `<CR>` (insert: `<C-s>`) to send. The draft is sticky: `q`/`<Esc>`
-  closes the picker without losing it, and invoking `<leader>9v` (or
-  `9a`) again from another selection — any file — stacks that selection
+  closes the picker without losing it, and invoking `<leader>99` (or
+  `9a`/`9e`) again from another selection — any file — stacks that selection
   as additional context instead of starting over, so one request can
   carry several regions. Navigate with `<C-j>`/`<C-k>` from the prompt or
   `<Tab>` into the list and `j`/`k`; `x` removes a context, `gx` discards
@@ -202,7 +204,9 @@ q](doc/edit-preview.png)
   `agent99 working…` marker; when the agent finishes, the proposal opens
   in a preview split — `<CR>` applies it, `q` discards (or is applied
   directly with `preview = false`).
-- `<leader>9a` asks a question about the selection instead of editing it:
+- In auto mode the model itself decides whether the instruction is an
+  edit or a question (`auto_mode = false` disables). `<leader>9e` hardcodes
+  edit; `<leader>9a` hardcodes a question:
   the agent investigates with the same tools and the answer opens in a
   markdown split (`q` closes it), with locations cited as file:line.
 - `<leader>9f` follows up on the last edit **or answer**: the agent keeps its

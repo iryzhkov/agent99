@@ -119,10 +119,12 @@ M.defaults = {
     -- false disables all keymaps; true uses these defaults; a table merges
     -- over them (set a key to false to drop that one mapping).
     keymaps = {
-        toggle_panel = "<leader>99",    -- n: toggle the agent panel
-        panel_selection = "<leader>99", -- x: open panel with selection as context
-        edit = "<leader>9v",            -- x: edit selection
-        ask = "<leader>9a",             -- x: ask about selection
+        auto = "<leader>99",            -- x: compose - the model infers edit/ask
+        compose = "<leader>99",         -- n: reopen the compose draft
+        edit = "<leader>9e",            -- x: compose, hardcoded edit
+        ask = "<leader>9a",             -- x: compose, hardcoded ask
+        chat = "<leader>9c",            -- n: toggle the chat panel
+        chat_selection = "<leader>9c",  -- x: panel with selection as context
         followup = "<leader>9f",        -- n: follow up on last edit/answer
         cancel = "<leader>9x",          -- n: cancel request / discard preview
         history = "<leader>9h",         -- n: request history
