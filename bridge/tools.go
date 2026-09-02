@@ -524,7 +524,10 @@ func runGrep(root string, args map[string]any) (string, error) {
 	blame, _ := args["blame"].(bool)
 	var cmd *exec.Cmd
 	if _, err := exec.LookPath("rg"); err == nil {
-		cargs := []string{"-n", "--column", "--no-heading", "-S", ctxArg}
+		// --sort path costs rg its parallelism but makes the output
+		// deterministic; without it two identical greps are not
+		// byte-identical, which defeats the duplicate-result guard.
+		cargs := []string{"-n", "--column", "--no-heading", "-S", "--sort", "path", ctxArg}
 		if glob != "" {
 			cargs = append(cargs, "-g", glob)
 		}
