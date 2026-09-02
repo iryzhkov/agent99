@@ -422,15 +422,34 @@ function M.open_record(rec)
     vim.bo[buf].filetype = "markdown"
     pcall(vim.treesitter.start, buf, "markdown")
     pcall(vim.api.nvim_buf_set_name, buf, "agent99://record/" .. (rec.id or "?"))
-    vim.cmd.split()
-    local win = vim.api.nvim_get_current_win()
-    vim.api.nvim_win_set_buf(win, buf)
-    vim.wo[win].winbar = "agent99 record — q close · gf on a path opens the raw file"
+    -- Telescope-style centered float rather than a split.
+    local width = math.min(100, vim.o.columns - 8)
+    local height = math.min(math.max(#lines + 2, 10), vim.o.lines - 6)
+    local win = vim.api.nvim_open_win(buf, true, {
+        relative = "editor",
+        width = width,
+        height = height,
+        row = math.floor((vim.o.lines - height) / 2) - 1,
+        col = math.floor((vim.o.columns - width) / 2),
+        style = "minimal",
+        border = "rounded",
+        title = (" agent99 %s — %s "):format(rec.mode or "record",
+            rec.status or rec.id or "?"),
+        title_pos = "center",
+        footer = " q close · gf on a path opens the raw file ",
+        footer_pos = "center",
+    })
     vim.wo[win].conceallevel = 2
     vim.wo[win].concealcursor = "nc"
     vim.wo[win].wrap = true
     vim.wo[win].linebreak = true
-    vim.keymap.set("n", "q", vim.cmd.close, { buffer = buf })
+    local function close()
+        if vim.api.nvim_win_is_valid(win) then
+            pcall(vim.api.nvim_win_close, win, true)
+        end
+    end
+    vim.keymap.set("n", "q", close, { buffer = buf })
+    vim.keymap.set("n", "<Esc>", close, { buffer = buf })
 end
 
 local function telescope_browse(items)
