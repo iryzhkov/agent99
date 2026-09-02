@@ -677,6 +677,10 @@ function M.start(buf, first, last, instruction, opts)
         -- Guards against applying over a region the user edited mid-flight.
         region_hash = region_lines
             and vim.fn.sha256(table.concat(region_lines, "\n")) or nil,
+        -- Pre-edit region text, so the history preview can show the change
+        -- as a diff instead of a bare replacement (capped for huge regions).
+        before = mode == "edit" and region_lines and #region_lines <= 400
+            and table.concat(region_lines, "\n") or nil,
     }
 
     log({ "request " .. id, "file: " .. file,

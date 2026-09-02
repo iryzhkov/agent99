@@ -212,13 +212,27 @@ local function record_preview(rec, running_secs)
     end
     if rec.result and rec.result ~= "" then
         add("")
-        add("## Result")
-        local res = vim.split(rec.result, "\n", { plain = true })
-        if #res > 120 then
-            res = vim.list_slice(res, 1, 120)
-            res[#res + 1] = "... (truncated; open the record for the rest)"
+        local body
+        if rec.mode == "ask" or rec.mode == "chat" then
+            add("## Answer")
+            body = vim.split(rec.result, "\n", { plain = true })
+        elseif rec.before then
+            -- Edit with the pre-edit region on record: show the actual
+            -- change as a diff, not the bare replacement text.
+            add("## Change")
+            local d = vim.diff(rec.before .. "\n", rec.result .. "\n", {}) or ""
+            body = { "```diff" }
+            vim.list_extend(body, vim.split(d:gsub("\n$", ""), "\n", { plain = true }))
+            body[#body + 1] = "```"
+        else
+            add("## Replacement")
+            body = vim.split(rec.result, "\n", { plain = true })
         end
-        vim.list_extend(lines, res)
+        if #body > 120 then
+            body = vim.list_slice(body, 1, 120)
+            body[#body + 1] = "... (truncated; open the record for the rest)"
+        end
+        vim.list_extend(lines, body)
     end
     if rec.error then
         add("")
