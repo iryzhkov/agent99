@@ -891,6 +891,91 @@ function M.cancel()
     vim.notify("agent99: request cancelled")
 end
 
+-- Undo one block: the region at `first` in `file` should currently read
+-- `expect_text` (what the run wrote); restore `restore_text` there. When
+-- the recorded position no longer matches (edits above shifted it), fall
+-- back to a unique exact occurrence anywhere in the file.
+local function undo_block(file, first, expect_text, restore_text)
+    local path = vim.fn.fnamemodify(file, ":p")
+    if vim.fn.filereadable(path) == 0 and vim.fn.bufexists(path) == 0 then
+        return false, "file is gone"
+    end
+    local bufnr = vim.fn.bufadd(path)
+    vim.fn.bufload(bufnr)
+    local expect = vim.split(expect_text, "\n", { plain = true })
+    local total = vim.api.nvim_buf_line_count(bufnr)
+    local function matches_at(row)
+        if row < 1 or row + #expect - 1 > total then
+            return false
+        end
+        return table.concat(vim.api.nvim_buf_get_lines(
+            bufnr, row - 1, row - 1 + #expect, false), "\n") == expect_text
+    end
+    local row
+    if first and matches_at(first) then
+        row = first
+    else
+        for r = 1, total - #expect + 1 do
+            if matches_at(r) then
+                if row then
+                    return false, "the edited text appears more than once"
+                end
+                row = r
+            end
+        end
+    end
+    if not row then
+        return false, "the edited text is no longer there"
+    end
+    local restore = restore_text ~= "" and
+        vim.split(restore_text, "\n", { plain = true }) or {}
+    vim.api.nvim_buf_set_lines(bufnr, row - 1, row - 1 + #expect, false, restore)
+    return true
+end
+
+--- Undo everything a recorded run changed: its symbol edits (newest
+--- first) and its applied replacement. Changes land unsaved in buffers,
+--- so :undo / :earlier still work per buffer on top of this.
+function M.undo_record(rec)
+    local done, failed = 0, {}
+    for i = #(rec.edits or {}), 1, -1 do
+        local e = rec.edits[i]
+        if e.file and e.after and e.first then
+            local ok, err = undo_block(e.file, e.first, e.after, e.before or "")
+            if ok then
+                done = done + 1
+            else
+                failed[#failed + 1] = (e.label or "edit") .. ": " .. err
+            end
+        else
+            failed[#failed + 1] = (e.label or "edit") .. ": no position data recorded"
+        end
+    end
+    if rec.status == "applied" and rec.before and rec.result
+        and rec.file and rec.file ~= "" then
+        local ok, err = undo_block(rec.file, rec.first, rec.result, rec.before)
+        if ok then
+            done = done + 1
+        else
+            failed[#failed + 1] = "replacement: " .. err
+        end
+    end
+    if done == 0 and #failed == 0 then
+        vim.notify("agent99: this record has nothing undoable "
+            .. "(no stored edits or replacement)")
+        return
+    end
+    if done > 0 then
+        rec.undone = true
+        require("agent99.history").write(rec)
+    end
+    local msg = ("agent99: undid %d change(s) from this run (unsaved)"):format(done)
+    if #failed > 0 then
+        msg = msg .. "; skipped: " .. table.concat(failed, "; ")
+    end
+    vim.notify(msg, #failed > 0 and vim.log.levels.WARN or vim.log.levels.INFO)
+end
+
 --- Undo the symbol-tool edits of the last run (newest first).
 function M.revert_edits()
     if not state.last_edits or #state.last_edits == 0 then

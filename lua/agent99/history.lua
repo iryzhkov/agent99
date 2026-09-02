@@ -764,7 +764,7 @@ function M.open_record(rec)
         style = "minimal", border = rc.border or "rounded",
         title = (" %s — %s "):format(rec.mode or "record", rec.status or "?"),
         title_pos = "center",
-        footer = " j/k · <CR> jump to file · C-h/C-l records · q ", footer_pos = "center",
+        footer = " j/k · <CR> jump · gu undo run · C-h/l records · q ", footer_pos = "center",
     })
     vim.wo[list_win].cursorline = true
     pcall(vim.api.nvim_win_set_cursor, list_win, { default, 0 })
@@ -1002,6 +1002,9 @@ function M.open_record(rec)
             { buffer = b, desc = "agent99: newer record" })
         vim.keymap.set("n", "gt", jump_to_target,
             { buffer = b, desc = "agent99: go to target region" })
+        vim.keymap.set("n", "gu", function()
+            require("agent99.request").undo_record(rec)
+        end, { buffer = b, desc = "agent99: undo this run's edits" })
         -- <Tab> cycles list -> content -> prompt -> target -> list.
         vim.keymap.set("n", "<Tab>", function()
             for step = 1, #wins do
