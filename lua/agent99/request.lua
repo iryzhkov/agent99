@@ -675,6 +675,7 @@ function M.start(buf, first, last, instruction, opts)
         id = id,
         mode = mode,
         time = os.date("%Y-%m-%d %H:%M:%S"),
+        root = root,
         file = file,
         first = first,
         last = last,

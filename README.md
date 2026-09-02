@@ -206,7 +206,9 @@ q](doc/edit-preview.png)
   with `<leader>9f`. Openai-provider only.
 - `<leader>9x` (or `:Agent99Cancel`) cancels an in-flight request, or
   discards a pending preview.
-- `<leader>9h` (or `:Agent99History`) searches requests — the running one
+- `<leader>9h` (or `:Agent99History`) searches requests — scoped to the
+  current workspace (project roots containing or contained by the cwd;
+  `:Agent99History all` lifts the filter) — the running one
   (live, with elapsed time) plus past records, newest first. With
   telescope installed it is a fuzzy picker over time/status/mode/file/
   instruction whose preview shows exactly what the agent was given

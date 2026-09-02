@@ -329,10 +329,29 @@ local function rel_time(timestr)
     return ("%s-%s-%s"):format(y, mo, d)
 end
 
+-- A record is relevant to the current workspace when its project root and
+-- the cwd contain one another (being in a subdirectory of the project, or
+-- the project being under the cwd, both count). Legacy records without a
+-- root are matched on their target file instead.
+local function in_workspace(rec)
+    local cwd = vim.uv.cwd()
+    local anchor = rec.root
+    if not anchor and rec.file and rec.file ~= "" then
+        anchor = vim.fn.fnamemodify(rec.file, ":h")
+    end
+    if not anchor then
+        return true -- chat records with no file: no way to place them
+    end
+    local function under(a, b)
+        return a == b or a:sub(1, #b + 1) == b .. "/"
+    end
+    return under(anchor, cwd) or under(cwd, anchor)
+end
+
 -- Running request first, then records newest-first. Each item carries its
 -- one-line display, a searchable ordinal, the preview lines, and the
--- record path (nil while running).
-local function picker_items()
+-- record path (nil while running). scope "all" lifts the workspace filter.
+local function picker_items(scope)
     local items = {}
     local running, secs = require("agent99.request").current()
     if running then
@@ -349,7 +368,7 @@ local function picker_items()
     table.sort(files, function(a, b) return a > b end)
     for _, path in ipairs(files) do
         local rec = read_record(path)
-        if rec then
+        if rec and (scope == "all" or in_workspace(rec)) then
             -- @now / @past tokens make the fuzzy search session-aware:
             -- type "@past" for runs from earlier Neovim sessions.
             local session = session_ids[rec.id] and "@now" or "@past"
@@ -736,7 +755,7 @@ function M.open_record(rec)
     show_section()
 end
 
-local function telescope_browse(items)
+local function telescope_browse(items, scope)
     local pickers = require("telescope.pickers")
     local finders = require("telescope.finders")
     local conf = require("telescope.config").values
@@ -744,7 +763,8 @@ local function telescope_browse(items)
     local actions = require("telescope.actions")
     local action_state = require("telescope.actions.state")
     pickers.new({}, {
-        prompt_title = "agent99 requests",
+        prompt_title = scope == "all" and "agent99 requests (all)"
+            or "agent99 requests (workspace)",
         finder = finders.new_table({
             results = items,
             entry_maker = function(it)
@@ -823,14 +843,17 @@ M._picker_items = picker_items
 --- given) plus past records, newest first. Uses telescope when installed
 --- (fuzzy search over time/status/mode/file/instruction, read-only
 --- markdown preview, <CR> opens the record); plain split otherwise.
-function M.browse()
-    local items = picker_items()
+--- Browse requests. Scoped to the current workspace (project roots that
+--- contain or are contained by the cwd) unless scope is "all".
+function M.browse(scope)
+    local items = picker_items(scope)
     if #items == 0 then
-        vim.notify("agent99: no history yet")
+        vim.notify(scope == "all" and "agent99: no history yet"
+            or "agent99: no requests for this workspace (:Agent99History all)")
         return
     end
     if pcall(require, "telescope") then
-        telescope_browse(items)
+        telescope_browse(items, scope)
     else
         split_browse(items)
     end

@@ -97,7 +97,7 @@ function M.pending_preview() return request().pending_preview() end
 function M.chat_send(text) require("agent99.chat").send(text) end
 function M.chat_reset() require("agent99.chat").reset() end
 
-function M.history() require("agent99.history").browse() end
+function M.history(scope) require("agent99.history").browse(scope) end
 function M.last_record() require("agent99.history").open_last() end
 function M.stats(scope) require("agent99.history").stats(scope) end
 function M.stats_lines(scope) return require("agent99.history").stats_lines(scope) end
@@ -118,7 +118,9 @@ local function define_commands()
     cmd("Agent99Cancel", M.cancel, {})
     cmd("Agent99Apply", M.accept, {})
     cmd("Agent99Revert", M.revert_edits, {})
-    cmd("Agent99History", M.history, {})
+    cmd("Agent99History", function(o)
+        M.history(vim.trim(o.args) == "all" and "all" or nil)
+    end, { nargs = "?", complete = function() return { "all" } end })
     cmd("Agent99Record", M.last_record, {})
     cmd("Agent99Stats", function(o)
         M.stats(vim.trim(o.args) == "all" and "all" or nil)
