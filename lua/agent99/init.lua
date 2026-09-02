@@ -53,44 +53,18 @@ function M.panel_visual()
     })
 end
 
-local function visual_request(mode, prompt_label)
-    if request().busy() then
-        vim.notify("agent99: a request is already running (cancel it first)",
-            vim.log.levels.WARN)
-        return
-    end
-    local buf = vim.api.nvim_get_current_buf()
-    -- getpos("v")/getpos(".") are valid while still in visual mode.
-    local vline = vim.fn.getpos("v")[2]
-    local cline = vim.fn.getpos(".")[2]
-    local first, last = math.min(vline, cline), math.max(vline, cline)
-    -- Leave visual mode NOW (the "x" flag executes the key instead of
-    -- queueing it) and only then open the prompt: a queued <Esc> would be
-    -- swallowed by vim.ui.input and cancel it before it is ever seen.
-    vim.api.nvim_feedkeys(
-        vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
-    vim.schedule(function()
-        vim.ui.input({ prompt = ("%s (lines %d-%d)> "):format(prompt_label, first, last) },
-            function(instruction)
-                if instruction == nil or instruction:gsub("%s", "") == "" then
-                    vim.notify("agent99: cancelled (empty instruction)")
-                    return
-                end
-                request().start(buf, first, last, instruction, { mode = mode })
-            end)
-    end)
-end
-
---- Edit the current visual selection. Call from a visual-mode mapping.
+--- Edit the current visual selection: opens the compose float with the
+--- selection as the edit target. Re-invoking from another selection stacks
+--- it as additional context; the typed draft survives closing the window.
 function M.edit_visual()
-    visual_request("edit", "agent99")
+    require("agent99.compose").from_visual("edit")
 end
 
---- Ask a question about the current visual selection; the answer opens in a
---- markdown split, and a follow-up afterwards turns the discussion into an
---- edit of the selected region.
+--- Ask a question about the current visual selection (same compose window;
+--- the answer opens in a markdown split, and a follow-up afterwards turns
+--- the discussion into an edit of the selected region).
 function M.ask_visual()
-    visual_request("ask", "agent99 ask")
+    require("agent99.compose").from_visual("ask")
 end
 
 --- Follow up on the last edit or answer (full conversation preserved).
