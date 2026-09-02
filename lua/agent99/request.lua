@@ -474,23 +474,27 @@ local function on_exit(result)
         local tool_edits = require("agent99.edits").take()
         if #tool_edits > 0 then
             state.last_edits = tool_edits
-            local summary, diffs = {}, {}
+            local summary, changes = {}, {}
             for _, e in ipairs(tool_edits) do
                 local label = ("%s %s in %s (lines %d+)"):format(
                     e.kind, e.name_path, vim.fn.fnamemodify(e.file, ":t"), e.first)
                 summary[#summary + 1] = label
                 -- Old and new text were captured at apply time (the ledger),
-                -- so the diff is exact even if later edits shifted lines.
-                if e.new_lines and #diffs < 20 then
-                    local d = vim.diff(
-                        table.concat(e.old_lines or {}, "\n") .. "\n",
-                        table.concat(e.new_lines, "\n") .. "\n", {}) or ""
-                    diffs[#diffs + 1] = { label = label, diff = d:gsub("\n$", "") }
+                -- so the change is exact even if later edits shifted lines.
+                -- Stored as before/after so the history view can render both
+                -- sides with the file's own syntax highlighting.
+                if e.new_lines and #changes < 20 then
+                    changes[#changes + 1] = {
+                        label = label,
+                        file = e.file,
+                        before = table.concat(e.old_lines or {}, "\n"),
+                        after = table.concat(e.new_lines, "\n"),
+                    }
                 end
             end
             record.symbol_edits = summary
-            if #diffs > 0 then
-                record.edit_diffs = diffs
+            if #changes > 0 then
+                record.edits = changes
             end
         end
 

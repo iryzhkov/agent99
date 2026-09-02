@@ -188,6 +188,33 @@ local function record_preview(rec, running_secs, full)
     local function add(s)
         vim.list_extend(lines, vim.split(s, "\n", { plain = true }))
     end
+    -- A change rendered as code in the file's own language: one Added or
+    -- Removed block when a side is empty, Before/After blocks otherwise.
+    local function add_change(file, before, after)
+        local lang = (file and vim.filetype.match({ filename = file })) or ""
+        local function block(title, text)
+            add("")
+            add("**" .. title .. "**")
+            add("```" .. lang)
+            local body = vim.split(text, "\n", { plain = true })
+            if not full and #body > 60 then
+                body = vim.list_slice(body, 1, 60)
+                body[#body + 1] = "... (truncated; <CR> opens the full view)"
+            end
+            vim.list_extend(lines, body)
+            add("```")
+        end
+        local b = vim.trim(before or "")
+        local a = vim.trim(after or "")
+        if b == "" and a ~= "" then
+            block("Added", after)
+        elseif a == "" and b ~= "" then
+            block("Removed", before)
+        else
+            block("Before", before)
+            block("After", after)
+        end
+    end
     if running_secs then
         add(("# RUNNING — %ds elapsed"):format(running_secs))
     else
@@ -210,7 +237,16 @@ local function record_preview(rec, running_secs, full)
     add("")
     add("## Instruction")
     add(rec.instruction or "(none)")
-    if rec.edit_diffs and #rec.edit_diffs > 0 then
+    if rec.edits and #rec.edits > 0 then
+        add("")
+        add("## Symbol edits")
+        for _, e in ipairs(rec.edits) do
+            add("")
+            add("### " .. e.label)
+            add_change(e.file, e.before, e.after)
+        end
+    elseif rec.edit_diffs and #rec.edit_diffs > 0 then
+        -- Records from the short-lived unified-diff format.
         add("")
         add("## Symbol edits")
         for _, d in ipairs(rec.edit_diffs) do
@@ -239,13 +275,13 @@ local function record_preview(rec, running_secs, full)
             add("## Answer")
             body = vim.split(rec.result, "\n", { plain = true })
         elseif rec.before then
-            -- Edit with the pre-edit region on record: show the actual
-            -- change as a diff, not the bare replacement text.
+            -- Edit with the pre-edit region on record: show the change as
+            -- Before/After code in the file's own language (a single Added
+            -- block when the region was empty).
+            add("")
             add("## Change")
-            local d = vim.diff(rec.before .. "\n", rec.result .. "\n", {}) or ""
-            body = { "```diff" }
-            vim.list_extend(body, vim.split(d:gsub("\n$", ""), "\n", { plain = true }))
-            body[#body + 1] = "```"
+            add_change(rec.file, rec.before, rec.result)
+            body = {}
         else
             add("## Replacement")
             body = vim.split(rec.result, "\n", { plain = true })
