@@ -181,8 +181,9 @@ function M.history_lines(n)
 end
 
 -- What was given to the agent and what came back, rendered as read-only
--- markdown for the picker preview.
-local function record_preview(rec, running_secs)
+-- markdown for the picker preview. `full` lifts the truncation caps and
+-- adds gf-able paths to the raw record and transcript (the opened view).
+local function record_preview(rec, running_secs, full)
     local lines = {}
     local function add(s)
         vim.list_extend(lines, vim.split(s, "\n", { plain = true }))
@@ -200,6 +201,12 @@ local function record_preview(rec, running_secs)
     if rec.stats then
         add("- " .. rec.stats)
     end
+    if full then
+        add("- record: " .. config.history_dir() .. "/" .. rec.id .. ".json")
+        if rec.transcript then
+            add("- transcript: " .. rec.transcript)
+        end
+    end
     add("")
     add("## Instruction")
     add(rec.instruction or "(none)")
@@ -211,7 +218,7 @@ local function record_preview(rec, running_secs)
             add("**" .. d.label .. "**")
             add("```diff")
             local body = vim.split(d.diff, "\n", { plain = true })
-            if #body > 60 then
+            if not full and #body > 60 then
                 body = vim.list_slice(body, 1, 60)
                 body[#body + 1] = "... (edit truncated)"
             end
@@ -243,9 +250,9 @@ local function record_preview(rec, running_secs)
             add("## Replacement")
             body = vim.split(rec.result, "\n", { plain = true })
         end
-        if #body > 120 then
+        if not full and #body > 120 then
             body = vim.list_slice(body, 1, 120)
-            body[#body + 1] = "... (truncated; open the record for the rest)"
+            body[#body + 1] = "... (truncated; <CR> opens the full view)"
         end
         vim.list_extend(lines, body)
     end
@@ -289,11 +296,31 @@ local function picker_items()
                 ordinal = table.concat({ session, rec.time or "", rec.status or "",
                     rec.mode or "", rec.file or "", rec.instruction or "" }, " "),
                 preview = record_preview(rec),
+                rec = rec,
                 path = path,
             }
         end
     end
     return items
+end
+
+-- The full rendered view of one record: the preview's markdown without
+-- truncation, in its own split. gf on the record/transcript lines opens
+-- the raw JSON for anyone who wants it.
+local function open_record(rec)
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, record_preview(rec, nil, true))
+    vim.bo[buf].modifiable = false
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].filetype = "markdown"
+    pcall(vim.api.nvim_buf_set_name, buf, "agent99://record/" .. (rec.id or "?"))
+    vim.cmd.split()
+    local win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(win, buf)
+    vim.wo[win].winbar = "agent99 record — q close · gf on a path opens the raw file"
+    vim.wo[win].conceallevel = 2
+    vim.wo[win].concealcursor = "nc"
+    vim.keymap.set("n", "q", vim.cmd.close, { buffer = buf })
 end
 
 local function telescope_browse(items)
@@ -329,8 +356,8 @@ local function telescope_browse(items)
                 if not entry then
                     return
                 end
-                if entry.value.path then
-                    vim.cmd.edit(entry.value.path)
+                if entry.value.rec then
+                    open_record(entry.value.rec)
                 else
                     vim.notify("agent99: request is still running (/cancel or <leader>9x to stop)")
                 end
@@ -345,7 +372,7 @@ local function split_browse(items)
     local lines, targets = {}, {}
     for i, it in ipairs(items) do
         lines[i] = it.display
-        targets[i] = it.path
+        targets[i] = it.rec
     end
     local buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -357,7 +384,7 @@ local function split_browse(items)
     vim.keymap.set("n", "<CR>", function()
         local target = targets[vim.api.nvim_win_get_cursor(0)[1]]
         if target then
-            vim.cmd.edit(target)
+            open_record(target)
         end
     end, { buffer = buf, desc = "agent99: open record" })
     vim.keymap.set("n", "q", vim.cmd.close, { buffer = buf })
