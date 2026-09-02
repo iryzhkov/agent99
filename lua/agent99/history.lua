@@ -89,7 +89,7 @@ function M.stats_lines(scope)
         for name, count in pairs(r.tools or {}) do
             tools[name] = (tools[name] or 0) + count
         end
-        repeated = repeated + (r.repeated_calls or 0)
+        repeated = repeated + (r.repeated_calls or 0) + (r.duplicate_results or 0)
         if r.autofix then
             autofixes = autofixes + 1
         end
@@ -119,7 +119,7 @@ function M.stats_lines(scope)
         local miss = tin - tcached
         lines[#lines + 1] = ("  totals: %.0fk in (%.0fk cache-miss / %.0fk cached ≈ 10x cheaper) / %.1fk out")
             :format(tin / 1000, miss / 1000, tcached / 1000, tout / 1000)
-        lines[#lines + 1] = ("  %d auto-fix rounds · %d repeated calls nudged")
+        lines[#lines + 1] = ("  %d auto-fix rounds · %d repeated/duplicate calls nudged")
             :format(autofixes, repeated)
         if undone > 0 then
             lines[#lines + 1] = ("  %d applied edit(s) were undone by the user within 30s")

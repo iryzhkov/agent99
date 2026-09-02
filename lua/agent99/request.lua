@@ -369,12 +369,15 @@ local function harvest_usage(record, stderr)
             end
         end
     end
-    local tools, repeated = {}, 0
+    local tools, repeated, duplicates = {}, 0, 0
     for name in stderr:gmatch("tool ([%w_]+)%(") do
         tools[name] = (tools[name] or 0) + 1
     end
     for _ in stderr:gmatch("tool [%w_]+ REPEATED") do
         repeated = repeated + 1
+    end
+    for _ in stderr:gmatch("tool [%w_]+ DUPLICATE") do
+        duplicates = duplicates + 1
     end
     if rounds > 0 then
         record.rounds = rounds
@@ -393,6 +396,9 @@ local function harvest_usage(record, stderr)
     end
     if repeated > 0 then
         record.repeated_calls = repeated
+    end
+    if duplicates > 0 then
+        record.duplicate_results = duplicates
     end
 end
 
@@ -723,7 +729,8 @@ function M.start(buf, first, last, instruction, opts)
                             require("agent99.ui").activity(name .. "(" .. cargs .. ")")
                         end)
                     end)
-                elseif line:find("REPEATED", 1, true) or line:find("degenerate", 1, true) then
+                elseif line:find("REPEATED", 1, true) or line:find("DUPLICATE", 1, true)
+                    or line:find("degenerate", 1, true) then
                     vim.schedule(function()
                         pcall(function()
                             require("agent99.ui").activity(line)

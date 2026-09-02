@@ -3,13 +3,15 @@ package main
 // The agent loop for OpenAI-compatible chat-completions APIs (DeepSeek by
 // default). Reads a JSON payload on stdin, loops over tool calls, prints
 // the model's final text answer on stdout. Loop hygiene: identical tool
-// calls are never re-executed (the model gets a pointed nudge instead), and
-// after two stalled rounds - or on the last round - tools are disabled so
-// the model must answer.
+// calls are never re-executed (the model gets a pointed nudge instead), a
+// large result that is byte-identical to an earlier one is suppressed in
+// favor of a pointer to the first occurrence, and after two stalled rounds
+// - or on the last round - tools are disabled so the model must answer.
 
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -270,6 +272,34 @@ func canonicalKey(name, arguments string) (string, map[string]any, bool) {
 	return b.String(), args, true
 }
 
+// Below this size a duplicate result costs little and suppressing it would
+// be noise (e.g. two legitimately empty greps both return "(no matches)").
+const minDedupeChars = 400
+
+// dedupeToolResult suppresses a result that is byte-identical to an earlier
+// one in this run: the exact-args guard in canonicalKey misses calls whose
+// arguments differ trivially (a reordered glob, an added no-op path) but
+// whose output is the same, and the duplicate's real cost is its size in
+// the context on every following round. Returns the (possibly replaced)
+// result and whether it was suppressed; seen maps result hash to the
+// ordinal of the call that produced it first.
+func dedupeToolResult(seen map[string]int, callNo int, name, result string) (string, bool) {
+	if len(result) < minDedupeChars {
+		return result, false
+	}
+	sum := sha256.Sum256([]byte(result))
+	key := string(sum[:])
+	if prev, ok := seen[key]; ok {
+		return fmt.Sprintf(
+			"This %s call returned byte-for-byte the same output as call #%d earlier "+
+				"in this run; the duplicate (%d chars) was suppressed to save context. "+
+				"The result has not changed - refine your pattern, path, or glob "+
+				"instead of re-issuing equivalent calls.", name, prev, len(result)), true
+	}
+	seen[key] = callNo
+	return result, false
+}
+
 // A degenerate reply repeats the same long line over and over (an observed
 // deepseek-chat failure mode at temperature 0). Detected when one line of
 // 30+ chars appears 4+ times and makes up at least half of all long lines.
@@ -354,6 +384,8 @@ func runAgent() {
 	client := &http.Client{Timeout: httpTimeout}
 	tools := openaiTools(p.FullTools)
 	seenCalls := map[string]int{}
+	seenResults := map[string]int{}
+	toolCallNo := 0
 	stalledRounds := 0
 	degenerateRetried := false
 	forceFinal := false
@@ -474,7 +506,10 @@ func runAgent() {
 				freshCalls++
 				out, err := callTool(name, args, p.Root)
 				if err == nil && stateChangingTools[name] {
+					// Buffers changed: older results are stale, so both
+					// repeat guards must forget their history.
 					seenCalls = map[string]int{}
+					seenResults = map[string]int{}
 				}
 				if err != nil {
 					result = fmt.Sprintf("Error: %v", err)
@@ -486,6 +521,14 @@ func runAgent() {
 				}
 				fmt.Fprintf(os.Stderr, "tool %s(%s) -> %d chars\n",
 					name, tc.Function.Arguments, len(result))
+				toolCallNo++
+				if err == nil {
+					var suppressed bool
+					result, suppressed = dedupeToolResult(seenResults, toolCallNo, name, result)
+					if suppressed {
+						fmt.Fprintf(os.Stderr, "tool %s DUPLICATE result -> suppressed\n", name)
+					}
+				}
 			}
 			messages = append(messages, map[string]any{
 				"role":         "tool",
