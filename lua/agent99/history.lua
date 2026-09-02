@@ -494,11 +494,14 @@ end
 -- ask requests. gf on the record/transcript lines opens the raw JSON.
 function M.open_record(rec)
     local sections = record_sections(rec)
-    local W = math.min(110, vim.o.columns - 6)
-    local H = math.min(28, vim.o.lines - 6)
-    local lw = 26
-    local cw = W - lw - 2
-    local row = math.floor((vim.o.lines - H) / 2) - 1
+    local rc = (config.options.ui or {}).record or {}
+    -- Near-full height, and a content pane wide enough that code up to
+    -- content_width columns renders without wrapping.
+    local lw = rc.list_width or 26
+    local cw = math.min(rc.content_width or 120, vim.o.columns - lw - 8)
+    local W = lw + cw + 2
+    local H = vim.o.lines - 5
+    local row = 1
     local col = math.floor((vim.o.columns - W) / 2)
 
     local list_buf = vim.api.nvim_create_buf(false, true)
@@ -519,7 +522,7 @@ function M.open_record(rec)
 
     local list_win = vim.api.nvim_open_win(list_buf, true, {
         relative = "editor", row = row, col = col, width = lw, height = H,
-        style = "minimal", border = "rounded",
+        style = "minimal", border = rc.border or "rounded",
         title = (" %s — %s "):format(rec.mode or "record", rec.status or "?"),
         title_pos = "center",
         footer = " j/k · q close ", footer_pos = "center",
@@ -547,7 +550,7 @@ function M.open_record(rec)
     local content_win = vim.api.nvim_open_win(content_buf, false, {
         relative = "editor", row = row, col = col + lw + 2,
         width = cw, height = H,
-        style = "minimal", border = "rounded",
+        style = "minimal", border = rc.border or "rounded",
         title = " " .. (sections[1] and sections[1].name or "record") .. " ",
         title_pos = "center",
         footer = " <Tab> scroll pane · gf opens raw file ", footer_pos = "center",

@@ -93,6 +93,13 @@ M.defaults = {
     ui = {
         width = 0.4,      -- fraction of columns for the agent panel
         input_height = 5, -- prompt pane height in lines
+        -- Layout of the record view (history <CR>, ask answers).
+        record = {
+            content_width = 120, -- columns for the content pane, so code up
+                                 -- to that width renders without wrapping
+            list_width = 26,     -- section list columns
+            border = "rounded",
+        },
         -- Layout of the compose picker (<leader>9v / 9a).
         compose = {
             width = 110,          -- max total columns (clamped to the screen)
