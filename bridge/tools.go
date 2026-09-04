@@ -361,6 +361,25 @@ var lspTools = []tool{
 		},
 	},
 	{
+		Name: "move_symbols",
+		Description: "Move whole symbols (functions, classes, constants) from one file to another, taking each one's doc comment with it and reorganizing the imports of both files afterwards. " +
+			"The way to split an oversized file: the destination is created if missing. Undoable with undo_edit.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"from":  map[string]any{"type": "string", "description": "File the symbols are in now."},
+				"to":    map[string]any{"type": "string", "description": "File to move them into; created if it does not exist."},
+				"names": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Name paths of the symbols to move, as find_symbol reports them.",
+				},
+				"header": map[string]any{"type": "string", "description": "Text to start a newly created destination with. Defaults to the source's `package X` line when there is one; supply it for languages where that is not enough."},
+			},
+			"required": []string{"from", "to", "names"},
+		},
+	},
+	{
 		Name: "delete_file",
 		Description: "Delete one file, letting the language servers react and reporting what broke elsewhere. " +
 			"Undoable with undo_edit, which restores the contents.",
@@ -1090,7 +1109,7 @@ func callTool(name string, args map[string]any, root string) (string, error) {
 		switch name {
 		case "ts_query", "find_symbol", "workspace_map", "workspace_symbols", "install_language",
 			"replace_symbol_body", "replace_symbol_lines", "insert_after_symbol", "insert_before_symbol", "undo_edit", "rename_symbol", "check_project",
-			"create_file", "move_file", "delete_file":
+			"create_file", "move_file", "delete_file", "move_symbols":
 			resolved := map[string]any{}
 			for k, v := range args {
 				resolved[k] = v

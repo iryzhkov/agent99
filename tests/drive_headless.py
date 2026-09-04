@@ -386,6 +386,34 @@ def main():
             check("expect= mismatch refuses", "do not hold the expected text" in str(e), e)
         b.call("undo_edit", {"all": True})
 
+        # move_symbols: splitting a file is a symbol operation, not a text
+        # one - the doc comments travel with their functions and both files
+        # have their imports reorganized afterwards.
+        split = os.path.join(root, "lua", "testproj", "context_store.lua")
+        res = b.call("move_symbols", {
+            "from": util, "to": split, "names": ["M.shout"],
+        })
+        with open(split) as f:
+            moved_text = f.read()
+        with open(util) as f:
+            left_text = f.read()
+        check("move_symbols moves the symbol",
+              "function M.shout" in moved_text and "function M.shout" not in left_text,
+              res)
+        check("move_symbols creates the destination and reports what moved",
+              res.get("created") is True and res.get("moved") == ["M.shout"], res)
+        check("the symbol that stayed is untouched", "function M.greet" in left_text, left_text)
+        res = b.call("undo_edit", {"all": True})
+        with open(util) as f:
+            check("undo_edit puts a split back", "function M.shout" in f.read(), res)
+        os.path.exists(split) and os.remove(split)
+
+        try:
+            b.call("move_symbols", {"from": util, "to": util, "names": ["M.greet"]})
+            check("move_symbols refuses a no-op move", False, "call succeeded")
+        except RuntimeError as e:
+            check("move_symbols refuses a no-op move", "same file" in str(e), e)
+
         # File lifecycle: create, move, delete, each undoable. (Whether the
         # new file comes back reformatted depends on the language having a
         # formatter, which the minimal config's lua_ls does not; the Go and

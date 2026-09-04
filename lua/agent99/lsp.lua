@@ -3218,6 +3218,26 @@ local function delete_file(args)
     return vim.tbl_extend("force", result, report)
 end
 
+-- Line number where the contiguous comment block above `lnum` starts, or
+-- `lnum` itself when there is none. A symbol's range excludes its doc
+-- comment, so anything that moves a symbol has to widen it by this much or
+-- the documentation is left behind, orphaned above whatever follows.
+local function doc_block_start(bufnr, lnum)
+    local first = lnum
+    for l = lnum - 1, 1, -1 do
+        local text = vim.api.nvim_buf_get_lines(bufnr, l - 1, l, false)[1] or ""
+        local stripped = text:gsub("^%s+", "")
+        if stripped:match("^%-%-") or stripped:match("^//") or stripped:match("^#")
+            or stripped:match("^/%*") or stripped:match("^%*")
+            or stripped:match([[^"""]]) then
+            first = l
+        else
+            break
+        end
+    end
+    return first
+end
+
 -- First line of the contiguous comment block directly above a line, for
 -- surfacing a symbol's doc summary. Language-agnostic prefix heuristic.
 local function comment_above(bufnr, lnum)
@@ -3245,6 +3265,140 @@ local DEPTH_SEGMENTS = {
     ["if"] = true, elseif_ = true, switch = true, case = true,
     match = true, try = true,
 }
+
+
+-- Move whole symbols from one file to another.
+--
+-- Splitting an oversized file is a symbol operation that no symbol tool could
+-- express: the unit is a run of independent top-level declarations, not one
+-- symbol, so replace_symbol_body has nothing to replace and the work fell back
+-- to a literal string match over a large block - the very thing these tools
+-- exist to avoid.
+--
+-- Doing it here also gets the two things a copy-and-delete cannot: each
+-- symbol's doc comment travels with it, and both files have their imports
+-- reorganized afterwards, so the destination gains what it now needs and the
+-- source loses what it no longer uses.
+local function move_symbols(args)
+    local from_buf = load_buf(args.from)
+    local to_path = resolve_new_path(args.to, "to")
+    if type(args.names) ~= "table" or #args.names == 0 then
+        err("missing required argument: names (the symbols to move)")
+    end
+    if vim.fn.fnamemodify(args.from, ":p") == to_path then
+        err("from and to are the same file")
+    end
+
+    -- Resolve every name first: moving half a list and then failing would
+    -- leave the caller with two files to reconcile by hand.
+    local moving = {}
+    local seen = {}
+    for _, name in ipairs(args.names) do
+        local _, entry = resolve_symbol(args.from, name)
+        if seen[entry.path] then
+            err("%s was named twice", entry.path)
+        end
+        seen[entry.path] = true
+        moving[#moving + 1] = {
+            path = entry.path,
+            first = doc_block_start(from_buf, entry.first),
+            last = entry.last,
+        }
+    end
+    table.sort(moving, function(a, b) return a.first < b.first end)
+    for i = 2, #moving do
+        if moving[i].first <= moving[i - 1].last then
+            err("%s and %s overlap; move them separately",
+                moving[i - 1].path, moving[i].path)
+        end
+    end
+
+    local from_before = vim.api.nvim_buf_get_lines(from_buf, 0, -1, false)
+    local blocks = {}
+    for _, m in ipairs(moving) do
+        blocks[#blocks + 1] = vim.api.nvim_buf_get_lines(from_buf, m.first - 1, m.last, false)
+    end
+
+    -- A new destination needs whatever declares which module it belongs to.
+    -- Only Go-style `package X` is inferred; anything else the caller supplies
+    -- with header=, since guessing wrong writes a broken file.
+    local created = false
+    if not vim.uv.fs_stat(to_path) then
+        local header = args.header
+        if header == nil then
+            for _, line in ipairs(vim.list_slice(from_before, 1, 30)) do
+                if line:match("^package%s+%S") then
+                    header = line
+                    break
+                end
+            end
+        end
+        local dir = vim.fn.fnamemodify(to_path, ":h")
+        if vim.fn.isdirectory(dir) == 0 and vim.fn.mkdir(dir, "p") == 0 then
+            err("could not create the directory %s", rel_path(dir))
+        end
+        local seed = {}
+        if header and header ~= "" then
+            vim.list_extend(seed, vim.split(header, "\n", { plain = true }))
+            seed[#seed + 1] = ""
+        end
+        if vim.fn.writefile(seed, to_path) ~= 0 then
+            err("could not create %s", rel_path(to_path))
+        end
+        notify_file_operation("workspace/didCreateFiles", { { uri = file_uri(to_path) } })
+        created = true
+    end
+
+    local to_buf = load_buf(to_path)
+    local to_before = vim.api.nvim_buf_get_lines(to_buf, 0, -1, false)
+    settle_before_edit(from_buf)
+    local before = diag_snapshot()
+
+    -- Append to the destination, then delete from the source bottom upwards so
+    -- the earlier line numbers stay valid as the later ones go.
+    local appended = {}
+    for _, block in ipairs(blocks) do
+        if #appended > 0 or #to_before > 0 then
+            appended[#appended + 1] = ""
+        end
+        vim.list_extend(appended, block)
+    end
+    local at = #to_before
+    vim.api.nvim_buf_set_lines(to_buf, at, at, false, appended)
+    for i = #moving, 1, -1 do
+        vim.api.nvim_buf_set_lines(from_buf, moving[i].first - 1, moving[i].last, false, {})
+    end
+
+    local opts = post_edit_options()
+    local _, _, polished = polish_after_edit(to_buf, at + 1, #appended, opts)
+    if opts.organize_imports then
+        organize_imports(from_buf)
+    end
+    if args.headless then
+        M.save_all()
+    end
+
+    -- Whole-file entries for both, so undo_edit puts the split back.
+    record_edit(from_buf, ("moved out of %s"):format(rel_path(args.from)), "move_symbols",
+        1, #from_before, from_before, vim.api.nvim_buf_get_lines(from_buf, 0, -1, false))
+    record_edit(to_buf, ("moved into %s"):format(rel_path(to_path)), "move_symbols",
+        1, #to_before, to_before, vim.api.nvim_buf_get_lines(to_buf, 0, -1, false))
+
+    local names = {}
+    for _, m in ipairs(moving) do names[#names + 1] = m.path end
+    local result = {
+        moved = names,
+        from = rel_path(vim.fn.fnamemodify(args.from, ":p")),
+        to = rel_path(to_path),
+        created = created or nil,
+        note = edit_note(args),
+    }
+    if #polished > 0 then
+        result.polished = table.concat(polished, ", ")
+    end
+    return vim.tbl_extend("force", result,
+        post_edit_report(to_buf, before, args.root, args.headless, opts))
+end
 
 local function control_depth(bufnr, line, sym_first)
     local ok, parser = pcall(vim.treesitter.get_parser, bufnr)
@@ -3857,6 +4011,7 @@ local dispatch_table = {
     create_file = create_file,
     move_file = move_file,
     delete_file = delete_file,
+    move_symbols = move_symbols,
     check_project = check_project,
     enclosing_symbols = enclosing_symbols,
     -- Internal: the bridge reports a disk read so the code window can follow.

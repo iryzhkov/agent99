@@ -245,9 +245,10 @@ var editTools = map[string]bool{
 	// The file-lifecycle tools write the file themselves, but a server may
 	// have rewritten other files' imports in response, and those land in
 	// buffers like any other edit.
-	"create_file": true,
-	"move_file":   true,
-	"delete_file": true,
+	"create_file":  true,
+	"move_file":    true,
+	"delete_file":  true,
+	"move_symbols": true,
 }
 
 // headlessSaveAll writes every modified file buffer of the headless
