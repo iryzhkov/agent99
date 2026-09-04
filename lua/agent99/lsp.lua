@@ -959,15 +959,26 @@ local function workspace_map(args)
             return true
         end, files)
     end
+    local glob_note
     if type(args.glob) == "string" and args.glob ~= "" then
-        -- Same feel as ripgrep's -g: a bare "*.go" matches at any depth and
-        -- "**/*.go" also matches files in the root itself.
+        -- Same feel as ripgrep's -g: a bare "*.go" matches at any depth,
+        -- "**/*.go" also matches files in the root itself, and "bridge/**/*.go"
+        -- matches bridge/x.go as well as bridge/sub/x.go ("**" spans zero
+        -- directories too, which glob2regpat's ".*" needs a hand with).
         local re = vim.regex(vim.fn.glob2regpat(args.glob))
+        local zero = vim.regex(vim.fn.glob2regpat((args.glob:gsub("/%*%*/", "/"))))
         local anywhere = not args.glob:find("/", 1, true)
+        local before_glob = #files
         files = vim.tbl_filter(function(f)
             local probe = anywhere and vim.fs.basename(f) or f
             return re:match_str(probe) ~= nil or re:match_str("/" .. f) ~= nil
+                or zero:match_str(probe) ~= nil
         end, files)
+        if #files == 0 and before_glob > 0 then
+            glob_note = ("0 of %d files matched the glob %q; it is matched against the path "
+                .. "from the root (\"**\" spans directories, \"*.go\" alone matches at any depth), "
+                .. "and path= narrows by directory instead"):format(before_glob, args.glob)
+        end
     end
     local total_files = #files
     local out, entries = {}, 0
@@ -1020,6 +1031,9 @@ local function workspace_map(args)
         end
     end
     local notes = {}
+    if glob_note then
+        notes[#notes + 1] = glob_note
+    end
     if total_files > MAX_MAP_FILES then
         notes[#notes + 1] = ("showing first %d of %d files; narrow with path or glob")
             :format(MAX_MAP_FILES, total_files)
@@ -1644,10 +1658,13 @@ local function not_analyzed_reason(bufnr)
 end
 
 local function diag_signature(d)
-    return ("%s|%s|%s"):format(vim.api.nvim_buf_get_name(d.bufnr),
-        d.severity, (d.message or ""):gsub("%s+", " "))
+    -- Messages that quote their own position ("used in Scan loop at line
+    -- 746") would read as a new diagnostic every time an edit above shifts
+    -- them; the position is not part of what the diagnostic says.
+    local message = (d.message or ""):gsub("%s+", " ")
+        :gsub("line %d+", "line N"):gsub(":%d+:%d+", ":N:N")
+    return ("%s|%s|%s"):format(vim.api.nvim_buf_get_name(d.bufnr), d.severity, message)
 end
-
 local function diag_snapshot()
     local counts = {}
     for _, d in ipairs(vim.diagnostic.get(nil)) do
@@ -1732,7 +1749,11 @@ end
 -- bufnr is nil after delete_file: there is no buffer left to report on, but
 -- the project-wide diagnostic diff below is exactly what the caller wants
 -- to see (what did removing this file break?), so the report still runs.
-local function post_edit_report(bufnr, before, root, headless, opts)
+-- Signatures of the pre-existing diagnostics as last reported, so the next
+-- report can say "no change" instead of listing them again.
+local last_prior_key = nil
+
+local function post_edit_report(bufnr, before, root, headless, opts, full)
     opts = opts or post_edit_options()
     local ft = bufnr and vim.bo[bufnr].filetype or ""
     -- Kick nvim-lint before waiting so its diagnostics join the same report.
@@ -1773,11 +1794,13 @@ local function post_edit_report(bufnr, before, root, headless, opts)
     local remaining = vim.deepcopy(before or {})
     local new_here, new_elsewhere, preexisting_here = {}, {}, {}
     local preexisting = { errors = 0, warnings = 0 }
+    local prior_sigs = {}
     for _, d in ipairs(vim.diagnostic.get(nil)) do
         if d.severity <= vim.diagnostic.severity.WARN then
             local sig = diag_signature(d)
             if (remaining[sig] or 0) > 0 then
                 remaining[sig] = remaining[sig] - 1
+                prior_sigs[#prior_sigs + 1] = sig
                 if d.severity == vim.diagnostic.severity.ERROR then
                     preexisting.errors = preexisting.errors + 1
                 else
@@ -1842,25 +1865,36 @@ local function post_edit_report(bufnr, before, root, headless, opts)
     local prior = {}
     if preexisting.errors > 0 then prior[#prior + 1] = preexisting.errors .. " errors" end
     if preexisting.warnings > 0 then prior[#prior + 1] = preexisting.warnings .. " warnings" end
+    -- The pre-existing set rarely changes between two edits, and repeating
+    -- it costs tokens on every reply for no decision. Remember what was
+    -- reported and say "no change" until it differs; full_diagnostics
+    -- asks for the list again.
+    table.sort(prior_sigs)
+    local key = table.concat(prior_sigs, "\n")
     if #prior > 0 then
-        local elsewhere = (preexisting.errors + preexisting.warnings) - #preexisting_here
-        report.preexisting = table.concat(prior, " and ") .. " were there before the edit (unchanged)"
-        if #preexisting_here > 0 then
-            if #preexisting_here > PREEXISTING_LISTED then
-                local extra = #preexisting_here - PREEXISTING_LISTED
-                preexisting_here = vim.list_slice(preexisting_here, 1, PREEXISTING_LISTED)
-                preexisting_here[#preexisting_here + 1] =
-                    ("… +%d more already in this file"):format(extra)
+        if key == last_prior_key and not full then
+            report.preexisting = "no change since the last reply (full_diagnostics=true lists them)"
+        else
+            local elsewhere = (preexisting.errors + preexisting.warnings) - #preexisting_here
+            report.preexisting = table.concat(prior, " and ") .. " were there before the edit (unchanged)"
+            if #preexisting_here > 0 then
+                if #preexisting_here > PREEXISTING_LISTED then
+                    local extra = #preexisting_here - PREEXISTING_LISTED
+                    preexisting_here = vim.list_slice(preexisting_here, 1, PREEXISTING_LISTED)
+                    preexisting_here[#preexisting_here + 1] =
+                        ("… +%d more already in this file"):format(extra)
+                end
+                report.preexisting_in_this_file = preexisting_here
+                if elsewhere > 0 then
+                    report.preexisting = report.preexisting
+                        .. ("; the other %d are in files this edit did not touch"):format(elsewhere)
+                end
+            elseif elsewhere > 0 then
+                report.preexisting = report.preexisting .. "; none of them in this file"
             end
-            report.preexisting_in_this_file = preexisting_here
-            if elsewhere > 0 then
-                report.preexisting = report.preexisting
-                    .. ("; the other %d are in files this edit did not touch"):format(elsewhere)
-            end
-        elseif elsewhere > 0 then
-            report.preexisting = report.preexisting .. "; none of them in this file"
         end
     end
+    last_prior_key = key
     if fixed > 0 then
         report.fixed = fixed .. " diagnostics from before the edit are gone"
     end
@@ -2028,6 +2062,16 @@ local function apply_code_action(args)
     local action = entry.actions[tonumber(args.index) or -1]
     if not action then
         err("no code action with index %s under this token", tostring(args.index))
+    end
+    -- A refused edit offers its own follow-ups (relocated, or forced) under
+    -- a token too; those re-run the edit tool with adjusted arguments.
+    if entry.edit then
+        action_cache[tostring(args.token)] = nil
+        local result = M.dispatch(entry.edit, action.args)
+        if type(result) == "table" then
+            result.applied = action.title
+        end
+        return result
     end
     local client = vim.lsp.get_client_by_id(entry.client_id)
     if not client then
@@ -2468,14 +2512,33 @@ local function find_symbol(args)
         end
     end
     collect(name)
-    -- "Flask/route" when route lives on a base class: fall back to the last
-    -- path segment and say so, instead of an empty answer.
-    local fallback
+    -- A name path ("Flask/route") is a precise question. When nothing has
+    -- that path, the matches for its last segment are offered as
+    -- suggestions, never as the answer: a fuzzy hit under `matches` reads
+    -- exactly like the symbol being found somewhere else.
+    local suggestions
     local leaf = name:match("([^/]+)$")
     if #found == 0 and leaf and leaf ~= name then
         collect(leaf)
         if #found > 0 then
-            fallback = ("no symbol matched %s; showing matches for %s"):format(name, leaf)
+            suggestions = {}
+            for _, m in ipairs(found) do
+                if #suggestions >= 5 then break end
+                suggestions[#suggestions + 1] = {
+                    name_path = m.entry.path,
+                    file = rel_path(vim.api.nvim_buf_get_name(m.bufnr)),
+                    lines = ("%d-%d"):format(m.entry.first, m.entry.last),
+                }
+            end
+            local total = #found
+            found = {}
+            return {
+                count = 0,
+                matches = {},
+                suggestions = suggestions,
+                note = ("no symbol at path %s; %d symbols match %s, the closest listed under "
+                    .. "suggestions - call again with one of those name paths"):format(name, total, leaf),
+            }
         end
     end
     -- Within a rank, shorter names first (the closest to what was asked),
@@ -2513,8 +2576,6 @@ local function find_symbol(args)
     local note
     if #found == 0 then
         note = "no symbol matched; try skim to see what exists"
-    elseif fallback then
-        note = fallback
     elseif #found > MAX_FIND_RESULTS then
         note = ("showing the best %d of %d matches; use a longer name or a name "
             .. "path (\"Type/method\") or narrow with file/glob"):format(MAX_FIND_RESULTS, #found)
@@ -2593,7 +2654,7 @@ local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_o
     if #done > 0 then
         fields.polished = table.concat(done, ", ")
     end
-    return vim.tbl_extend("error", fields, post_edit_report(bufnr, before, args.root, args.headless, opts))
+    return vim.tbl_extend("error", fields, post_edit_report(bufnr, before, args.root, args.headless, opts, args.full_diagnostics))
 end
 
 -- A unified diff of what an edit would do, for the dry_run of the tools that
@@ -2638,30 +2699,79 @@ end
 -- Edit a slice of a symbol, addressed by line numbers RELATIVE to the
 -- symbol's first line (declaration = 1) - the numbering find_symbol bodies
 -- use. Much cheaper than resending the whole symbol for a small change.
+-- Where, inside the symbol, the expected text actually is. Relative line
+-- numbers are read off a snapshot and drift when anything above the symbol
+-- changes; the text they were meant to hit usually still exists, a few
+-- lines away. Returns the relative first line of the single occurrence,
+-- or nil plus how many occurrences there were.
+local function locate_expected(bufnr, entry, want)
+    local want_lines = vim.split(want, "\n", { plain = true })
+    local n = #want_lines
+    local body = vim.api.nvim_buf_get_lines(bufnr, entry.first - 1, entry.last, false)
+    local hits = {}
+    for start = 1, #body - n + 1 do
+        local window = vim.trim(table.concat(vim.list_slice(body, start, start + n - 1), "\n"))
+        if window == want then
+            hits[#hits + 1] = start
+        end
+    end
+    if #hits == 1 then
+        return hits[1], 1
+    end
+    return nil, #hits
+end
+
+-- The chunks of a replace_symbol_lines call: the single first_line/
+-- last_line/text/expect form, or `chunks` carrying several of them.
+local function edit_chunks(args)
+    local chunks = args.chunks
+    if type(chunks) ~= "table" or #chunks == 0 then
+        chunks = { {
+            first_line = args.first_line,
+            last_line = args.last_line,
+            text = args.text,
+            expect = args.expect
+        } }
+    end
+    local out = {}
+    for i, c in ipairs(chunks) do
+        local first, last = tonumber(c.first_line), tonumber(c.last_line)
+        if not first or not last then
+            err("chunk %d: missing first_line and last_line (relative to the symbol)", i)
+        end
+        if type(c.text) ~= "string" then
+            err("chunk %d: missing text", i)
+        end
+        if c.expect ~= nil and type(c.expect) ~= "string" then
+            err("chunk %d: expect must be a string: the text those lines currently hold", i)
+        end
+        out[i] = { first = first, last = last, text = c.text, expect = c.expect }
+    end
+    return out
+end
+
 local function replace_symbol_lines(args)
     local bufnr, entry = resolve_symbol(args.file, args.name_path)
     local span = entry.last - entry.first + 1
-    local first = tonumber(args.first_line)
-    local last = tonumber(args.last_line)
-    if not first or not last then
-        err("missing required arguments: first_line and last_line (relative to the symbol)")
+    local chunks = edit_chunks(args)
+    for i, c in ipairs(chunks) do
+        if c.first < 1 or c.last < c.first or c.last > span then
+            err("chunk %d: lines %s-%s are outside the symbol %s, which has %d lines (1-%d relative)",
+                i, tostring(c.first), tostring(c.last), entry.path, span, span)
+        end
     end
-    if first < 1 or last < first or last > span then
-        err("lines %s-%s are outside the symbol %s, which has %d lines (1-%d relative)",
-            tostring(first), tostring(last), entry.path, span, span)
+    table.sort(chunks, function(a, b) return a.first < b.first end)
+    for i = 2, #chunks do
+        if chunks[i].first <= chunks[i - 1].last then
+            err("chunks overlap: lines %d-%d and %d-%d", chunks[i - 1].first,
+                chunks[i - 1].last, chunks[i].first, chunks[i].last)
+        end
     end
-    if type(args.text) ~= "string" then
-        err("missing required argument: text")
-    end
-    local abs_first = entry.first + first - 1
-    local abs_last = entry.first + last - 1
-    local new_lines = vim.split((args.text:gsub("\n+$", "")), "\n", { plain = true })
-    local old = vim.api.nvim_buf_get_lines(bufnr, abs_first - 1, abs_last, false)
-    if args.dry_run then
-        return vim.tbl_extend("force",
-            { file = rel_path(vim.api.nvim_buf_get_name(bufnr)) },
-            preview_diff(old, new_lines,
-                ("lines %d-%d of %s"):format(first, last, entry.path)))
+    for _, c in ipairs(chunks) do
+        c.abs_first = entry.first + c.first - 1
+        c.abs_last = entry.first + c.last - 1
+        c.new_lines = vim.split((c.text:gsub("\n+$", "")), "\n", { plain = true })
+        c.old = vim.api.nvim_buf_get_lines(bufnr, c.abs_first - 1, c.abs_last, false)
     end
 
     -- Relative line numbers are read off a snapshot - a find_symbol body or a
@@ -2669,33 +2779,127 @@ local function replace_symbol_lines(args)
     -- them. The numbers stay perfectly valid-looking after the shift, so the
     -- edit lands on the wrong lines and silently replaces working code.
     -- `expect` is the guard: give the text those lines are supposed to hold
-    -- and a stale offset fails loudly instead.
-    if args.expect ~= nil then
-        if type(args.expect) ~= "string" then
-            err("expect must be a string: the text those lines currently hold")
+    -- and a stale offset fails loudly instead. The refusal also does the
+    -- search the caller would do next: when the expected text sits exactly
+    -- once in the symbol, it offers the relocated edit as a code action, so
+    -- the fix is one apply_code_action call and no re-read.
+    local stale, relocated = {}, {}
+    for i, c in ipairs(chunks) do
+        if c.expect ~= nil and not args.force then
+            local want = vim.trim((c.expect:gsub("\n+$", "")))
+            local have = vim.trim(table.concat(c.old, "\n"))
+            if want ~= have then
+                local at, count = locate_expected(bufnr, entry, want)
+                stale[#stale + 1] = { chunk = i, c = c, have = have, want = want, at = at, count = count }
+                if at then
+                    relocated[#relocated + 1] = vim.tbl_extend("force", c, {
+                        first_line = at, last_line = at + (c.last - c.first),
+                    })
+                end
+            end
         end
-        local want = vim.trim((args.expect:gsub("\n+$", "")))
-        local have = vim.trim(table.concat(old, "\n"))
-        if want ~= have then
-            err("lines %d-%d of %s do not hold the expected text, so the numbers are "
-                .. "probably from before an earlier edit shifted them.\nexpected: %s\n"
-                .. "found:    %s\nRe-read the symbol with find_symbol and use fresh numbers.",
-                first, last, entry.path, vim.inspect(want), vim.inspect(have))
+    end
+    if #stale > 0 then
+        local lines = {}
+        for _, s in ipairs(stale) do
+            lines[#lines + 1] = ("lines %d-%d of %s do not hold the expected text, so the numbers are "
+                    .. "probably from before an earlier edit shifted them.\nexpected: %s\nfound:    %s")
+                :format(s.c.first, s.c.last, entry.path, vim.inspect(s.want), vim.inspect(s.have))
+            if s.at then
+                lines[#lines + 1] = ("the expected text is at lines %d-%d (relative) instead."):format(
+                    s.at, s.at + (s.c.last - s.c.first))
+            elseif s.count > 1 then
+                lines[#lines + 1] = ("the expected text occurs %d times in the symbol; pick with more context."):format(
+                s.count)
+            else
+                lines[#lines + 1] = "the expected text is nowhere in the symbol; re-read it with find_symbol."
+            end
         end
+        local actions = {}
+        if #relocated == #stale then
+            -- Every stale chunk has one home: the whole call, relocated.
+            local moved = {}
+            for _, c in ipairs(chunks) do
+                local r
+                for _, rc in ipairs(relocated) do
+                    if rc.first == c.first then r = rc end
+                end
+                moved[#moved + 1] = {
+                    first_line = r and r.first_line or c.first,
+                    last_line = r and r.last_line or c.last,
+                    text = c.text,
+                    expect = c.expect
+                }
+            end
+            actions[#actions + 1] = {
+                title = "apply the same edit at the relocated lines",
+                args = vim.tbl_extend("force", args, {
+                    chunks = moved,
+                    first_line = nil,
+                    last_line = nil,
+                    text = nil,
+                    expect = nil
+                })
+            }
+        end
+        actions[#actions + 1] = {
+            title = "apply at the requested lines anyway (ignore expect)",
+            args = vim.tbl_extend("force", args, { force = true })
+        }
+        action_token = action_token + 1
+        local token = tostring(action_token)
+        action_cache[token] = { edit = "replace_symbol_lines", actions = actions }
+        local titles = {}
+        for i, a in ipairs(actions) do
+            titles[#titles + 1] = ("%d = %s"):format(i, a.title)
+        end
+        err("%s\napply_code_action(token=%s, index=N) continues without a re-read: %s",
+            table.concat(lines, "\n"), token, table.concat(titles, "; "))
+    end
+
+    if args.dry_run then
+        local previews = {}
+        for _, c in ipairs(chunks) do
+            previews[#previews + 1] = preview_diff(c.old, c.new_lines,
+                ("lines %d-%d of %s"):format(c.first, c.last, entry.path))
+        end
+        if #previews == 1 then
+            return vim.tbl_extend("force", { file = rel_path(vim.api.nvim_buf_get_name(bufnr)) }, previews[1])
+        end
+        return { file = rel_path(vim.api.nvim_buf_get_name(bufnr)), chunks = previews }
     end
 
     settle_before_edit(bufnr)
     local before = diag_snapshot()
-    vim.api.nvim_buf_set_lines(bufnr, abs_first - 1, abs_last, false, new_lines)
-    local result = finish_edit(bufnr, args, before, ("%s:%d-%d"):format(entry.path, first, last),
-        "replace_lines", abs_first, abs_last, old, #new_lines,
-        { replaced = ("lines %d-%d of %s"):format(first, last, entry.path) })
+    -- Bottom-up, so a chunk's replacement never shifts the ones above it.
+    local span_first, span_last = chunks[1].abs_first, chunks[#chunks].abs_last
+    local span_old = vim.api.nvim_buf_get_lines(bufnr, span_first - 1, span_last, false)
+    local delta = 0
+    for i = #chunks, 1, -1 do
+        local c = chunks[i]
+        vim.api.nvim_buf_set_lines(bufnr, c.abs_first - 1, c.abs_last, false, c.new_lines)
+        delta = delta + #c.new_lines - #c.old
+    end
+    local label = #chunks == 1
+        and ("lines %d-%d of %s"):format(chunks[1].first, chunks[1].last, entry.path)
+        or ("%d chunks (lines %d-%d) of %s"):format(#chunks, chunks[1].first, chunks[#chunks].last, entry.path)
+    local result = finish_edit(bufnr, args, before,
+        ("%s:%d-%d"):format(entry.path, chunks[1].first, chunks[#chunks].last),
+        "replace_lines", span_first, span_last, span_old, #span_old + delta,
+        { replaced = label })
     -- Always echo what was there. Without `expect` this is the only way a
     -- caller finds out an offset had drifted, and it costs a few lines.
-    result.replaced_text = old
+    if #chunks == 1 then
+        result.replaced_text = chunks[1].old
+    else
+        local echo = {}
+        for _, c in ipairs(chunks) do
+            echo[#echo + 1] = { lines = ("%d-%d"):format(c.first, c.last), replaced_text = c.old }
+        end
+        result.replaced_chunks = echo
+    end
     return result
 end
-
 local function insert_symbol_tool(where)
     return function(args)
         local bufnr, entry = resolve_symbol(args.file, args.name_path)
@@ -2773,7 +2977,7 @@ local function undo_edit(args)
             end
         end
         result = vim.tbl_extend("error", result,
-            post_edit_report(last_bufnr, before, args.root, args.headless, opts))
+            post_edit_report(last_bufnr, before, args.root, args.headless, opts, args.full_diagnostics))
         result.note = edit_note(args)
     end
     return result
@@ -3030,7 +3234,7 @@ local function rename_symbol(args)
     local result = { renamed_to = new_name, files = files, total_edits = total,
         file_operations = #file_ops > 0 and file_ops or nil }
     result = vim.tbl_extend("error", result,
-        post_edit_report(bufnr, before, args.root, args.headless))
+        post_edit_report(bufnr, before, args.root, args.headless, nil, args.full_diagnostics))
     result.note = edit_note(args)
     return result
 end
@@ -3178,7 +3382,7 @@ local function create_file(args)
         result.polished = table.concat(done, ", ")
     end
     return vim.tbl_extend("force", result,
-        post_edit_report(bufnr, before, args.root, args.headless, opts))
+        post_edit_report(bufnr, before, args.root, args.headless, opts, args.full_diagnostics))
 end
 
 local function move_file(args)
@@ -3243,7 +3447,7 @@ local function move_file(args)
         result.updated_note = "the language server rewrote references to the old path"
     end
     return vim.tbl_extend("force", result,
-        post_edit_report(bufnr, before, args.root, args.headless))
+        post_edit_report(bufnr, before, args.root, args.headless, nil, args.full_diagnostics))
 end
 
 local function delete_file(args)
@@ -3296,7 +3500,7 @@ local function delete_file(args)
         result.updated_by_server = touched
     end
     -- No buffer left to report against, so report the project-wide picture.
-    local report = post_edit_report(nil, before, args.root, args.headless)
+    local report = post_edit_report(nil, before, args.root, args.headless, nil, args.full_diagnostics)
     report.file = nil
     return vim.tbl_extend("force", result, report)
 end
@@ -3480,7 +3684,7 @@ local function move_symbols(args)
         result.polished = table.concat(polished, ", ")
     end
     return vim.tbl_extend("force", result,
-        post_edit_report(to_buf, before, args.root, args.headless, opts))
+        post_edit_report(to_buf, before, args.root, args.headless, opts, args.full_diagnostics))
 end
 
 local function control_depth(bufnr, line, sym_first)

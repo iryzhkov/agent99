@@ -122,6 +122,89 @@ def main():
             check("replace_symbol_body rewrites a markdown section",
                   "One, now." in f.read() and "None yet." not in open(notes).read(), res)
 
+        # A stale offset with the right expect is refused, and the refusal
+        # carries a code action that applies the edit where the text is.
+        try:
+            b.call("replace_symbol_lines", {
+                "file": util, "name_path": "M.greet", "first_line": 3, "last_line": 3,
+                "expect": 'return "hello, " .. name', "text": '    return "hi, " .. name',
+            })
+            check("stale expect is refused", False, "call succeeded")
+        except RuntimeError as e:
+            msg = str(e)
+            import re
+            m = re.search(r"token=(\d+)", msg)
+            check("stale expect is refused with a relocation",
+                  "at lines 2-2 (relative)" in msg and m is not None, msg)
+            assert m is not None
+            res = b.call("apply_code_action", {"token": m.group(1), "index": 1})
+            check("relocated edit applies",
+                  res.get("replaced") == "lines 2-2 of M.greet"
+                  and 'return "hi, "' in open(util).read(), res)
+
+        # Several chunks in one symbol apply together, bottom-up.
+        res = b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet",
+            "chunks": [
+                {"first_line": 1, "last_line": 1, "expect": "function M.greet(name)",
+                 "text": "function M.greet(name)\n    name = tostring(name)"},
+                {"first_line": 2, "last_line": 2, "expect": 'return "hi, " .. name',
+                 "text": '    return "hello, " .. name'},
+            ],
+        })
+        text = open(util).read()
+        check("chunked edit applies all chunks",
+              "name = tostring(name)" in text and 'return "hello, " .. name' in text
+              and len(res.get("replaced_chunks", [])) == 2, res)
+        # A chunk whose expect fails refuses the whole call.
+        try:
+            b.call("replace_symbol_lines", {
+                "file": util, "name_path": "M.greet",
+                "chunks": [
+                    {"first_line": 1, "last_line": 1, "expect": "function M.greet(name)", "text": "function M.greet(name)"},
+                    {"first_line": 3, "last_line": 3, "expect": "nothing like this", "text": "x"},
+                ],
+            })
+            check("chunked edit is all-or-nothing", False, "call succeeded")
+        except RuntimeError as e:
+            check("chunked edit is all-or-nothing",
+                  "nowhere in the symbol" in str(e) and open(util).read() == text, e)
+
+        # The pre-existing diagnostics are listed once, then reported as
+        # unchanged until they change or full_diagnostics asks again.
+        res = b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
+            "text": "    name = tostring(name) -- again",
+        })
+        res2 = b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
+            "text": "    name = tostring(name)",
+        })
+        check("preexisting diagnostics reported as unchanged",
+              res2.get("preexisting") is None or "no change" in res2.get("preexisting"), res2)
+        res3 = b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
+            "text": "    name = tostring(name)", "full_diagnostics": True,
+        })
+        check("full_diagnostics lists them again",
+              res3.get("preexisting") is None or "no change" not in res3.get("preexisting"), res3)
+
+        # A name path that matches nothing yields suggestions, not matches.
+        res = b.call("find_symbol", {"file": util, "name": "Nope/greet"})
+        check("find_symbol name path miss gives suggestions",
+              res.get("count") == 0 and res.get("matches") == []
+              and any(s.get("name_path") == "M.greet" for s in res.get("suggestions", [])), res)
+        res = b.call("workspace_map", {"glob": "lua/**/*.rs"})
+        check("workspace_map explains an empty glob",
+              res.get("file_count") == 0 and "0 of" in (res.get("note") or ""), res)
+        res = b.call("workspace_map", {"glob": "lua/**/*.lua"})
+        check("workspace_map glob spans zero directories",
+              any(f["file"] == "lua/testproj/util.lua" for f in res.get("files", [])), res)
+        # Put M.greet back the way the checks below expect it.
+        b.call("replace_symbol_body", {
+            "file": util, "name_path": "M.greet",
+            "body": 'function M.greet(name)\n    return "hello, " .. name\nend',
+        })
         # Edits in a headless workspace must not claim to be unsaved.
         res = b.call("replace_symbol_lines", {
             "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,

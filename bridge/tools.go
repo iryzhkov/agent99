@@ -208,7 +208,7 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "replace_symbol_lines",
-		Description: "Replace lines first_line..last_line of a symbol, numbered relative to its declaration (=1) as find_symbol bodies show; prefer over replace_symbol_body for small changes. Applied to the editor buffer immediately and tracked; returns fresh diagnostics and the text it replaced. Line numbers go stale the moment anything above the symbol changes - pass expect= with the current text of those lines and a stale offset fails instead of clobbering. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
+		Description: "Replace lines first_line..last_line of a symbol, numbered relative to its declaration (=1) as find_symbol bodies show; prefer over replace_symbol_body for small changes. Several places in one symbol go in chunks, applied together. Applied to the editor buffer immediately and tracked; returns fresh diagnostics and the text it replaced. Line numbers go stale the moment anything above the symbol changes - pass expect= with the current text of those lines: a stale offset is refused and the refusal offers the relocated edit as a code action, so apply_code_action(token, 1) finishes it without a re-read. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -221,9 +221,24 @@ var lspTools = []tool{
 					"type":        "string",
 					"description": "The text those lines currently hold. Pass it whenever the line numbers came from an earlier call: an edit above the symbol shifts them, and without this the edit silently lands on the wrong lines.",
 				},
+				"chunks": map[string]any{
+					"type":        "array",
+					"description": "Several non-overlapping replacements in the same symbol, instead of first_line/last_line/text/expect. Line numbers all refer to the symbol as it is now; all chunks apply or none.",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"first_line": map[string]any{"type": "integer"},
+							"last_line":  map[string]any{"type": "integer"},
+							"text":       map[string]any{"type": "string"},
+							"expect":     map[string]any{"type": "string"},
+						},
+						"required": []string{"first_line", "last_line", "text"},
+					},
+				},
+				"dry_run":          map[string]any{"type": "boolean", "description": "Show a unified diff of the change without applying it."},
+				"full_diagnostics": map[string]any{"type": "boolean", "description": "List the pre-existing diagnostics again even when they have not changed since the last reply."},
 			},
-			"dry_run":  map[string]any{"type": "boolean", "description": "Show a unified diff of the change without applying it."},
-			"required": []string{"file", "name_path", "first_line", "last_line", "text"},
+			"required": []string{"file", "name_path"},
 		},
 	},
 	{
@@ -672,6 +687,27 @@ var lspToolNames = func() map[string]bool {
 	}
 	return set
 }()
+
+// Every edit tool reports diagnostics the same way, so the switch that
+// asks for the unabridged pre-existing list is added to all of them here
+// rather than repeated in each schema.
+func init() {
+	for i := range lspTools {
+		if !editTools[lspTools[i].Name] {
+			continue
+		}
+		props, ok := lspTools[i].InputSchema["properties"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, has := props["full_diagnostics"]; !has {
+			props["full_diagnostics"] = map[string]any{
+				"type":        "boolean",
+				"description": "List the pre-existing diagnostics again even when they have not changed since the last reply.",
+			}
+		}
+	}
+}
 
 func resolveInRoot(root string, path any) string {
 	s, _ := path.(string)
