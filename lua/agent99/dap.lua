@@ -505,9 +505,13 @@ local function project_python(root, adapter_py)
         local py = root .. "/" .. venv .. "/bin/python"
         if vim.fn.executable(py) == 1 then return py end
     end
+    -- The adapter's interpreter may be Mason's private venv, which has
+    -- debugpy and nothing else; the program should run under the machine's
+    -- python (the adapter injects debugpy into whichever interpreter runs).
+    local system = vim.fn.exepath("python3")
+    if system ~= "" then return system end
     return adapter_py
 end
-
 local BUILTIN = {}
 
 BUILTIN.delve = {
