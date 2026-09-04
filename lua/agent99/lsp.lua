@@ -1508,6 +1508,10 @@ local function polish_after_edit(bufnr, first, count, opts)
     return first, count, done
 end
 
+-- Pre-existing diagnostics in the edited file are listed rather than counted,
+-- up to this many; past it the rest become a tally.
+local PREEXISTING_LISTED = 10
+
 local function diag_signature(d)
     return ("%s|%s|%s"):format(vim.api.nvim_buf_get_name(d.bufnr),
         d.severity, (d.message or ""):gsub("%s+", " "))
@@ -1628,7 +1632,7 @@ local function post_edit_report(bufnr, before, root, headless, opts)
     -- Diff against the snapshot: consume matching signatures as
     -- pre-existing, the rest are new; leftovers in the snapshot were fixed.
     local remaining = vim.deepcopy(before or {})
-    local new_here, new_elsewhere = {}, {}
+    local new_here, new_elsewhere, preexisting_here = {}, {}, {}
     local preexisting = { errors = 0, warnings = 0 }
     for _, d in ipairs(vim.diagnostic.get(nil)) do
         if d.severity <= vim.diagnostic.severity.WARN then
@@ -1639,6 +1643,14 @@ local function post_edit_report(bufnr, before, root, headless, opts)
                     preexisting.errors = preexisting.errors + 1
                 else
                     preexisting.warnings = preexisting.warnings + 1
+                end
+                -- A count alone does not answer the question the caller
+                -- actually has, which is whether any of these are in the
+                -- code being edited. The ones elsewhere in the project stay
+                -- a count; these get named.
+                if d.bufnr == bufnr then
+                    preexisting_here[#preexisting_here + 1] = ("%s line %d: %s"):format(
+                        vim.diagnostic.severity[d.severity], d.lnum + 1, d.message)
                 end
             elseif d.bufnr == bufnr then
                 new_here[#new_here + 1] = ("%s line %d: %s"):format(
@@ -1679,7 +1691,23 @@ local function post_edit_report(bufnr, before, root, headless, opts)
     if preexisting.errors > 0 then prior[#prior + 1] = preexisting.errors .. " errors" end
     if preexisting.warnings > 0 then prior[#prior + 1] = preexisting.warnings .. " warnings" end
     if #prior > 0 then
+        local elsewhere = (preexisting.errors + preexisting.warnings) - #preexisting_here
         report.preexisting = table.concat(prior, " and ") .. " were there before the edit (unchanged)"
+        if #preexisting_here > 0 then
+            if #preexisting_here > PREEXISTING_LISTED then
+                local extra = #preexisting_here - PREEXISTING_LISTED
+                preexisting_here = vim.list_slice(preexisting_here, 1, PREEXISTING_LISTED)
+                preexisting_here[#preexisting_here + 1] =
+                    ("… +%d more already in this file"):format(extra)
+            end
+            report.preexisting_in_this_file = preexisting_here
+            if elsewhere > 0 then
+                report.preexisting = report.preexisting
+                    .. ("; the other %d are in files this edit did not touch"):format(elsewhere)
+            end
+        elseif elsewhere > 0 then
+            report.preexisting = report.preexisting .. "; none of them in this file"
+        end
     end
     if fixed > 0 then
         report.fixed = fixed .. " diagnostics from before the edit are gone"
@@ -2502,9 +2530,13 @@ end
 local check_baseline = {}
 local CHECK_MAX_LINES = 60
 
+-- Guessed commands are all type checks and vetting, never test runners: they
+-- have to be fast enough to run after an edit, and the question they answer is
+-- "did I break a reference", not "does the suite pass". The reply says so,
+-- because a green check here is easy to mistake for a green project.
 local function guess_check_command(root)
     local function has(rel) return vim.uv.fs_stat(root .. "/" .. rel) ~= nil end
-    if has("go.mod") then return "go vet ./..." end
+    if has("go.mod") then return "go build ./... && go vet ./..." end
     if has("Cargo.toml") then return "cargo check --message-format short" end
     if has("tsconfig.json") then
         if has("node_modules/.bin/tsc") then return "node_modules/.bin/tsc --noEmit -p ." end
@@ -2562,6 +2594,12 @@ local function check_project(args)
         seconds = math.floor((vim.uv.now() - started) / 100) / 10,
         unsaved = unsaved,
     }
+    if guessed then
+        out.covers = "type and reference checking only: this does not run the tests, "
+            .. "and it checks one build configuration, so code behind another build tag "
+            .. "or feature flag is not analyzed. Run the test suite yourself, and pass "
+            .. "command= (or set AGENT99_CHECK / post_edit.check) for a different gate."
+    end
     local key = root .. "\0" .. cmd
     local base = check_baseline[key]
     if base and not args.reset then
