@@ -43,6 +43,17 @@ local function server_socket()
     return sock
 end
 
+-- Environment for a bridge process: where to find this Neovim, and the
+-- feature flags the config turns on.
+local function bridge_env()
+    local env = { AGENT99_NVIM = server_socket() }
+    local dbg = config.options.debug
+    if dbg and dbg.enabled then
+        env.AGENT99_DEBUG = "1"
+    end
+    return env
+end
+
 -- Write the MCP config claude is pointed at. Regenerated per request so the
 -- socket path is always the current instance's.
 local function write_mcp_config()
@@ -54,7 +65,7 @@ local function write_mcp_config()
             lsp = {
                 command = config.bridge_bin(),
                 args = { "mcp" },
-                env = { AGENT99_NVIM = server_socket() },
+                env = bridge_env(),
             },
         },
     }
@@ -883,7 +894,7 @@ function M.start(buf, first, last, instruction, opts)
         "lines: " .. tostring(first) .. "-" .. tostring(last),
         "instruction: " .. instruction, "cmd: " .. table.concat(cmd, " ") })
 
-    local env = { AGENT99_NVIM = server_socket() }
+    local env = bridge_env()
     if opts.api_key then
         env[provider.api_key_env or "AGENT99_API_KEY"] = opts.api_key
     end

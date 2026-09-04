@@ -26,7 +26,16 @@ const (
 // Tools allowed to run longer than nvimTimeout: installs download and compile.
 var toolTimeouts = map[string]time.Duration{
 	"install_language": 15 * time.Minute,
+	"install_debugger": 15 * time.Minute,
 	"check_project":    10 * time.Minute,
+	// Debugger tools that wait for the program: the Lua side clamps its
+	// own wait to well under this so it always answers first.
+	"debug_launch":   5 * time.Minute,
+	"debug_attach":   5 * time.Minute,
+	"debug_continue": 5 * time.Minute,
+	"debug_step":     5 * time.Minute,
+	"debug_wait":     5 * time.Minute,
+	"debug_stop":     5 * time.Minute,
 }
 
 func remoteExpr(sock, expr string) (string, error) {

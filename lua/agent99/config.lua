@@ -94,6 +94,16 @@ M.defaults = {
         -- Request records kept on disk under stdpath("state")/agent99.
         keep = 100,
     },
+    -- Debugger tools (debug_launch, debug_breakpoint, ...): a Debug Adapter
+    -- Protocol session through nvim-dap, which must be on the runtimepath.
+    -- Off by default because the thirteen schemas cost prompt tokens on
+    -- every round; the bridge gets AGENT99_DEBUG=1 when enabled.
+    debug = {
+        enabled = false,
+        -- A session the agent started and then left alone is ended after
+        -- this long without a tool touching it.
+        idle_ms = 10 * 60 * 1000,
+    },
     -- What a symbol edit tool reports back after applying: it waits for the
     -- language servers to re-publish (up to post_edit.wait_ms, returning as
     -- soon as they settle) and lists only the errors/warnings the edit

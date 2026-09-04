@@ -218,6 +218,12 @@ func stopLocked() bool {
 		return true
 	default:
 	}
+	// A debug session's adapter and debuggee are grandchildren of this
+	// process; end them before the instance goes, so close_workspace never
+	// leaves a program running under a debugger nobody can reach.
+	if debugEnabled() {
+		remoteExpr(ws.Socket, "luaeval('"+headlessDebugStopLua+"')")
+	}
 	// Ask nicely so buffers and LSP clients shut down, then force it.
 	remoteExpr(ws.Socket, "execute('qa!')")
 	select {
@@ -229,6 +235,13 @@ func stopLocked() bool {
 	os.Remove(ws.Socket)
 	return true
 }
+
+// Lua expression that ends the agent's debug session, if any; errors are
+// swallowed because the instance is about to be killed anyway.
+var headlessDebugStopLua = strings.Join([]string{
+	`(function() pcall(function()`,
+	`require("agent99.dap").shutdown_sync() end) return "" end)()`,
+}, " ")
 
 // Edits made by the symbol tools land in buffers; with no user at the
 // keyboard they must reach disk on their own, otherwise a client reading

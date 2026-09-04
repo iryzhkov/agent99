@@ -97,6 +97,18 @@ def main():
           slim)
     b2.close()
 
+    # The debugger tools are advertised only with AGENT99_DEBUG, in both
+    # modes; embedded, the installer stays out (it is standalone-only).
+    dbg_env = dict(os.environ, AGENT99_DEBUG="1")
+    b3 = Bridge(env=dbg_env)
+    b3.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                          "clientInfo": {"name": "drive_mcp", "version": "0"}})
+    dbg = {t["name"] for t in b3.rpc("tools/list")["result"]["tools"]}
+    b3.close()
+    check("debug roster gated on AGENT99_DEBUG",
+          "debug_launch" not in tools and "debug_launch" in dbg
+          and "debug_stop" in dbg and "install_debugger" not in dbg, dbg)
+
     # lua_ls may still be indexing right after startup; retry until the
     # cross-file definition resolves.
     locs = []

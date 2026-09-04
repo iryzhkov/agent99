@@ -55,6 +55,17 @@ lazy.nvim:
 { "iryzhkov/agent99", build = "make build", opts = {} }
 ```
 
+With the debugger tools (optional; see "Debugging" below):
+
+```lua
+{
+  "iryzhkov/agent99",
+  build = "make build",
+  dependencies = { "mfussenegger/nvim-dap" },
+  opts = { debug = { enabled = true } },
+}
+```
+
 or from a local clone: `{ dir = "~/src/agent99", opts = {} }` (run
 `make build` there once).
 
@@ -236,6 +247,10 @@ require("agent99").setup({
     timeout_ms = 5 * 60 * 1000,
     auto_mode = true,            -- <leader>99 lets the model infer edit vs question
     history = { keep = 100 },    -- request records kept on disk
+    debug = {
+        enabled = false,         -- advertise the debugger tools (needs nvim-dap on the runtimepath)
+        idle_ms = 10 * 60 * 1000, -- end an agent-started session untouched for this long
+    },
     ui = {
         width = 0.4,             -- chat panel width (fraction of columns)
         input_height = 5,        -- chat prompt height
@@ -418,11 +433,84 @@ toolchain is missing such as `cargo` for rust_analyzer). Installed pieces
 land in Neovim's data directory and persist; add them to the editor
 config's ensure-installed lists to keep them on a fresh machine.
 
+### Debugging
+
+The tools above read and edit a program; these run it and look at it while
+it is stopped, through a Debug Adapter Protocol session that
+[nvim-dap](https://github.com/mfussenegger/nvim-dap) drives inside the same
+Neovim. A breakpoint can be placed by symbol name path, every stop reply
+names the enclosing symbol the way grep hits do, and the paused frame is one
+`find_symbol` away in the same tool set. In embedded mode the session is
+the user's nvim-dap session: the agent sees the user's breakpoints, the
+user sees the agent's, and a stop shows in both.
+
+**Off by default.** Thirteen schemas cost prompt tokens on every round for a
+model that is not debugging, so the tools are advertised only when asked
+for: `debug = { enabled = true }` in `setup()` for the plugin (it passes
+`AGENT99_DEBUG=1` to the bridges it spawns), and `AGENT99_DEBUG=1` in the
+standalone server's environment (`claude mcp add -e AGENT99_DEBUG=1 ...`).
+When off, `open_workspace` still reports a `debugger` field per language,
+so a client learns the option exists. nvim-dap must be on the runtimepath;
+without it every debug tool says so and nothing else changes.
+
+**Adapters.** The user's `dap.configurations` win when they exist
+(`debug_launch(config="name")`, or the first launch entry for the file's
+filetype). Function-valued fields are evaluated with every prompt replaced
+by an error naming the field, because a `vim.ui.select` in a headless
+instance would hang forever. Without a user configuration, built-ins cover
+Go (Delve, spawned by agent99 so its output is captured), Python (debugpy
+from the project's venv, the system interpreter or Mason's package, with the
+program run under the project's venv), and C/C++/Rust (codelldb, then
+lldb-dap, then gdb 14+'s own DAP mode). `install_debugger(language)` fetches
+delve/debugpy/codelldb through Mason. JavaScript/TypeScript has no built-in
+yet (js-debug's two-stage launch is deferred); a user configuration works.
+
+**One stop, one turn.** Launch, attach, continue, step and wait all reply
+with the same stop context: reason, frame (`file`, `line`, `symbol`,
+`at` = line within the symbol), a five-line source window with the current
+line marked, up to twelve locals as `name: type = value` clipped at 120
+characters, the top six frames with runs outside the workspace (or in
+site-packages, node_modules, vendor, a venv) collapsed into `<external ×N>`,
+the breakpoint hit, program output since the last reply, expressions from
+the `track` list given at launch, and `stale_source` naming files edited
+since the launch. Exit replies carry the exit code and the output tail;
+"running" is a normal answer, with `debug_wait` to keep waiting and
+`pause_after` to interrupt. Variables can be `summary` (default), `names`
+(no values, for large or sensitive locals) or `none`, chosen at launch.
+
+**Process ownership.** A launched program is terminated by `debug_stop`,
+by `close_workspace`, when the idle watchdog fires (`debug.idle_ms`,
+default 10 min, `AGENT99_DEBUG_IDLE_MS` for the server), when Neovim exits,
+and when the bridge dies (the adapter's connection drops and Delve, debugpy
+and gdb all kill what they launched). An attached process is left running
+by `debug_stop` unless `force=true`; on Linux with `kernel.yama.ptrace_scope=1`
+attaching by pid fails and the error says so — start the target under
+`dlv exec --headless --accept-multiclient --listen 127.0.0.1:PORT` or
+`python -m debugpy --listen PORT --wait-for-client` and use `host`/`port`,
+which always works.
+
+Two heuristics worth more than any tool option: stepping more than three
+times in a row means a breakpoint would serve better (`debug_continue`
+takes `to=` for run-to-line), and break at the call site in your own code
+rather than inside library code, with a `condition` inside loops.
+
+Not built, on purpose: stdin to the debuggee (a program that reads it shows
+as running forever; redirect input through a wrapper), more than one
+session at a time, exception-breakpoint configuration, disassembly and
+memory, a REPL passthrough (`debug_evaluate` with `context="repl"` covers
+the legitimate use), and streaming output outside replies.
+
 ## Tools exposed to the agent
 
 | Tool | Backed by |
 |---|---|
 | `install_language` | standalone MCP only: tree-sitter parser via nvim-treesitter plus a language server via Mason for one filetype, enabled and attach-checked; the fix for languages open_workspace calls blind |
+| `debug_launch`, `debug_attach` | start a program under its debug adapter (Go, Python, C/C++/Rust built-ins, or a user nvim-dap configuration by name), or attach by pid or to a debug server by host/port, and wait for the first stop; `debug_launch()` with no arguments relaunches the previous configuration with breakpoints and `track` kept. `AGENT99_DEBUG=1` / `debug.enabled` advertises these |
+| `debug_breakpoint`, `debug_breakpoints` | set/remove a breakpoint at a line or at a symbol name path plus offset (with `condition`, `hit_condition`, `log_message`), before or during a session; the reply says where the adapter actually put it. List or clear the agent's own breakpoints — the user's are never touched |
+| `debug_continue`, `debug_step`, `debug_wait` | resume (or run to a line), step over/into/out `count` times, wait for a running program (`wait_ms=0` = just report, `pause_after` interrupts); every one replies with the stop context: frame with symbol, source window, locals, stack, output since the last reply, tracked expressions, stale-source warning |
+| `debug_stack`, `debug_variables`, `debug_evaluate`, `debug_output` | the rest on demand: deeper stack with external frames collapsed, variables of a frame one level deep or one path expanded, an expression in a frame, and the captured output (up to 200 lines, surviving the exit) |
+| `debug_stop` | terminate a launched program or disconnect from an attached one (left running unless `force`), remove the agent's breakpoints, kill the adapter if it lingers |
+| `install_debugger` | standalone MCP only: delve/debugpy/codelldb through Mason, for a language whose `debugger` field says none |
 | `workspace_map` | the whole workspace's shape in one call: every project file with its line count and its declarations, descending one level into classes so nested languages list their methods (string parsers on disk content — no buffers created, no servers attached); the outline budget is shared across files (`+N more` marks a cut), test files are left out unless `include_tests`; the intended first move in an unfamiliar repo, ahead of skim/grep |
 | `skim` | structure of up to 20 files in one call: every function/class/method declaration line with line numbers, nested (treesitter, LSP-symbol fallback; C/C++ take the server's symbols first because macros confuse the grammar) — measures ~6-25% of the tokens of reading the same files |
 | `find_symbol` | look up symbols by `/`-joined name path across files/globs, optionally returning the full body — fetch exactly one function instead of a whole file. Constants and module-level variables are included by folding in the server's document symbols, which treesitter's declaration nodes leave out |
@@ -474,6 +562,16 @@ on the bundled `tests/testproj`, then asserts on real lua_ls results
 through the MCP bridge. lua-language-server must be on PATH or in mason's
 bin directory.
 
+The debugger tools are exercised by `tests/drive_debug.py` against a real
+Delve session on `tests/debugproj`: breakpoints by name path, launch, step,
+variables, evaluate, run to exit, stale-source detection, relaunch, attach
+to a headless `dlv` server, the ptrace hint, the idle/timeout paths, and
+that neither `close_workspace` nor a SIGKILL of the bridge leaves a debuggee
+behind. `smoke.sh` installs the pinned Delve (`DLV_VERSION`) into
+`~/.cache/agent99-tests/bin` and clones nvim-dap at a pinned commit under
+`tests/.deps` (or uses `$AGENT99_TEST_NVIM_DAP`); if either fails it prints
+a skip line, which `AGENT99_TEST_REQUIRE_DEBUG=1` turns into a failure.
+
 ## Known limitations
 
 - One request at a time.
@@ -487,6 +585,9 @@ bin directory.
   build tag gets no diagnostics at all. Edits there report that they were not
   checked rather than reporting success; verify them by building or testing
   with the tags that include the file.
+- Debugging: one session at a time (the tools say so when nvim-dap has
+  more), no stdin to the debuggee, no JavaScript/TypeScript built-in
+  adapter, and attach-by-pid needs `ptrace_scope=0` on Linux.
 
 ## Ideas / next steps
 

@@ -100,11 +100,19 @@ func standaloneTools(tools []tool) []tool {
 // Tools kept out of the embedded (in-editor) schema but always advertised
 // by the standalone server, where the headless instance is the one that may
 // lack parsers and servers.
-var standaloneOnly = map[string]bool{"install_language": true}
+var standaloneOnly = map[string]bool{"install_language": true, "install_debugger": true}
 
 func servedTools() []tool {
 	full := os.Getenv("AGENT99_FULL_TOOLS") != ""
 	tools := activeTools(lspTools, full)
+	if debugEnabled() {
+		for _, t := range debugTools {
+			if embeddedMode() && standaloneOnly[t.Name] {
+				continue
+			}
+			tools = append(tools, t)
+		}
+	}
 	if embeddedMode() {
 		return tools
 	}
@@ -205,6 +213,10 @@ func callMCPTool(name string, arguments map[string]any) map[string]any {
 	// The slim roster hides some LSP tools from the schema but keeps them callable.
 	if !served && !lspToolNames[name] {
 		return textResult("Error: unknown tool: "+name, true)
+	}
+	if debugToolNames[name] && !debugEnabled() {
+		return textResult("Error: the debugger tools are off; start the server with AGENT99_DEBUG=1 "+
+			"(or setup({ debug = { enabled = true } }) in the plugin)", true)
 	}
 	out, err := callTool(name, arguments, toolRoot())
 	if err != nil {

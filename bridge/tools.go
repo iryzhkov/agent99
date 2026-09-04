@@ -453,9 +453,221 @@ var fileTools = []tool{
 	},
 }
 
+// debugTools drive a Debug Adapter Protocol session through nvim-dap inside
+// the same Neovim. They are advertised only with AGENT99_DEBUG=1 (see
+// debugEnabled): thirteen schemas cost prompt tokens on every round for a
+// model that is not debugging.
+var debugTools = []tool{
+	{
+		Name: "debug_launch",
+		Description: "Start the program under a debugger and wait for the first stop or its exit. file picks the adapter by " +
+			"filetype (Go: its package; Python: the script; C/C++/Rust: pass program, the binary). No arguments relaunches " +
+			"the previous configuration with breakpoints kept. Replies with the stop context: frame, source, locals, stack, output.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"file":          map[string]any{"type": "string", "description": "Source file to run (its filetype picks the adapter)."},
+				"program":       map[string]any{"type": "string", "description": "Program to run: a Go package directory, a Python script, or a built binary."},
+				"args":          map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Command-line arguments."},
+				"cwd":           map[string]any{"type": "string", "description": "Working directory (default: root)."},
+				"env":           map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "Extra environment variables."},
+				"config":        map[string]any{"type": "string", "description": "Name of a user nvim-dap configuration to run instead of a built-in adapter."},
+				"adapter":       map[string]any{"type": "string", "enum": []string{"delve", "debugpy", "codelldb", "lldb-dap", "gdb"}, "description": "Force a built-in adapter."},
+				"stop_on_entry": map[string]any{"type": "boolean", "description": "Stop at the first line (default false: run to the first breakpoint or exit)."},
+				"variables":     map[string]any{"type": "string", "enum": []string{"summary", "names", "none"}, "description": "How much of the locals every stop reply carries (default summary)."},
+				"track":         map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Expressions evaluated in the top frame at every stop."},
+				"again":         map[string]any{"type": "boolean", "description": "Relaunch the previous configuration."},
+				"wait_ms":       map[string]any{"type": "integer", "description": "How long to wait for the first stop (default 30000, max 240000)."},
+			},
+		},
+	},
+	{
+		Name: "debug_attach",
+		Description: "Attach to a running process (pid) or a debug server (host, port) and wait for the first stop. " +
+			"On Linux with ptrace_scope=1 attaching by pid fails; start the target under dlv exec --headless or python -m debugpy --listen and use host/port.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"pid":       map[string]any{"type": "integer", "description": "Process id to attach to."},
+				"host":      map[string]any{"type": "string", "description": "Debug server host (default 127.0.0.1)."},
+				"port":      map[string]any{"type": "integer", "description": "Debug server port."},
+				"adapter":   map[string]any{"type": "string", "enum": []string{"delve", "debugpy", "codelldb", "lldb-dap", "gdb"}, "description": "Adapter to use; else picked from file's filetype."},
+				"file":      map[string]any{"type": "string", "description": "A source file of the target, to pick the adapter by filetype."},
+				"config":    map[string]any{"type": "string", "description": "Name of a user nvim-dap attach configuration."},
+				"variables": map[string]any{"type": "string", "enum": []string{"summary", "names", "none"}},
+				"track":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+				"wait_ms":   map[string]any{"type": "integer"},
+			},
+		},
+	},
+	{
+		Name: "debug_breakpoint",
+		Description: "Set (or remove) a breakpoint at file:line, or at a symbol by name path plus a 1-based offset from its declaration " +
+			"as find_symbol numbers it. Works before a session exists (sent at launch). The reply says where the adapter actually put it.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"file":          map[string]any{"type": "string", "description": "File path (absolute or relative to root)."},
+				"line":          map[string]any{"type": "integer", "description": "1-based line."},
+				"name_path":     map[string]any{"type": "string", "description": "Symbol name path, alternative to line."},
+				"offset":        map[string]any{"type": "integer", "description": "1-based line offset from the symbol's declaration (default 1)."},
+				"condition":     map[string]any{"type": "string", "description": "Break only when this expression is true."},
+				"hit_condition": map[string]any{"type": "string", "description": "Break on the Nth hit, adapter syntax."},
+				"log_message":   map[string]any{"type": "string", "description": "Log this instead of stopping (logpoint)."},
+				"remove":        map[string]any{"type": "boolean", "description": "Remove the breakpoint at that line instead."},
+			},
+			"required": []string{"file"},
+		},
+	},
+	{
+		Name:        "debug_breakpoints",
+		Description: "List the agent's breakpoints with their verified state, or clear them all.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"clear": map[string]any{"type": "boolean", "description": "Remove every breakpoint this server placed."},
+			},
+		},
+	},
+	{
+		Name:        "debug_continue",
+		Description: "Resume and wait for the next stop or exit. to = run to a line (file plus line or name_path/offset) via a temporary breakpoint.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"wait_ms": map[string]any{"type": "integer", "description": "How long to wait (default 30000, max 240000)."},
+				"to": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"file":      map[string]any{"type": "string"},
+						"line":      map[string]any{"type": "integer"},
+						"name_path": map[string]any{"type": "string"},
+						"offset":    map[string]any{"type": "integer"},
+					},
+					"required": []string{"file"},
+				},
+			},
+		},
+	},
+	{
+		Name:        "debug_step",
+		Description: "Step over, into or out, count times, and reply with the last stop. More than three steps in a row usually means a breakpoint would serve better.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"action":  map[string]any{"type": "string", "enum": []string{"over", "into", "out"}, "description": "Default over."},
+				"count":   map[string]any{"type": "integer", "description": "Repeat count (default 1)."},
+				"wait_ms": map[string]any{"type": "integer"},
+			},
+		},
+	},
+	{
+		Name:        "debug_wait",
+		Description: "Wait for a running session to stop; wait_ms=0 reports the current state without waiting. pause_after interrupts the program when the wait expires.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"wait_ms":     map[string]any{"type": "integer", "description": "Default 30000, max 240000; 0 = just report."},
+				"pause_after": map[string]any{"type": "boolean", "description": "Send pause if nothing stopped in time."},
+			},
+		},
+	},
+	{
+		Name:        "debug_stack",
+		Description: "Stack of the stopped thread, one line per frame; frames outside the workspace collapse into <external ×N> unless all_frames.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"depth":      map[string]any{"type": "integer", "description": "Frames to fetch (default 12)."},
+				"thread":     map[string]any{"type": "integer", "description": "Thread id (default: the stopped one)."},
+				"all_frames": map[string]any{"type": "boolean", "description": "Show frames outside the workspace too."},
+			},
+		},
+	},
+	{
+		Name:        "debug_variables",
+		Description: "Locals and arguments of a frame as `name: type = value` lines (clipped), one level deep; expand drills into one path by expression.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"frame":  map[string]any{"type": "integer", "description": "Frame index (default 0)."},
+				"scope":  map[string]any{"type": "string", "enum": []string{"locals", "globals", "all"}, "description": "Default locals."},
+				"expand": map[string]any{"type": "string", "description": "Expression whose children to list, e.g. req.Header."},
+				"depth":  map[string]any{"type": "integer", "description": "Nesting depth (default 1, max 3)."},
+				"max":    map[string]any{"type": "integer", "description": "Maximum entries (default 40)."},
+			},
+		},
+	},
+	{
+		Name:        "debug_evaluate",
+		Description: "Evaluate an expression in a frame of the stopped thread. Calls that mutate state are your responsibility.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"expression": map[string]any{"type": "string"},
+				"frame":      map[string]any{"type": "integer", "description": "Frame index (default 0)."},
+				"context":    map[string]any{"type": "string", "enum": []string{"repl", "watch", "hover"}, "description": "Default repl."},
+			},
+			"required": []string{"expression"},
+		},
+	},
+	{
+		Name:        "debug_output",
+		Description: "Program and adapter output captured so far (up to 200 lines); survives the session's exit until the next launch.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"tail": map[string]any{"type": "integer", "description": "Last N lines (default 100, max 200)."},
+				"grep": map[string]any{"type": "string", "description": "Keep only lines matching this Vim regex."},
+			},
+		},
+	},
+	{
+		Name:        "debug_stop",
+		Description: "End the session: terminate a launched program, or disconnect from an attached one leaving it running (force terminates it too). Removes the agent's breakpoints.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"force": map[string]any{"type": "boolean", "description": "Terminate an attached process as well."},
+			},
+		},
+	},
+	{
+		Name:        "install_debugger",
+		Description: "Install the debug adapter for a language through Mason (delve, debugpy, codelldb). Slow; once per language.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"language": map[string]any{"type": "string", "description": "Filetype (go, python, c, cpp, rust) or a file extension."},
+				"package":  map[string]any{"type": "string", "description": "Mason package to install instead of the default for the language."},
+			},
+			"required": []string{"language"},
+		},
+	},
+}
+
+// debugEnabled reports whether the debugger tools are served. The plugin
+// sets AGENT99_DEBUG for the bridges it spawns when debug.enabled is on;
+// the standalone server takes it from its own environment.
+func debugEnabled() bool {
+	return os.Getenv("AGENT99_DEBUG") != ""
+}
+
+var debugToolNames = func() map[string]bool {
+	set := map[string]bool{}
+	for _, t := range debugTools {
+		set[t.Name] = true
+	}
+	return set
+}()
+
 var lspToolNames = func() map[string]bool {
 	set := map[string]bool{}
 	for _, t := range lspTools {
+		set[t.Name] = true
+	}
+	// The debugger tools run in Neovim too, through the same transport.
+	for _, t := range debugTools {
 		set[t.Name] = true
 	}
 	return set
@@ -1098,8 +1310,13 @@ func matchSegments(pattern, parts []string) bool {
 func callTool(name string, args map[string]any, root string) (string, error) {
 	if lspToolNames[name] {
 		// "from" and "to" belong to move_file; they name paths exactly as
-		// "file" does and have to be rooted the same way.
-		for _, key := range []string{"file", "from", "to"} {
+		// "file" does and have to be rooted the same way. The debugger's
+		// paths are "program" and "cwd"; its "to" is an object, not a path.
+		pathKeys := []string{"file", "from", "to"}
+		if debugToolNames[name] {
+			pathKeys = []string{"file", "program", "cwd"}
+		}
+		for _, key := range pathKeys {
 			if _, ok := args[key]; !ok {
 				continue
 			}
@@ -1110,10 +1327,34 @@ func callTool(name string, args map[string]any, root string) (string, error) {
 			resolved[key] = resolveInRoot(root, args[key])
 			args = resolved
 		}
+		// debug_continue's run-to target carries its own file.
+		if to, ok := args["to"].(map[string]any); ok && name == "debug_continue" {
+			resolvedTo := map[string]any{}
+			for k, v := range to {
+				resolvedTo[k] = v
+			}
+			resolvedTo["file"] = resolveInRoot(root, to["file"])
+			resolved := map[string]any{}
+			for k, v := range args {
+				resolved[k] = v
+			}
+			resolved["to"] = resolvedTo
+			args = resolved
+		}
 		switch name {
 		case "ts_query", "find_symbol", "workspace_map", "workspace_symbols", "install_language",
 			"replace_symbol_body", "replace_symbol_lines", "insert_after_symbol", "insert_before_symbol", "undo_edit", "rename_symbol", "check_project",
 			"create_file", "move_file", "delete_file", "move_symbols":
+			resolved := map[string]any{}
+			for k, v := range args {
+				resolved[k] = v
+			}
+			resolved["root"] = root
+			args = resolved
+		}
+		if debugToolNames[name] {
+			// Every debugger tool needs the root: defaults for cwd, the
+			// external-frame boundary, and the adapter lookup.
 			resolved := map[string]any{}
 			for k, v := range args {
 				resolved[k] = v

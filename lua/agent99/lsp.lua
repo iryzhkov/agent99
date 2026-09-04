@@ -3600,6 +3600,16 @@ local function workspace_support(args)
         if not parser and #clients == 0 and not DATA_FILETYPES[ft] then
             blind[#blind + 1] = ft
         end
+        -- What could run this language under a debugger, so a client
+        -- learns the option exists even when the debug tools are off.
+        if not DATA_FILETYPES[ft] then
+            local okd, dbg = pcall(function()
+                return require("agent99.dap").debugger_for(ft, root)
+            end)
+            if okd and dbg then
+                entry.debugger = dbg
+            end
+        end
         out[#out + 1] = entry
     end
     local note
@@ -4075,6 +4085,12 @@ end
 function M.dispatch(tool, args)
     local fn = dispatch_table[tool]
     if not fn then
+        -- The debugger tools live in their own module; they share the
+        -- transport, the position addressing and the relativized replies.
+        local okd, dap_tools = pcall(require, "agent99.dap")
+        if okd and dap_tools.handles(tool) then
+            return relativize(dap_tools.dispatch(tool, args))
+        end
         err("unknown tool: %s", tostring(tool))
     end
     local result = fn(args or {})
@@ -4084,4 +4100,19 @@ function M.dispatch(tool, args)
     return result
 end
 
+-- Internals shared with agent99.dap, exported rather than moved so the
+-- debugger module can reuse the coroutine helpers, buffer loading and the
+-- symbol index without this file growing further.
+M._internal = {
+    await = await,
+    sleep = sleep,
+    err = err,
+    load_buf = load_buf,
+    resolve_symbol = resolve_symbol,
+    rel_path = rel_path,
+    disk_fingerprint = disk_fingerprint,
+    symbol_index = symbol_index,
+    innermost_entry = innermost_entry,
+    decl_line = decl_line,
+}
 return M
