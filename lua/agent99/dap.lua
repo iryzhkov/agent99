@@ -556,6 +556,11 @@ BUILTIN.delve = {
         local st = uv.fs_stat(program)
         if st and st.type == "file" and vim.fn.fnamemodify(program, ":e") ~= "go" then
             cfg.mode = "exec"
+        elseif args.file and args.file:match("_test%.go$") then
+            -- A test file names the package's tests, not a main package:
+            -- Delve builds and runs the test binary; args go to it as
+            -- -test.run and friends.
+            cfg.mode = "test"
         else
             cfg.mode = "debug"
         end

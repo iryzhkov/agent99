@@ -482,7 +482,7 @@ var debugTools = []tool{
 	{
 		Name: "debug_launch",
 		Description: "Start the program under a debugger and wait for the first stop or its exit. file picks the adapter by " +
-			"filetype (Go: its package; Python/JS/TS: the script; Java: the file with main; C/C++/Rust: pass program, the binary). No arguments relaunches " +
+			"filetype (Go: its package, or the package's tests when file is a _test.go, with args like -test.run NAME; Python/JS/TS: the script; Java: the file with main; C/C++/Rust: pass program, the binary). No arguments relaunches " +
 			"the previous configuration with breakpoints kept. Replies with the stop context: frame, source, locals, stack, output.",
 		InputSchema: map[string]any{
 			"type": "object",

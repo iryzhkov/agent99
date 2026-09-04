@@ -2771,6 +2771,24 @@ end
 -- changes; the text they were meant to hit usually still exists, a few
 -- lines away. Returns the relative first line of the single occurrence,
 -- or nil plus how many occurrences there were.
+-- The first line of the comment block sitting directly above `lnum`, or
+-- lnum itself when there is none: a symbol's doc comment.
+local function doc_block_start(bufnr, lnum)
+    local first = lnum
+    for l = lnum - 1, 1, -1 do
+        local text = vim.api.nvim_buf_get_lines(bufnr, l - 1, l, false)[1] or ""
+        local stripped = text:gsub("^%s+", "")
+        if stripped:match("^%-%-") or stripped:match("^//") or stripped:match("^#")
+            or stripped:match("^/%*") or stripped:match("^%*")
+            or stripped:match([[^"""]]) then
+            first = l
+        else
+            break
+        end
+    end
+    return first
+end
+
 local function locate_expected(bufnr, entry, want)
     local want_lines = vim.split(want, "\n", { plain = true })
     local n = #want_lines
@@ -2852,12 +2870,20 @@ local function replace_symbol_lines(args)
         end
         c.entry = entries[c.name_path]
         local span = c.entry.last - c.entry.first + 1
+        -- The doc comment above the declaration is reachable too, by
+        -- match or by absolute number: editing a function's comment along
+        -- with the function is the common case, and the index's range
+        -- stops at the declaration.
+        local doc_first = doc_block_start(bufnr, c.entry.first)
+        local doc_lines = c.entry.first - doc_first
         if c.match ~= nil then
             -- Text-keyed: the lines are wherever this text sits in the
             -- symbol, which must be exactly one place. No line arithmetic,
             -- and the text doubles as the expect= guard.
             local want = vim.trim((c.match:gsub("\n+$", "")))
-            local at, count, n = locate_expected(bufnr, c.entry, want)
+            local at, count, n = locate_expected(bufnr,
+                { first = doc_first, last = c.entry.last }, want)
+            if at then at = at - doc_lines end
             if not at then
                 if count == 0 then
                     err("chunk %d: the match text is nowhere in %s; re-read it with find_symbol",
@@ -2872,10 +2898,12 @@ local function replace_symbol_lines(args)
             c.first = c.first - c.entry.first + 1
             c.last = c.last - c.entry.first + 1
         end
-        if c.first < 1 or c.last < c.first or c.last > span then
-            err("chunk %d: lines %s-%s are outside the symbol %s, which spans %d-%d (%d lines)",
+        local floor = (c.match ~= nil or c.absolute) and (1 - doc_lines) or 1
+        if c.first < floor or c.last < c.first or c.last > span then
+            err("chunk %d: lines %s-%s are outside the symbol %s, which spans %d-%d (%d lines%s)",
                 c.index, tostring(c.first + c.entry.first - 1), tostring(c.last + c.entry.first - 1),
-                c.entry.path, c.entry.first, c.entry.last, span)
+                c.entry.path, c.entry.first, c.entry.last, span,
+                doc_lines > 0 and (", doc comment from %d"):format(doc_first) or "")
         end
         c.abs_first = c.entry.first + c.first - 1
         c.abs_last = c.entry.first + c.last - 1
@@ -3010,7 +3038,9 @@ local function replace_symbol_lines(args)
         shift = shift + #c.new_lines - #c.old
     end
     local label
-    if #chunks == 1 then
+    if #chunks == 1 and chunks[1].first < 1 then
+        label = ("lines %d-%d (the doc comment above %s)"):format(chunks[1].abs_first, chunks[1].abs_last, entry.path)
+    elseif #chunks == 1 then
         label = ("lines %d-%d of %s"):format(chunks[1].first, chunks[1].last, entry.path)
     elseif symbols == 1 then
         label = ("%d chunks (lines %d-%d) of %s"):format(#chunks, chunks[1].first, chunks[#chunks].last, entry.path)
@@ -3649,25 +3679,9 @@ local function delete_file(args)
     return vim.tbl_extend("force", result, report)
 end
 
--- Line number where the contiguous comment block above `lnum` starts, or
--- `lnum` itself when there is none. A symbol's range excludes its doc
--- comment, so anything that moves a symbol has to widen it by this much or
--- the documentation is left behind, orphaned above whatever follows.
-local function doc_block_start(bufnr, lnum)
-    local first = lnum
-    for l = lnum - 1, 1, -1 do
-        local text = vim.api.nvim_buf_get_lines(bufnr, l - 1, l, false)[1] or ""
-        local stripped = text:gsub("^%s+", "")
-        if stripped:match("^%-%-") or stripped:match("^//") or stripped:match("^#")
-            or stripped:match("^/%*") or stripped:match("^%*")
-            or stripped:match([[^"""]]) then
-            first = l
-        else
-            break
-        end
-    end
-    return first
-end
+-- doc_block_start (defined above replace_symbol_lines) is what anything
+-- that moves a symbol widens its range by, or the documentation is left
+-- behind, orphaned above whatever follows.
 
 -- First line of the contiguous comment block directly above a line, for
 -- surfacing a symbol's doc summary. Language-agnostic prefix heuristic.
