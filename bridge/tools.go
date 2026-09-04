@@ -205,7 +205,7 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "replace_symbol_lines",
-		Description: "Replace lines first_line..last_line of a symbol, numbered relative to its declaration (=1) as find_symbol bodies show; prefer over replace_symbol_body for small changes. Applied to the editor buffer immediately and tracked; returns fresh diagnostics. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
+		Description: "Replace lines first_line..last_line of a symbol, numbered relative to its declaration (=1) as find_symbol bodies show; prefer over replace_symbol_body for small changes. Applied to the editor buffer immediately and tracked; returns fresh diagnostics and the text it replaced. Line numbers go stale the moment anything above the symbol changes - pass expect= with the current text of those lines and a stale offset fails instead of clobbering. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -214,13 +214,17 @@ var lspTools = []tool{
 				"first_line": map[string]any{"type": "integer", "description": "First line to replace, relative to the symbol (1-based)."},
 				"last_line":  map[string]any{"type": "integer", "description": "Last line to replace, relative to the symbol (inclusive)."},
 				"text":       map[string]any{"type": "string", "description": "Replacement for those lines."},
+				"expect": map[string]any{
+					"type":        "string",
+					"description": "The text those lines currently hold. Pass it whenever the line numbers came from an earlier call: an edit above the symbol shifts them, and without this the edit silently lands on the wrong lines.",
+				},
 			},
 			"required": []string{"file", "name_path", "first_line", "last_line", "text"},
 		},
 	},
 	{
 		Name:        "insert_after_symbol",
-		Description: "Insert source right after a symbol by name path (a blank line is added). Applied to the editor buffer immediately and tracked.",
+		Description: "Insert source right after a symbol by name path (a blank line is added between multi-line symbols, and not between single-line ones such as the members of a const block). Applied to the editor buffer immediately and tracked.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

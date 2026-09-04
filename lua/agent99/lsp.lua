@@ -1431,6 +1431,55 @@ end
 -- Format lines first..last (1-based, inclusive) through the server: range
 -- formatting when offered, else whole-file formatting for filetypes where
 -- that is canonical. Returns true when edits were applied.
+-- Undo the parts of a whole-file format that fall outside the edited region.
+--
+-- Several servers, gopls among them, offer no range formatting, so the only
+-- way to format an edit is to format the document. In a file that was not
+-- formatter-clean to begin with - and plenty are - that turns a two-line
+-- change into a diff spanning the file, mixing the edit with unrelated
+-- reflowing that nobody asked for and a reviewer has to pick apart.
+--
+-- So the format is applied, then the result is diffed against what was there
+-- and every hunk that does not touch the edited lines is put back. The edit
+-- comes out formatted; the rest of the file is left exactly as it was found.
+-- Returns whether anything survived inside the region.
+local function confine_format(bufnr, before_lines, first, last)
+    local after_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local hunks = vim.diff(
+        table.concat(before_lines, "\n") .. "\n",
+        table.concat(after_lines, "\n") .. "\n",
+        { result_type = "indices" })
+    if type(hunks) ~= "table" or #hunks == 0 then
+        return false
+    end
+    -- Reverted hunk by hunk, bottom upwards, rather than by rewriting the
+    -- buffer: the caller tracks the edited region with extmarks, and
+    -- replacing every line would move them to the top of the file and make
+    -- the edit report claim it had rewritten the whole thing.
+    local changed_inside = false
+    for i = #hunks, 1, -1 do
+        local start_a, count_a, start_b, count_b = hunks[i][1], hunks[i][2], hunks[i][3], hunks[i][4]
+        -- A hunk with count_a == 0 is an insertion sitting after old line
+        -- start_a, so its footprint in the old text is that one position.
+        local from = count_a > 0 and start_a or start_a + 1
+        local to = count_a > 0 and (start_a + count_a - 1) or start_a
+        if from <= last and to >= first then
+            changed_inside = true
+        else
+            local restored = {}
+            for l = start_a, start_a + count_a - 1 do
+                restored[#restored + 1] = before_lines[l]
+            end
+            -- count_b == 0 means the format deleted these lines, so there is
+            -- nothing to replace: put them back after new line start_b.
+            local at = count_b > 0 and (start_b - 1) or start_b
+            local upto = count_b > 0 and (start_b - 1 + count_b) or start_b
+            pcall(vim.api.nvim_buf_set_lines, bufnr, at, upto, false, restored)
+        end
+    end
+    return changed_inside
+end
+
 local function format_region(bufnr, first, last, mode)
     if mode == "range" or mode == true then
         local client = client_for(bufnr, "textDocument/rangeFormatting")
@@ -1456,8 +1505,9 @@ local function format_region(bufnr, first, last, mode)
             options = detect_indent(bufnr),
         })
         if ok and type(edits) == "table" and #edits > 0 then
+            local before_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
             pcall(vim.lsp.util.apply_text_edits, edits, bufnr, client.offset_encoding)
-            return true
+            return confine_format(bufnr, before_lines, first, last)
         end
     end
     return false
@@ -1511,6 +1561,32 @@ end
 -- Pre-existing diagnostics in the edited file are listed rather than counted,
 -- up to this many; past it the rest become a tally.
 local PREEXISTING_LISTED = 10
+
+-- A server saying it cannot analyze this file at all, rather than saying
+-- something about the code in it. Usually a build-tag or project-membership
+-- problem: the file is real, but it is not in the configuration the server
+-- was given, so "no new errors" after an edit means nothing was checked.
+local NOT_ANALYZED_PATTERNS = {
+    "no packages found",                      -- gopls
+    "build constraints exclude all",          -- go build tags
+    "is not included in your workspace",      -- gopls, outside the module
+    "file is not included in tsconfig",       -- tsserver
+    "no compile_commands",                    -- clangd
+}
+
+local function not_analyzed_reason(bufnr)
+    for _, d in ipairs(vim.diagnostic.get(bufnr)) do
+        local message = (d.message or ""):lower()
+        for _, pattern in ipairs(NOT_ANALYZED_PATTERNS) do
+            if message:find(pattern, 1, true) then
+                -- gopls follows this with several lines of documentation
+                -- links; the first line is the whole of the answer.
+                return vim.split(d.message, "\n", { plain = true })[1]
+            end
+        end
+    end
+    return nil
+end
 
 local function diag_signature(d)
     return ("%s|%s|%s"):format(vim.api.nvim_buf_get_name(d.bufnr),
@@ -1674,7 +1750,15 @@ local function post_edit_report(bufnr, before, root, headless, opts)
         new_elsewhere = vim.list_slice(new_elsewhere, 1, 10)
         new_elsewhere[#new_elsewhere + 1] = ("… +%d more"):format(extra)
     end
-    if not attached and bufnr then
+    local not_analyzed = bufnr and not_analyzed_reason(bufnr) or nil
+    if not_analyzed then
+        -- Reporting "no new errors" here would be a straight lie: the server
+        -- never looked. This is the build-tag case, where the edit is real
+        -- but nothing is checking it.
+        report.diagnostics_after = "not checked: the language server does not analyze this "
+            .. "file in its current configuration (" .. not_analyzed .. "). An edit here is "
+            .. "unverified - build or test with the tags that include it."
+    elseif not attached and bufnr then
         report.diagnostics_after = "no language server attached to this file; nothing checked"
     elseif not bufnr then
         report.diagnostics_after = #new_elsewhere == 0
@@ -2436,12 +2520,37 @@ local function replace_symbol_lines(args)
     local abs_last = entry.first + last - 1
     local new_lines = vim.split((args.text:gsub("\n+$", "")), "\n", { plain = true })
     local old = vim.api.nvim_buf_get_lines(bufnr, abs_first - 1, abs_last, false)
+
+    -- Relative line numbers are read off a snapshot - a find_symbol body or a
+    -- grep hit - and an edit anywhere above the symbol moves every one of
+    -- them. The numbers stay perfectly valid-looking after the shift, so the
+    -- edit lands on the wrong lines and silently replaces working code.
+    -- `expect` is the guard: give the text those lines are supposed to hold
+    -- and a stale offset fails loudly instead.
+    if args.expect ~= nil then
+        if type(args.expect) ~= "string" then
+            err("expect must be a string: the text those lines currently hold")
+        end
+        local want = vim.trim((args.expect:gsub("\n+$", "")))
+        local have = vim.trim(table.concat(old, "\n"))
+        if want ~= have then
+            err("lines %d-%d of %s do not hold the expected text, so the numbers are "
+                .. "probably from before an earlier edit shifted them.\nexpected: %s\n"
+                .. "found:    %s\nRe-read the symbol with find_symbol and use fresh numbers.",
+                first, last, entry.path, vim.inspect(want), vim.inspect(have))
+        end
+    end
+
     settle_before_edit(bufnr)
     local before = diag_snapshot()
     vim.api.nvim_buf_set_lines(bufnr, abs_first - 1, abs_last, false, new_lines)
-    return finish_edit(bufnr, args, before, ("%s:%d-%d"):format(entry.path, first, last),
+    local result = finish_edit(bufnr, args, before, ("%s:%d-%d"):format(entry.path, first, last),
         "replace_lines", abs_first, abs_last, old, #new_lines,
         { replaced = ("lines %d-%d of %s"):format(first, last, entry.path) })
+    -- Always echo what was there. Without `expect` this is the only way a
+    -- caller finds out an offset had drifted, and it costs a few lines.
+    result.replaced_text = old
+    return result
 end
 
 local function insert_symbol_tool(where)
@@ -2451,13 +2560,18 @@ local function insert_symbol_tool(where)
             err("missing required argument: text")
         end
         local lines = vim.split((args.text:gsub("\n+$", "")), "\n", { plain = true })
+        -- A blank line belongs between two functions and nowhere near two
+        -- constants: inserting a sibling into a `const (...)` or `var (...)`
+        -- block should not split the block in half. Single-line declarations
+        -- are the ones that live in such groups.
+        local spaced = (entry.last - entry.first) > 0
         local row -- 0-based insertion point
         if where == "after" then
             row = entry.last
-            table.insert(lines, 1, "")
+            if spaced then table.insert(lines, 1, "") end
         else
             row = entry.first - 1
-            table.insert(lines, "")
+            if spaced then table.insert(lines, "") end
         end
         settle_before_edit(bufnr)
         local before = diag_snapshot()

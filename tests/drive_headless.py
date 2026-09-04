@@ -336,6 +336,24 @@ def main():
             time.sleep(0.1)
         check("edit autosaved to disk", '.. "!"' in on_disk, on_disk)
 
+        # A stale relative offset must fail rather than clobber, and every
+        # replace echoes back what it replaced.
+        res = b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
+            "text": '    return "hi, " .. name', "expect": '    return "hello, " .. name',
+        })
+        check("expect= matching text applies",
+              res.get("replaced_text") == ['    return "hello, " .. name'], res)
+        try:
+            b.call("replace_symbol_lines", {
+                "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
+                "text": "    return 1", "expect": '    return "hello, " .. name',
+            })
+            check("expect= mismatch refuses", False, "call succeeded")
+        except RuntimeError as e:
+            check("expect= mismatch refuses", "do not hold the expected text" in str(e), e)
+        b.call("undo_edit", {"all": True})
+
         # File lifecycle: create, move, delete, each undoable. (Whether the
         # new file comes back reformatted depends on the language having a
         # formatter, which the minimal config's lua_ls does not; the Go and

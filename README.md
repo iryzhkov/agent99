@@ -438,7 +438,7 @@ config's ensure-installed lists to keep them on a fresh machine.
 | `rename_symbol` | `textDocument/rename` project-wide; `dry_run` lists affected files and edit counts first; applied renames enter the undo ledger per file |
 | `check_project` | one project-wide check from the root (`post_edit.check`, `AGENT99_CHECK`, or guessed from go.mod / tsconfig.json / Cargo.toml / pyproject.toml); the first call in a root records a baseline, later calls report only new and resolved lines |
 | `undo_edit` | take back the newest edit(s) of the run (`count`, or `all`), restoring the recorded source, or reversing a create/move/delete; refuses when the region changed since, and does not cover code actions |
-| `replace_symbol_body`, `replace_symbol_lines`, `insert_after_symbol`, `insert_before_symbol` | symbol-addressed edits, applied to editor buffers immediately and tracked (undoable per run); after every edit the region is formatted through the server and imports organized (a new call into an unimported package costs no extra round), then the tool waits for the servers to re-publish and returns only the errors/warnings the edit introduced, plus counts of pre-existing and fixed ones, new errors in other open files, and optionally a linter's output (see `post_edit`) |
+| `replace_symbol_body`, `replace_symbol_lines`, `insert_after_symbol`, `insert_before_symbol` | symbol-addressed edits, applied to editor buffers immediately and tracked (undoable per run). `replace_symbol_lines` takes `expect=`, the text those lines currently hold, so a line number that went stale when something above the symbol moved fails loudly instead of overwriting working code; it also echoes back what it replaced. After every edit the region is formatted through the server and imports organized (a new call into an unimported package costs no extra round), with the formatting confined to the edited lines even where the server only offers whole-file formatting, so a change to a file that was never formatter-clean stays a small diff; then the tool waits for the servers to re-publish and returns only the errors/warnings the edit introduced, plus counts of pre-existing and fixed ones, new errors in other open files, and optionally a linter's output (see `post_edit`) |
 | `create_file`, `move_file`, `delete_file` | file lifecycle through the language servers (`workspace/*FileOperations`), so a refactor that adds, splits or renames a file does not have to leave the editor. `move_file` has the server rewrite the imports naming the old path before the move; `create_file` makes parent directories, formats and organizes imports, and refuses to overwrite; `delete_file` reports what broke elsewhere. All three are undoable through `undo_edit` |
 | `buffer_lines` | editor's live buffer content, **including unsaved changes** |
 | `grep` filters | `kind=` keeps only definitions, calls, comments, strings, or `code` (anything that is not a comment or a string) — the fix for an identifier that also appears in the prose above every use of it; `tests=exclude`/`only` splits production code from tests on the path. Filtering by kind implies no context lines, and says how many hits were never classified rather than quietly dropping them |
@@ -477,6 +477,10 @@ bin directory.
   its state (loaded buffers, the `check_project` baseline).
 - Auto-fix compares diagnostics by severity+message, so a pre-existing
   error the edit duplicates on another line still counts as new.
+- A language server analyzes one build configuration, so a file excluded by a
+  build tag gets no diagnostics at all. Edits there report that they were not
+  checked rather than reporting success; verify them by building or testing
+  with the tags that include the file.
 
 ## Ideas / next steps
 
