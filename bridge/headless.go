@@ -242,6 +242,12 @@ var editTools = map[string]bool{
 	"apply_code_action":    true,
 	"undo_edit":            true,
 	"rename_symbol":        true,
+	// The file-lifecycle tools write the file themselves, but a server may
+	// have rewritten other files' imports in response, and those land in
+	// buffers like any other edit.
+	"create_file": true,
+	"move_file":   true,
+	"delete_file": true,
 }
 
 // headlessSaveAll writes every modified file buffer of the headless
@@ -263,12 +269,15 @@ func headlessSaveAll() error {
 
 // Lua expression (single quotes are forbidden: it travels inside a
 // Vimscript string literal) returning "" or the joined write errors.
+//
+// The saving itself lives in agent99.lsp so that it goes through the same
+// disk-fingerprint check as every other write: a plain `:write` over a file
+// that changed on disk asks the user whether to overwrite it, and in a
+// headless instance that question never gets an answer - it hangs the RPC
+// channel and the edit is lost.
 var headlessSaveLua = strings.Join([]string{
-	`(function() local errs = {}`,
-	`for _, b in ipairs(vim.api.nvim_list_bufs()) do`,
-	`if vim.bo[b].modified and vim.bo[b].buftype == "" and vim.api.nvim_buf_get_name(b) ~= "" then`,
-	`local ok, e = pcall(vim.api.nvim_buf_call, b, function() vim.cmd("silent write") end)`,
-	`if not ok then errs[#errs + 1] = tostring(e) end`,
-	`end end`,
-	`return table.concat(errs, "; ") end)()`,
+	`(function() local ok, r = pcall(function()`,
+	`return require("agent99.lsp").save_all() end)`,
+	`if not ok then return tostring(r) end`,
+	`return table.concat(r, "; ") end)()`,
 }, " ")

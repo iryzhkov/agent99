@@ -148,12 +148,12 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "workspace_map",
-		Description: "Every project file with its line count and top-level declarations, in one cheap call. The first move in an unfamiliar repo. Test files are left out unless include_tests.",
+		Description: "Every project file with its line count and declarations - classes with their methods one level in - in one cheap call. The first move in an unfamiliar repo. Test files are left out unless include_tests.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{"type": "string", "description": "Subdirectory (default: root)."},
-				"glob": map[string]any{"type": "string", "description": "Filename glob, e.g. **/*.go."},
+				"glob": map[string]any{"type": "string", "description": "Path glob relative to the root, e.g. src/**/*.go; subdirectories need a **/ prefix."},
 			},
 			"required": []string{},
 		},
@@ -170,7 +170,7 @@ var lspTools = []tool{
 					"items":       map[string]any{"type": "string"},
 					"description": "Files to search (optional if glob is given).",
 				},
-				"glob": map[string]any{"type": "string", "description": "Glob relative to root."},
+				"glob": map[string]any{"type": "string", "description": "Path glob relative to root, e.g. **/*.go; subdirectories need a **/ prefix."},
 			},
 			"required": []string{"query"},
 		},
@@ -184,7 +184,7 @@ var lspTools = []tool{
 				"name":         map[string]any{"type": "string", "description": "Name or name path; suffix/substring match."},
 				"file":         map[string]any{"type": "string", "description": "One file to search."},
 				"files":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Several files to search."},
-				"glob":         map[string]any{"type": "string", "description": "Glob relative to root."},
+				"glob":         map[string]any{"type": "string", "description": "Path glob relative to root, e.g. **/*.go; subdirectories need a **/ prefix."},
 				"include_body": map[string]any{"type": "boolean", "description": "Return the full source of well-matching symbols."},
 			},
 			"required": []string{"name"},
@@ -321,6 +321,44 @@ var lspTools = []tool{
 			"required": []string{"file"},
 		},
 	},
+	{
+		Name: "create_file",
+		Description: "Create a new file with its contents, formatted and with imports organized, " +
+			"and tell the language servers about it. Missing parent directories are created. Undoable with undo_edit.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"file": map[string]any{"type": "string", "description": "Path of the new file (absolute or relative to root)."},
+				"text": map[string]any{"type": "string", "description": "Contents of the new file."},
+			},
+			"required": []string{"file", "text"},
+		},
+	},
+	{
+		Name: "move_file",
+		Description: "Move or rename a file through the language servers, so they rewrite the imports and " +
+			"references that name the old path. Always prefer this over a shell mv. Undoable with undo_edit.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"from": map[string]any{"type": "string", "description": "Current path (absolute or relative to root)."},
+				"to":   map[string]any{"type": "string", "description": "New path (absolute or relative to root); its directory is created if missing."},
+			},
+			"required": []string{"from", "to"},
+		},
+	},
+	{
+		Name: "delete_file",
+		Description: "Delete one file, letting the language servers react and reporting what broke elsewhere. " +
+			"Undoable with undo_edit, which restores the contents.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"file": map[string]any{"type": "string", "description": "File to delete (absolute or relative to root)."},
+			},
+			"required": []string{"file"},
+		},
+	},
 }
 
 // fileTools run in this process; only the "agent" subcommand exposes them
@@ -347,7 +385,7 @@ var fileTools = []tool{
 			"properties": map[string]any{
 				"pattern": map[string]any{"type": "string", "description": "Regular expression to search for."},
 				"path":    map[string]any{"type": "string", "description": "Subdirectory or file (default: root)."},
-				"glob":    map[string]any{"type": "string", "description": "Filename glob."},
+				"glob":    map[string]any{"type": "string", "description": "Path glob relative to the root, e.g. src/**/*.go; subdirectories need a **/ prefix."},
 				"context": map[string]any{"type": "integer", "description": "Context lines around each match (default 2, max 10)."},
 				"blame":   map[string]any{"type": "boolean", "description": "Add git blame age per hit (slower)."},
 			},
@@ -355,12 +393,14 @@ var fileTools = []tool{
 		},
 	},
 	{
-		Name:        "list_files",
-		Description: "List project files (respects .gitignore).",
+		Name: "list_files",
+		Description: "List project file paths (respects .gitignore); images and other binaries are left out. " +
+			"Prefer workspace_map, which lists the same files with their declarations.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path": map[string]any{"type": "string", "description": "Subdirectory (default: root)."},
+				"glob": map[string]any{"type": "string", "description": "Path glob, e.g. src/**/*.go or *.go."},
 			},
 			"required": []string{},
 		},
@@ -513,6 +553,17 @@ func runGrep(root string, args map[string]any) (string, error) {
 	ctxArg := fmt.Sprintf("-C%d", ctx)
 	glob, _ := args["glob"].(string)
 	blame, _ := args["blame"].(bool)
+	// Both searchers match a glob against the path as they walk it, so a
+	// root-relative glob like "src/**/*.go" only works if the path they
+	// walk is root-relative too. Search from the root with a relative
+	// target and put the root back on the results afterwards, so that a
+	// glob here means the same thing it means in find_symbol and skim.
+	searchDir, searchTarget := root, "."
+	if rel, err := filepath.Rel(root, target); err == nil && !strings.HasPrefix(rel, "..") {
+		searchTarget = rel
+	} else {
+		searchDir, searchTarget = "", target
+	}
 	var cmd *exec.Cmd
 	if _, err := exec.LookPath("rg"); err == nil {
 		// --sort path costs rg its parallelism but makes the output
@@ -524,16 +575,17 @@ func runGrep(root string, args map[string]any) (string, error) {
 		if glob != "" {
 			cargs = append(cargs, "-g", glob)
 		}
-		cargs = append(cargs, "-e", pattern, target)
+		cargs = append(cargs, "-e", pattern, searchTarget)
 		cmd = exec.Command("rg", cargs...)
 	} else {
 		cargs := []string{"-rnHIE", ctxArg}
 		if glob != "" {
 			cargs = append(cargs, "--include="+glob)
 		}
-		cargs = append(cargs, "-e", pattern, target)
+		cargs = append(cargs, "-e", pattern, searchTarget)
 		cmd = exec.Command("grep", cargs...)
 	}
+	cmd.Dir = searchDir
 	out, err := cmd.Output()
 	if err != nil {
 		// Exit code 1 just means "no matches" for both rg and grep.
@@ -547,8 +599,27 @@ func runGrep(root string, args map[string]any) (string, error) {
 		lines = append(lines[:maxGrepLines],
 			fmt.Sprintf("... (truncated at %d matches)", maxGrepLines))
 	}
+	if searchDir != "" {
+		absolutizeGrepPaths(lines, searchDir)
+	}
 	annotateGrepHits(lines, blame)
 	return strings.Join(lines, "\n"), nil
+}
+
+// Put the search root back in front of the paths the searcher printed. It
+// ran with the root as its working directory (so that globs are
+// root-relative), which makes every hit relative; the annotator and the
+// agent both want a path they can open from anywhere.
+func absolutizeGrepPaths(lines []string, root string) {
+	for i, l := range lines {
+		if l == "" || l == "--" || strings.HasPrefix(l, "/") {
+			continue
+		}
+		// Plain concatenation, not filepath.Join: the rest of the line is
+		// matched source text, and cleaning it would rewrite any "//" or
+		// "/./" the code happens to contain.
+		lines[i] = strings.TrimSuffix(root, "/") + "/" + strings.TrimPrefix(l, "./")
+	}
 }
 
 var testPathRe = regexp.MustCompile(`(^|/)(tests?|spec)(/|$)|_test\.|_spec\.|\.test\.|\.spec\.`)
@@ -739,8 +810,24 @@ func annotateGrepHits(lines []string, blame bool) {
 	}
 }
 
+// Extensions of files nobody lists a directory to find: images, archives,
+// fonts, compiled objects, design sources. A repository's docs/ or assets/
+// directory is mostly these, and they crowd out the source the agent asked
+// for.
+var listFilesSkipExt = map[string]bool{
+	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".bmp": true,
+	".ico": true, ".webp": true, ".svg": true, ".pdf": true, ".ai": true,
+	".psd": true, ".sketch": true, ".mp3": true, ".mp4": true, ".mov": true,
+	".wav": true, ".ttf": true, ".otf": true, ".woff": true, ".woff2": true,
+	".eot": true, ".zip": true, ".gz": true, ".tar": true, ".bz2": true,
+	".xz": true, ".7z": true, ".jar": true, ".class": true, ".o": true,
+	".a": true, ".so": true, ".dylib": true, ".dll": true, ".exe": true,
+	".pyc": true, ".wasm": true, ".bin": true, ".db": true, ".sqlite": true,
+}
+
 func runListFiles(root string, args map[string]any) (string, error) {
 	target := resolveInRoot(root, args["path"])
+	glob, _ := args["glob"].(string)
 	var files []string
 	cmd := exec.Command("git", "ls-files", "--cached", "--others", "--exclude-standard")
 	cmd.Dir = target
@@ -762,31 +849,98 @@ func runListFiles(root string, args map[string]any) (string, error) {
 			return nil
 		})
 	}
-	sort.Strings(files)
-	if len(files) > maxListFiles {
-		files = append(files[:maxListFiles],
-			fmt.Sprintf("... (truncated at %d files)", maxListFiles))
+	kept := files[:0]
+	var skipped int
+	for _, f := range files {
+		if f == "" {
+			continue
+		}
+		if glob != "" && !matchPathGlob(glob, f) {
+			continue
+		}
+		if glob == "" && listFilesSkipExt[strings.ToLower(filepath.Ext(f))] {
+			skipped++
+			continue
+		}
+		kept = append(kept, f)
 	}
-	if len(files) == 0 {
+	files = kept
+	sort.Strings(files)
+	var notes []string
+	if len(files) > maxListFiles {
+		notes = append(notes, fmt.Sprintf("... (truncated at %d files; narrow it with path= or glob=, "+
+			"or use workspace_map for files with their declarations)", maxListFiles))
+		files = files[:maxListFiles]
+	}
+	if skipped > 0 {
+		notes = append(notes, fmt.Sprintf("... (%d image/binary/archive files not listed; glob= to include them)", skipped))
+	}
+	if len(files) == 0 && len(notes) == 0 {
 		return "(no files)", nil
 	}
-	return strings.Join(files, "\n"), nil
+	return strings.Join(append(files, notes...), "\n"), nil
+}
+
+// Match one repo-relative path against a glob, accepting both a bare
+// filename pattern ("*.go", matched against the last component) and a path
+// pattern ("src/**/*.go"), so that the same glob means here what it means
+// in find_symbol and grep.
+func matchPathGlob(glob, path string) bool {
+	if matchSegments(strings.Split(glob, "/"), strings.Split(path, "/")) {
+		return true
+	}
+	if !strings.Contains(glob, "/") {
+		if ok, err := filepath.Match(glob, filepath.Base(path)); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
+// Segment-wise glob match where "**" stands for any number of path
+// segments, including none. filepath.Match alone cannot express that: its
+// "*" never crosses a separator.
+func matchSegments(pattern, parts []string) bool {
+	if len(pattern) == 0 {
+		return len(parts) == 0
+	}
+	if pattern[0] == "**" {
+		for i := 0; i <= len(parts); i++ {
+			if matchSegments(pattern[1:], parts[i:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(parts) == 0 {
+		return false
+	}
+	if ok, err := filepath.Match(pattern[0], parts[0]); err != nil || !ok {
+		return false
+	}
+	return matchSegments(pattern[1:], parts[1:])
 }
 
 // callTool executes one tool and returns its text result.
 func callTool(name string, args map[string]any, root string) (string, error) {
 	if lspToolNames[name] {
-		if _, ok := args["file"]; ok {
+		// "from" and "to" belong to move_file; they name paths exactly as
+		// "file" does and have to be rooted the same way.
+		for _, key := range []string{"file", "from", "to"} {
+			if _, ok := args[key]; !ok {
+				continue
+			}
 			resolved := map[string]any{}
 			for k, v := range args {
 				resolved[k] = v
 			}
-			resolved["file"] = resolveInRoot(root, args["file"])
+			resolved[key] = resolveInRoot(root, args[key])
 			args = resolved
 		}
 		switch name {
 		case "ts_query", "find_symbol", "workspace_map", "workspace_symbols", "install_language",
-			"replace_symbol_body", "replace_symbol_lines", "insert_after_symbol", "insert_before_symbol", "undo_edit", "rename_symbol", "check_project":
+			"replace_symbol_body", "replace_symbol_lines", "insert_after_symbol", "insert_before_symbol", "undo_edit", "rename_symbol", "check_project",
+			"create_file", "move_file", "delete_file":
 			resolved := map[string]any{}
 			for k, v := range args {
 				resolved[k] = v

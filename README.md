@@ -291,7 +291,7 @@ Standalone: any MCP client + agent99-bridge mcp
   other agents").
 ```
 
-## Using the tools from other agents (MCP)
+## The agent MCP server
 
 The same tool set is an MCP stdio server: `bin/agent99-bridge mcp`. Claude
 Code, or any MCP client, can use it outside Neovim:
@@ -299,6 +299,35 @@ Code, or any MCP client, can use it outside Neovim:
 ```
 claude mcp add --scope user agent99 -- ~/.local/share/nvim/lazy/agent99/bin/agent99-bridge mcp
 ```
+
+The point of it is that an agent working through these tools sees the code
+the way an editor does rather than the way `cat` does. It navigates by
+symbol instead of by line number, it is told what its edit broke the moment
+it makes it, and its refactors go through the language server, so the
+imports and references that have to move with a change actually move.
+
+### What you get over plain file tools
+
+- **Structure instead of text.** `workspace_map` gives every file in the
+  project with its declarations — classes with their methods one level in —
+  in one call. `find_symbol` fetches one function out of a 1600-line module
+  by name path (`Flask/full_dispatch_request`), with its lines numbered
+  relative to the symbol so the next edit can address them directly.
+- **Annotated search.** Every `grep` hit is tagged with the symbol that
+  encloses it, its kind, nesting depth, existing diagnostics and whether it
+  is in a test file, so most hits need no follow-up read.
+- **Edits that keep the file valid.** After every symbol edit the region is
+  formatted through the server and imports are organized, so writing a call
+  into a package the file does not import yet costs no extra round trip.
+- **Immediate feedback.** Each edit returns the diagnostics it introduced,
+  separated from the ones that were already there and the ones it fixed.
+  `check_project` does the same for the project's own check command against
+  a baseline.
+- **Refactors, not text substitution.** `rename_symbol` and `move_file` go
+  through the language server, which rewrites every reference and import
+  path across the project.
+
+### Workspaces
 
 Without `$AGENT99_NVIM` the server runs in **standalone mode**: it serves
 `open_workspace(root)`, which starts a headless Neovim in that project with
@@ -312,7 +341,67 @@ stopped when the server exits. Standalone mode additionally serves the
 file tools (`read_file`, annotated `grep`, `list_files`), with relative paths resolved against the
 workspace, and symbol edits are saved to disk right after they are
 applied since nobody is at the keyboard to `:w`. One workspace at a time;
-opening a different root replaces the instance.
+opening a different root replaces the instance, and its state (loaded
+buffers, the `check_project` baseline) goes with it.
+
+If the server inherits `$NVIM` (Claude Code launched from a `:terminal`
+inside Neovim), that live instance is used instead and `open_workspace` is
+unnecessary — and the tools then see your unsaved buffers.
+`AGENT99_HEADLESS_INIT=<init.lua>` makes the headless instance start with
+`--clean -u <init.lua>` instead of your configuration (the tests use it;
+then language servers must be on `PATH`, since mason.nvim is not there to
+add them).
+
+### Sharing the tree with other tools
+
+The buffers behind these tools are long-lived, so a file can change
+underneath one: the agent runs `sed`, a `git checkout` lands, you save in
+your own editor. Every buffer carries the disk fingerprint its contents
+were last known to agree with, and is resynced before it is read or
+edited — an external change is picked up, not written over. When the file
+changed *and* the session has unsaved edits of its own, the tool refuses
+and says so rather than choosing which change to lose. Writes go through
+`write!` after that check, so the "file has changed since reading it,
+write anyway?" prompt — unanswerable in a headless instance — can never be
+reached.
+
+### File lifecycle
+
+`create_file`, `move_file` and `delete_file` let a refactor that adds,
+splits or renames a file stay inside the editor. Each one tells the
+language servers what happened through the `workspace/*FileOperations`
+requests, and each is undoable through `undo_edit` like any other edit
+(`delete_file` restores the contents).
+
+`move_file` is the one that earns its place: the server is asked what else
+must change *before* the file moves, so the imports naming the old path are
+rewritten across the project. Moving `packages/zod/src/v4/core/regexes.ts`
+into a `patterns/` subdirectory rewrote the import in five other files;
+a shell `mv` would have left five broken imports for the agent to find.
+
+`create_file` makes missing parent directories, formats the new file and
+organizes its imports, and refuses to overwrite an existing file.
+
+### Globs
+
+`glob` means the same thing in every tool that takes one: a path pattern
+matched against the path from the workspace root, where `**` spans
+directories. So `src/**/*.go` works, `**/*.ts` matches everywhere, and a
+bare `schemas.ts` is treated as "wherever it lives". A glob that matches
+nothing says so, and says why, instead of returning an empty result that
+reads like an answer.
+
+### When a language server knows less than it looks
+
+Some servers only index the files they have been shown — tsserver builds
+its program from open files, so `workspace_symbols` in a large repository
+can answer about a fraction of it. Rather than report that as "no match",
+which is indistinguishable from the symbol not existing, the tool waits
+for indexing, opens the project's most central source file to give the
+server its real configuration, and then falls back to reading the
+project's own files. Results found that way are labelled.
+
+### Extras
 
 `AGENT99_LINT_<FILETYPE>` in the server's environment (`claude mcp add -e
 AGENT99_LINT_GO="go vet {dir}" ...`) sets a post-edit linter without touching
@@ -329,35 +418,28 @@ toolchain is missing such as `cargo` for rust_analyzer). Installed pieces
 land in Neovim's data directory and persist; add them to the editor
 config's ensure-installed lists to keep them on a fresh machine.
 
-If the server inherits `$NVIM` (Claude Code launched from a `:terminal`
-inside Neovim), that live instance is used instead and `open_workspace` is
-unnecessary — and the tools then see your unsaved buffers.
-`AGENT99_HEADLESS_INIT=<init.lua>` makes the headless instance start with
-`--clean -u <init.lua>` instead of your configuration (the tests use it;
-then language servers must be on `PATH`, since mason.nvim is not there to
-add them).
-
 ## Tools exposed to the agent
 
 | Tool | Backed by |
 |---|---|
 | `install_language` | standalone MCP only: tree-sitter parser via nvim-treesitter plus a language server via Mason for one filetype, enabled and attach-checked; the fix for languages open_workspace calls blind |
-| `workspace_map` | the whole workspace's shape in one call: every project file with its line count and top-level declarations only (string parsers on disk content — no buffers created, no servers attached); the outline budget is shared across files (`+N more` marks a cut), test files are left out unless `include_tests`; the intended first move in an unfamiliar repo, ahead of skim/grep |
+| `workspace_map` | the whole workspace's shape in one call: every project file with its line count and its declarations, descending one level into classes so nested languages list their methods (string parsers on disk content — no buffers created, no servers attached); the outline budget is shared across files (`+N more` marks a cut), test files are left out unless `include_tests`; the intended first move in an unfamiliar repo, ahead of skim/grep |
 | `skim` | structure of up to 20 files in one call: every function/class/method declaration line with line numbers, nested (treesitter, LSP-symbol fallback; C/C++ take the server's symbols first because macros confuse the grammar) — measures ~6-25% of the tokens of reading the same files |
-| `find_symbol` | look up symbols by `/`-joined name path across files/globs, optionally returning the full body — fetch exactly one function instead of a whole file |
+| `find_symbol` | look up symbols by `/`-joined name path across files/globs, optionally returning the full body — fetch exactly one function instead of a whole file. Constants and module-level variables are included by folding in the server's document symbols, which treesitter's declaration nodes leave out |
 | `ts_query` | structural multi-file search: a treesitter s-expression query with `@captures` and `#eq?`/`#match?` predicates — for questions grep can't ask |
 | `definition`, `type_definition`, `implementation` | `textDocument/*` via live client |
 | `hover` | `textDocument/hover` (signatures + docs) |
 | `expand_symbol` | definition + full source of the defining symbol + hover, in one round-trip |
 | `references` | `textDocument/references`, grouped by file (paths relative to the root), each hit annotated with its enclosing symbol path |
-| `document_symbols`, `workspace_symbols` | file outline / project-wide symbol search |
+| `document_symbols`, `workspace_symbols` | file outline / project-wide symbol search. `workspace_symbols` falls back to reading the project's files when the server's index does not cover them, rather than reporting a gap in the index as "no match" |
 | `diagnostics` | `vim.diagnostic.get` (what the editor shows); fixable ones list their `quick_fixes`, steering the agent to `apply_code_action` instead of hand-writing fixes |
 | `incoming_calls`, `outgoing_calls` | call hierarchy (server support varies) |
 | `code_actions`, `apply_code_action` | list the editor's quick fixes/refactorings, apply one by token+index; the edit is performed by Neovim itself (safe, possibly multi-file) |
 | `rename_symbol` | `textDocument/rename` project-wide; `dry_run` lists affected files and edit counts first; applied renames enter the undo ledger per file |
 | `check_project` | one project-wide check from the root (`post_edit.check`, `AGENT99_CHECK`, or guessed from go.mod / tsconfig.json / Cargo.toml / pyproject.toml); the first call in a root records a baseline, later calls report only new and resolved lines |
-| `undo_edit` | take back the newest symbol edit(s) of the run (`count`, or `all`), restoring the recorded source and reporting diagnostics after; refuses when the region changed since, and does not cover code actions |
+| `undo_edit` | take back the newest edit(s) of the run (`count`, or `all`), restoring the recorded source, or reversing a create/move/delete; refuses when the region changed since, and does not cover code actions |
 | `replace_symbol_body`, `replace_symbol_lines`, `insert_after_symbol`, `insert_before_symbol` | symbol-addressed edits, applied to editor buffers immediately and tracked (undoable per run); after every edit the region is formatted through the server and imports organized (a new call into an unimported package costs no extra round), then the tool waits for the servers to re-publish and returns only the errors/warnings the edit introduced, plus counts of pre-existing and fixed ones, new errors in other open files, and optionally a linter's output (see `post_edit`) |
+| `create_file`, `move_file`, `delete_file` | file lifecycle through the language servers (`workspace/*FileOperations`), so a refactor that adds, splits or renames a file does not have to leave the editor. `move_file` has the server rewrite the imports naming the old path before the move; `create_file` makes parent directories, formats and organizes imports, and refuses to overwrite; `delete_file` reports what broke elsewhere. All three are undoable through `undo_edit` |
 | `buffer_lines` | editor's live buffer content, **including unsaved changes** |
 | `read_file`, `grep`, `list_files` | plain file access rooted at the project (openai-kind providers; claude brings its own Read/Grep/Glob). A plain read of a large file returns its skim instead of thousands of lines. Grep output is deterministic and every hit is annotated: `file:line [Symbol kind @pos/len dN !SEV ~age · signature · doc-comment]` — what the hit *is*, where it sits, its nesting depth, existing diagnostics, `test:` for test files, blame age on request — so most hits need no follow-up read |
 
@@ -390,8 +472,8 @@ bin directory.
 - One request at a time.
 - The reply replaces the selection; agent-driven multi-file editing goes
   through the symbol tools and `apply_code_action`.
-- First LSP query in a cold project can return empty results while the
-  server is still indexing; the agent usually retries.
+- One workspace at a time; opening another root replaces the instance and
+  its state (loaded buffers, the `check_project` baseline).
 - Auto-fix compares diagnostics by severity+message, so a pre-existing
   error the edit duplicates on another line still counts as new.
 
@@ -399,8 +481,6 @@ bin directory.
 
 - Hunk-based diff preview (show only what changed, via vim.diff).
 - Charwise/blockwise selections (currently widened to whole lines).
-- `textDocument/rename` as an agent tool (safe multi-file refactor
-  primitive).
 - FIM-based ghost-text completion as a separate fast path.
 - A CLI entry point driving a running (or headless) editor — most of a
   standalone coding agent already exists here (the MCP server's

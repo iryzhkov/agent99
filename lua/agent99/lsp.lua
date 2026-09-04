@@ -73,6 +73,178 @@ local function is_test_path(path)
         or path:find("/__tests__/") or path:find("/testdata/")
 end
 
+local function project_files(root)
+    local files = vim.fn.systemlist({ "git", "-C", root,
+        "ls-files", "--cached", "--others", "--exclude-standard" })
+    if vim.v.shell_error ~= 0 then
+        files = {}
+        for _, f in ipairs(vim.fn.globpath(root, "**/*", true, true)) do
+            if vim.fn.isdirectory(f) == 0 then
+                files[#files + 1] = f:sub(#root + 2)
+            end
+        end
+    end
+    return files
+end
+
+-- How good a file is to hand a language server as its first sight of the
+-- project. It matters more than it looks: a server like tsserver builds its
+-- program from the files it has been given, so opening a stray bench script
+-- gets it a one-file project and every whole-project query then comes back
+-- empty. Source directories win, tests and scratch directories lose, and
+-- shallow beats deep.
+local SAMPLE_SOURCE_DIRS = { "src", "lib", "app", "pkg", "internal", "source" }
+local SAMPLE_SIDE_DIRS = {
+    bench = true, benchmarks = true, examples = true, example = true,
+    docs = true, doc = true, scripts = true, tools = true, integration = true,
+    fixtures = true, vendor = true, third_party = true, node_modules = true,
+    playground = true, sandbox = true, demo = true,
+}
+
+local function sample_score(rel)
+    local score = 0
+    local first = rel:match("^([^/]+)/") or ""
+    if SAMPLE_SIDE_DIRS[first] then
+        score = score - 40
+    end
+    for _, dir in ipairs(SAMPLE_SOURCE_DIRS) do
+        if rel:find("^" .. dir .. "/") or rel:find("/" .. dir .. "/") then
+            score = score + 30
+            break
+        end
+    end
+    if is_test_path(rel) then
+        score = score - 30
+    end
+    local depth = select(2, rel:gsub("/", ""))
+    return score - depth
+end
+
+local function better_sample(a, b)
+    if not a then return true end
+    local sa, sb = sample_score(a), sample_score(b)
+    if sa ~= sb then return sb > sa end
+    return #b < #a
+end
+
+-- Disk synchronisation.
+--
+-- The buffers these tools work in are hidden and long-lived, so the file
+-- underneath one can change while we hold it: the agent runs `sed` or `git
+-- checkout`, another tool edits the same tree, the user saves in their own
+-- editor. Neovim guards against writing over such a change by asking "the
+-- file has been changed since reading it, write anyway (y/n)?", and that
+-- question is fatal here - there is no one to answer it, so the RPC channel
+-- hangs and the edit is lost while the tool reports success.
+--
+-- So agent99 never lets that question be asked. Every buffer carries the
+-- disk fingerprint its contents were last known to agree with; a buffer is
+-- resynced before it is read or edited, and writes go through `write!`,
+-- which does not prompt, only after we have checked the fingerprint
+-- ourselves.
+
+local function rel_path(path)
+    local cwd = vim.fn.getcwd()
+    if path:sub(1, #cwd + 1) == cwd .. "/" then
+        return path:sub(#cwd + 2)
+    end
+    return path
+end
+
+local function disk_fingerprint(path)
+    local st = vim.uv.fs_stat(path)
+    if not st then return nil end
+    return ("%d.%d/%d"):format(st.mtime.sec, st.mtime.nsec, st.size)
+end
+
+-- Remember that `bufnr` now agrees with what is on disk.
+local function mark_synced(bufnr, path)
+    path = path or vim.api.nvim_buf_get_name(bufnr)
+    vim.b[bufnr].agent99_disk = disk_fingerprint(path)
+end
+
+-- Has the file changed behind the buffer's back since we last agreed with
+-- it? Unknown fingerprints (buffer loaded before this ran) count as clean:
+-- Neovim's own timestamp check still backs us up on the write.
+local function disk_moved_on(bufnr, path)
+    local seen = vim.b[bufnr].agent99_disk
+    if not seen then return false end
+    local now = disk_fingerprint(path)
+    return now ~= nil and now ~= seen
+end
+
+-- In a live editor the user saves too, and their write is as authoritative
+-- as ours; without this their next keystroke would look like a buffer that
+-- disagrees with the disk.
+vim.api.nvim_create_autocmd({ "BufWritePost", "BufReadPost" }, {
+    group = vim.api.nvim_create_augroup("agent99_disk_state", { clear = true }),
+    callback = function(ev)
+        local name = vim.api.nvim_buf_get_name(ev.buf)
+        if name ~= "" then
+            mark_synced(ev.buf, name)
+        end
+    end,
+})
+
+-- Bring `bufnr` back in line with the file. An unmodified buffer is simply
+-- reloaded. A buffer with edits of ours still in it cannot be: reloading
+-- would throw those away and writing would throw the other change away, so
+-- the caller is told and nothing is touched.
+local function sync_buf(bufnr, path)
+    if not disk_moved_on(bufnr, path) then return false end
+    if vim.bo[bufnr].modified then
+        err("%s changed on disk while this session had unsaved edits to it; "
+            .. "nothing was written. Re-read the file and redo the edit, or "
+            .. "undo_edit first", rel_path(path))
+    end
+    local ok, e = pcall(vim.api.nvim_buf_call, bufnr, function()
+        vim.cmd("silent! edit!")
+    end)
+    if not ok then
+        err("could not reload %s after it changed on disk: %s", rel_path(path), tostring(e))
+    end
+    mark_synced(bufnr, path)
+    loaded_at[bufnr] = vim.uv.now()
+    return true
+end
+
+-- Write `bufnr` to disk. Refuses rather than clobbers when the file moved
+-- on under us; `write!` itself never prompts, so this cannot hang.
+local function write_buf(bufnr)
+    if not vim.bo[bufnr].modified then return true end
+    local path = vim.api.nvim_buf_get_name(bufnr)
+    if path == "" then return true end
+    if disk_moved_on(bufnr, path) then
+        return false, ("%s changed on disk since this session read it; "
+            .. "the edit was left unsaved in the editor"):format(rel_path(path))
+    end
+    local ok, e = pcall(vim.api.nvim_buf_call, bufnr, function()
+        vim.cmd("silent write!")
+    end)
+    if not ok then
+        return false, ("could not write %s: %s"):format(rel_path(path), tostring(e))
+    end
+    mark_synced(bufnr, path)
+    return true
+end
+
+-- Save every file buffer the tools have changed. Called by the bridge after
+-- each edit tool in a headless workspace, and before shell commands that
+-- read the tree. Returns a list of failures, empty when all is well.
+function M.save_all()
+    local failures = {}
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_loaded(b) and vim.bo[b].modified
+            and vim.bo[b].buftype == "" and vim.api.nvim_buf_get_name(b) ~= "" then
+            local ok, why = write_buf(b)
+            if not ok then
+                failures[#failures + 1] = why
+            end
+        end
+    end
+    return failures
+end
+
 local function load_buf(file)
     if type(file) ~= "string" or file == "" then
         err("missing required argument: file")
@@ -85,6 +257,9 @@ local function load_buf(file)
     if not vim.api.nvim_buf_is_loaded(bufnr) then
         vim.fn.bufload(bufnr)
         loaded_at[bufnr] = vim.uv.now()
+        mark_synced(bufnr, path)
+    else
+        sync_buf(bufnr, path)
     end
     return bufnr, path
 end
@@ -199,14 +374,6 @@ end
 -- Paths in results are relative to the working directory (the workspace
 -- root in headless mode) when they lie under it; tools resolve relative
 -- paths against the root, so the model can pass them straight back.
-local function rel_path(path)
-    local cwd = vim.fn.getcwd()
-    if path:sub(1, #cwd + 1) == cwd .. "/" then
-        return path:sub(#cwd + 2)
-    end
-    return path
-end
-
 local function line_preview(path, lnum)
     local bufnr = vim.fn.bufnr(path)
     if bufnr ~= -1 and vim.api.nvim_buf_is_loaded(bufnr) then
@@ -309,6 +476,9 @@ local TS_EXCLUDED = {
     call = true, parameter = true, parameters = true, argument = true,
     arguments = true, index = true, expression = true, pointer = true,
     import = true, type = true, body = true,
+    -- TypeScript's "extends Base" clause is a class_heritage node: it
+    -- carries the class name again without declaring anything.
+    heritage = true,
 }
 
 -- Whole node types wanted despite an excluded segment: JavaScript's
@@ -333,6 +503,26 @@ local function ts_opaque(node_type)
         end
     end
     return false
+end
+
+-- Declarations that hold other declarations, as opposed to a function whose
+-- body is statements. The workspace map descends into these one level.
+local TS_CONTAINER = {
+    class = true, struct = true, interface = true, impl = true,
+    module = true, trait = true, enum = true,
+}
+
+local function ts_container(node_type)
+    local container = false
+    for segment in node_type:gmatch("[^_]+") do
+        if segment == "function" or segment == "method" then
+            return false
+        end
+        if TS_CONTAINER[segment] then
+            container = true
+        end
+    end
+    return container
 end
 
 local function ts_wanted(node_type)
@@ -409,6 +599,26 @@ end
 local MAX_QUERY_FILES = 50
 local MAX_QUERY_MATCHES = 200
 
+-- Expand a glob against the project root. A glob with no "/" in it reads as
+-- "this file, wherever it lives" ("schemas.ts"), but vim's globpath only
+-- looks in the root itself, so retry that case one directory deep and then
+-- anywhere. Returns the paths and, when there are none, why not.
+local function expand_glob(root, glob)
+    if type(root) ~= "string" or root == "" then
+        err("glob needs the project root; pass explicit files instead")
+    end
+    local paths = vim.fn.globpath(root, glob, true, true)
+    if #paths == 0 and not glob:find("/") then
+        paths = vim.fn.globpath(root, "**/" .. glob, true, true)
+    end
+    if #paths == 0 then
+        return paths, ("glob %q matched no files under %s; a glob is matched "
+            .. "against the path from the root, so subdirectories need a "
+            .. "\"**/\" prefix (\"**/*.ts\", \"**/schemas.ts\")"):format(glob, rel_path(root))
+    end
+    return paths
+end
+
 local function ts_query(args)
     local qstr = args.query
     if type(qstr) ~= "string" or qstr == "" then
@@ -418,16 +628,14 @@ local function ts_query(args)
     for _, f in ipairs(args.files or {}) do
         files[#files + 1] = f
     end
+    local glob_note
     if type(args.glob) == "string" and args.glob ~= "" then
-        if type(args.root) ~= "string" or args.root == "" then
-            err("glob needs the project root; pass explicit files instead")
-        end
-        for _, f in ipairs(vim.fn.globpath(args.root, args.glob, true, true)) do
-            files[#files + 1] = f
-        end
+        local paths, why = expand_glob(args.root, args.glob)
+        glob_note = why
+        vim.list_extend(files, paths)
     end
     if #files == 0 then
-        err("no files to search: pass files (array of paths) and/or glob")
+        err("%s", glob_note or "no files to search: pass files (array of paths) and/or glob")
     end
     if #files > MAX_QUERY_FILES then
         files = vim.list_slice(files, 1, MAX_QUERY_FILES)
@@ -588,6 +796,9 @@ local MAP_TEXT_MAX = 80
 -- declarations cannot blank out the rest of the map.
 local MAP_FILE_MIN = 8
 local MAP_FILE_MAX = 60
+-- How far into a container declaration the map goes. One level turns
+-- "class Flask(App):" into that class and its methods; deeper is skim's job.
+local MAP_MAX_DEPTH = 1
 
 local MAX_MAP_FILE_BYTES = 2 * 1024 * 1024
 
@@ -630,10 +841,13 @@ local function top_level_outline(path, budget, missing)
         return nil, #lines
     end
     local out, extra = {}, 0
-    -- Emit declaration-shaped nodes but never descend into them: only the
-    -- top level of each file, which is what a first look needs. Past the
+    -- Emit declaration-shaped nodes, descending one level into the ones that
+    -- hold other declarations. Stopping at the top level suits Go, where
+    -- methods are top-level anyway, but it reduces a 1600-line Python module
+    -- to "class Flask(App):" - true, and no use to anyone. One level in, a
+    -- class lists its methods and the map is worth reading again. Past the
     -- budget, keep counting so the entry can say how much was left out.
-    local function walk(node)
+    local function walk(node, depth)
         for child in node:iter_children() do
             if child:named() then
                 local ctype = child:type()
@@ -646,15 +860,18 @@ local function top_level_outline(path, budget, missing)
                         if #text > MAP_TEXT_MAX then
                             text = text:sub(1, MAP_TEXT_MAX) .. "…"
                         end
-                        out[#out + 1] = ("%d: %s"):format(srow + 1, text)
+                        out[#out + 1] = ("%s%d: %s"):format(("  "):rep(depth), srow + 1, text)
+                    end
+                    if depth < MAP_MAX_DEPTH and ts_container(ctype) then
+                        walk(child, depth + 1)
                     end
                 elseif not ts_opaque(ctype) then
-                    walk(child)
+                    walk(child, depth)
                 end
             end
         end
     end
-    walk(trees[1]:root())
+    walk(trees[1]:root(), 0)
     if extra > 0 then
         out[#out + 1] = ("… +%d more declarations (skim the file for all of them)"):format(extra)
     end
@@ -848,6 +1065,53 @@ local function symbol_match_rank(name, query)
     return 4
 end
 
+-- Open the most central source file of each language a server is running
+-- for, so the server has the project's real configuration in view. Returns
+-- true when something new was opened and it is worth asking again. Done at
+-- most once per root: the buffers stay loaded afterwards.
+local warmed_roots = {}
+
+local function warm_up_project(root)
+    if warmed_roots[root] then
+        return false
+    end
+    warmed_roots[root] = true
+    local served = {}
+    for _, client in ipairs(vim.lsp.get_clients()) do
+        for _, ft in ipairs(client.config and client.config.filetypes or {}) do
+            served[ft] = true
+        end
+    end
+    if not next(served) then
+        return false
+    end
+    local sample, ext_cache = {}, {}
+    for _, rel in ipairs(project_files(root)) do
+        local ext = rel:match("%.([%w_]+)$") or rel
+        local ft = ext_cache[ext]
+        if ft == nil then
+            ft = vim.filetype.match({ filename = rel }) or false
+            ext_cache[ext] = ft
+        end
+        if ft and served[ft] and better_sample(sample[ft], rel) then
+            sample[ft] = rel
+        end
+    end
+    local opened = false
+    for _, rel in pairs(sample) do
+        if pcall(load_buf, root .. "/" .. rel) then
+            opened = true
+        end
+    end
+    if opened then
+        sleep(FRESH_RETRY_MS)
+    end
+    return opened
+end
+
+-- Defined after the symbol index it reads; see below.
+local fallback_symbol_search
+
 local function workspace_symbols(args)
     local query = args.query
     if type(query) ~= "string" then
@@ -860,36 +1124,61 @@ local function workspace_symbols(args)
         end
         return file == root or file:sub(1, #root + 1) == root .. "/"
     end
-    local inside, outside, seen_client = {}, {}, false
-    for _, client in ipairs(vim.lsp.get_clients()) do
-        if client:supports_method("workspace/symbol") then
-            local bufnr = next(client.attached_buffers or {})
-            if bufnr then
-                seen_client = true
-                local result = request(client, bufnr, "workspace/symbol", { query = query })
-                for _, s in ipairs(result or {}) do
-                    local loc = s.location or {}
-                    local file = loc.uri and vim.uri_to_fname(loc.uri) or nil
-                    local item = {
-                        name = s.name,
-                        kind = symbol_kind(s.kind),
-                        file = file,
-                        line = loc.range and (loc.range.start.line + 1) or nil,
-                        container = s.containerName,
-                        server = client.name,
-                        rank = symbol_match_rank(s.name or "", query),
-                    }
-                    if in_root(file) or not root then
-                        inside[#inside + 1] = item
-                    else
-                        outside[#outside + 1] = item
+    local inside, outside, seen_client, warming
+    local function collect()
+        inside, outside, seen_client, warming = {}, {}, false, false
+        for _, client in ipairs(vim.lsp.get_clients()) do
+            if client:supports_method("workspace/symbol") then
+                local bufnr = next(client.attached_buffers or {})
+                if bufnr then
+                    seen_client = true
+                    if fresh_buf(bufnr) then warming = true end
+                    local result = request(client, bufnr, "workspace/symbol", { query = query })
+                    for _, s in ipairs(result or {}) do
+                        local loc = s.location or {}
+                        local file = loc.uri and vim.uri_to_fname(loc.uri) or nil
+                        local item = {
+                            name = s.name,
+                            kind = symbol_kind(s.kind),
+                            file = file,
+                            line = loc.range and (loc.range.start.line + 1) or nil,
+                            container = s.containerName,
+                            server = client.name,
+                            rank = symbol_match_rank(s.name or "", query),
+                        }
+                        if in_root(file) or not root then
+                            inside[#inside + 1] = item
+                        else
+                            outside[#outside + 1] = item
+                        end
                     end
                 end
             end
         end
     end
+    collect()
+    -- An empty list is the same answer as "that symbol does not exist", so
+    -- before believing it, rule out the two ways a server can be answering
+    -- about less than the whole project: it may still be indexing, or it
+    -- may never have been shown a file central enough to work out what the
+    -- project is (tsserver builds its program from the files it is given,
+    -- so one bench script gets you a one-file program).
+    if #inside == 0 and warming then
+        sleep(FRESH_RETRY_MS)
+        collect()
+    end
+    local from_files
+    if #inside == 0 and root then
+        if warm_up_project(root) then
+            collect()
+        end
+        if #inside == 0 then
+            from_files = fallback_symbol_search(root, query)
+        end
+    end
     if not seen_client then
-        err("no active LSP client supports workspace/symbol")
+        err("no active LSP client supports workspace/symbol; open a file of "
+            .. "that language first (find_symbol, read_file) so its server starts")
     end
     local function by_rank(a, b)
         if a.rank ~= b.rank then
@@ -905,23 +1194,40 @@ local function workspace_symbols(args)
         item.rank = nil
         out[#out + 1] = item
     end
+    -- Library and runtime hits are only worth their tokens when the project
+    -- itself has nothing to offer. Asking for a project symbol and getting
+    -- ten results from go/pkg/mod under the four real ones is noise.
     local external = 0
-    for _, item in ipairs(outside) do
-        if #out >= MAX_LOCATIONS or external >= MAX_EXTERNAL_SYMBOLS then break end
-        item.rank = nil
-        item.external = true
-        out[#out + 1] = item
-        external = external + 1
+    if #inside == 0 then
+        for _, item in ipairs(outside) do
+            if #out >= MAX_LOCATIONS or external >= MAX_EXTERNAL_SYMBOLS then break end
+            item.rank = nil
+            item.external = true
+            out[#out + 1] = item
+            external = external + 1
+        end
     end
     local note
     if #outside > external then
-        note = ("%d more matches outside the project (libraries, runtime) omitted")
+        note = ("%d matches outside the project (libraries, runtime) not listed")
             :format(#outside - external)
     end
-    if #inside == 0 and root then
-        note = "no match inside the project" .. (note and ("; " .. note) or "")
+    local project_matches = #inside
+    if #inside == 0 and from_files and #from_files > 0 then
+        for i, item in ipairs(from_files) do
+            if i > MAX_LOCATIONS then break end
+            table.insert(out, i, item)
+        end
+        project_matches = math.min(#from_files, MAX_LOCATIONS)
+        note = "found by reading the project's files: the language server's "
+            .. "index did not have them (it covers the files it has been shown)"
+            .. (note and ("; " .. note) or "")
+    elseif #inside == 0 and root then
+        note = "no match inside the project (find_symbol and grep search the "
+            .. "files directly and do not depend on the server's index)"
+            .. (note and ("; " .. note) or "")
     end
-    return { count = #out, project_matches = #inside, symbols = out, note = note }
+    return { count = #out, project_matches = project_matches, symbols = out, note = note }
 end
 
 -- Titles of the code actions available for one diagnostic, so the agent
@@ -1028,7 +1334,8 @@ local function diagnostics(args)
         diagnostics = out,
         note = total > 0
             and "quick_fixes lists code actions the language server can apply for you: "
-            .. "use code_actions + apply_code_action at that line instead of editing by hand"
+            .. "call code_actions with this file and line (the col above is optional), "
+            .. "then apply_code_action, instead of editing by hand"
             or nil,
     }
 end
@@ -1279,18 +1586,21 @@ local function run_lint_command(template, bufnr, root, timeout_ms)
     return { command = cmd, exit = result.code, output = lines }
 end
 
+-- bufnr is nil after delete_file: there is no buffer left to report on, but
+-- the project-wide diagnostic diff below is exactly what the caller wants
+-- to see (what did removing this file break?), so the report still runs.
 local function post_edit_report(bufnr, before, root, headless, opts)
     opts = opts or post_edit_options()
-    local ft = vim.bo[bufnr].filetype
+    local ft = bufnr and vim.bo[bufnr].filetype or ""
     -- Kick nvim-lint before waiting so its diagnostics join the same report.
-    if opts.nvim_lint then
+    if opts.nvim_lint and bufnr then
         local okl, lint = pcall(require, "lint")
         if okl and type(lint.try_lint) == "function"
             and lint.linters_by_ft and lint.linters_by_ft[ft] then
             pcall(lint.try_lint)
         end
     end
-    local attached = #vim.lsp.get_clients({ bufnr = bufnr }) > 0
+    local attached = bufnr ~= nil and #vim.lsp.get_clients({ bufnr = bufnr }) > 0
     if attached then
         wait_for_diagnostics(bufnr, opts.wait_ms, 300)
     end
@@ -1301,13 +1611,13 @@ local function post_edit_report(bufnr, before, root, headless, opts)
     if not template or template == "" then
         template = opts.commands and opts.commands[ft]
     end
-    if type(template) == "string" and template ~= "" then
+    if bufnr and type(template) == "string" and template ~= "" then
         -- A shell linter reads the disk. Headless edits are saved anyway
         -- (the bridge does it after the call), so write now; in a live
         -- editor the user's buffer is theirs to save, so lint only if it
         -- is already clean on disk.
         if headless then
-            pcall(vim.api.nvim_buf_call, bufnr, function() vim.cmd("silent write") end)
+            write_buf(bufnr)
         end
         if not vim.bo[bufnr].modified then
             report.lint = run_lint_command(template, bufnr, root, opts.lint_timeout_ms)
@@ -1352,8 +1662,11 @@ local function post_edit_report(bufnr, before, root, headless, opts)
         new_elsewhere = vim.list_slice(new_elsewhere, 1, 10)
         new_elsewhere[#new_elsewhere + 1] = ("… +%d more"):format(extra)
     end
-    if not attached then
+    if not attached and bufnr then
         report.diagnostics_after = "no language server attached to this file; nothing checked"
+    elseif not bufnr then
+        report.diagnostics_after = #new_elsewhere == 0
+            and "no new errors elsewhere in the project" or nil
     elseif #new_here == 0 then
         report.diagnostics_after = "no new errors or warnings"
     else
@@ -1486,7 +1799,18 @@ local action_token = 0
 local function code_actions(args)
     local bufnr = load_buf(args.file)
     local client = get_client(bufnr, "textDocument/codeAction")
-    local pos = make_position(bufnr, client, args.line, args.symbol, args.col)
+    -- Every other position tool needs a column because it has to land on one
+    -- particular name. Code actions do not: they are asked for over a range,
+    -- and the range that matters is the line a diagnostic was reported on.
+    -- So when neither symbol nor col is given, take the whole line - that is
+    -- what "code actions at that line" is supposed to mean.
+    local col, symbol = args.col, args.symbol
+    if col == nil and (symbol == nil or symbol == "") then
+        local text = vim.api.nvim_buf_get_lines(bufnr, (tonumber(args.line) or 1) - 1,
+            (tonumber(args.line) or 1), false)[1] or ""
+        col = (text:find("%S") or 1)
+    end
+    local pos = make_position(bufnr, client, args.line, symbol, col)
     local lsp_diags = {}
     pcall(function()
         lsp_diags = vim.lsp.diagnostic.from(
@@ -1726,24 +2050,66 @@ local function lsp_index(bufnr)
     return entries
 end
 
+-- The treesitter index deliberately only keeps declarations that carry a
+-- body - functions, classes, types. That leaves out the named constants and
+-- module-level variables an agent does have to find and edit: Go's MIME
+-- string table, a TypeScript exported regex, a Python module default. The
+-- language server lists those in its document symbols, so fold in the ones
+-- treesitter had no node for.
+--
+-- Returns the entries and whether the server actually answered, so that a
+-- result assembled without it is not cached as if it were complete.
+local function merge_lsp_only_symbols(entries, bufnr)
+    if #enabled_lsp_configs_for(vim.bo[bufnr].filetype) == 0 then
+        return entries, true -- nothing will ever attach; this is as good as it gets
+    end
+    if not pcall(get_client, bufnr, "textDocument/documentSymbol", ATTACH_TIMEOUT_MS) then
+        return entries, false
+    end
+    local from_lsp = lsp_index(bufnr)
+    if not from_lsp or #from_lsp == 0 then
+        return entries, false
+    end
+    local covered = {}
+    for _, e in ipairs(entries) do
+        covered[e.name] = true
+    end
+    for _, e in ipairs(from_lsp) do
+        if not covered[e.name] then
+            entries[#entries + 1] = e
+            covered[e.name] = true
+        end
+    end
+    table.sort(entries, function(a, b)
+        if a.first ~= b.first then return a.first < b.first end
+        return (a.path or "") < (b.path or "")
+    end)
+    return entries, true
+end
+
 local function symbol_index(bufnr)
     local tick = vim.api.nvim_buf_get_changedtick(bufnr)
     local cached = index_cache[bufnr]
-    if cached and cached.tick == tick then
+    if cached and cached.tick == tick and cached.complete then
         return cached.entries
     end
-    local entries
+    local entries, complete
     if PREFER_LSP_OUTLINE[vim.bo[bufnr].filetype] then
         -- Same reasoning as skim: clangd's symbols beat the C/C++ grammar.
         entries = lsp_index(bufnr)
+        complete = entries ~= nil and #entries > 0
     end
     if not entries or #entries == 0 then
         entries = ts_index(bufnr)
+        if entries and #entries > 0 then
+            entries, complete = merge_lsp_only_symbols(entries, bufnr)
+        end
     end
     if not entries or #entries == 0 then
         entries = lsp_index(bufnr) or {}
+        complete = #entries > 0
     end
-    index_cache[bufnr] = { tick = tick, entries = entries }
+    index_cache[bufnr] = { tick = tick, entries = entries, complete = complete }
     return entries
 end
 
@@ -1776,6 +2142,55 @@ local MAX_BODY_LINES = 200
 -- Body lines are numbered RELATIVE to the symbol (declaration = 1), matching
 -- the addressing of replace_symbol_lines; the absolute file range is in the
 -- accompanying `lines` field.
+-- Search the project's own files for a symbol, without asking a server.
+--
+-- Some servers only index the files they have been handed - tsserver builds
+-- its program from open files, so workspace/symbol in a large repository
+-- answers about a fraction of it and reports the rest as "no match", which
+-- is indistinguishable from the symbol not existing. Grep for the name to
+-- find candidate files, then read their real symbol index, so the answer is
+-- about the project rather than about what the server happens to know.
+local FALLBACK_MAX_FILES = 25
+
+function fallback_symbol_search(root, query)
+    if vim.fn.executable("rg") == 0 then
+        return {}
+    end
+    local files = vim.fn.systemlist({
+        "rg", "--files-with-matches", "--fixed-strings", "--max-count", "1",
+        "--sort", "path", "--", query, root,
+    })
+    if vim.v.shell_error > 1 then
+        return {}
+    end
+    local found = {}
+    for i, path in ipairs(files) do
+        if i > FALLBACK_MAX_FILES then break end
+        local okb, bufnr = pcall(load_buf, path)
+        if okb then
+            for _, entry in ipairs(symbol_index(bufnr)) do
+                if match_rank(entry, query) then
+                    found[#found + 1] = {
+                        name = entry.name,
+                        kind = entry.kind,
+                        file = rel_path(path),
+                        line = entry.first,
+                        container = entry.path ~= entry.name and entry.path or nil,
+                        server = "agent99 (project files)",
+                        rank = symbol_match_rank(entry.name or "", query),
+                    }
+                end
+            end
+        end
+    end
+    table.sort(found, function(a, b)
+        if a.rank ~= b.rank then return a.rank < b.rank end
+        return (a.name or "") < (b.name or "")
+    end)
+    for _, item in ipairs(found) do item.rank = nil end
+    return found
+end
+
 local function symbol_body(bufnr, entry)
     local last = math.min(entry.last, entry.first + MAX_BODY_LINES - 1)
     local lines = vim.api.nvim_buf_get_lines(bufnr, entry.first - 1, last, false)
@@ -1802,14 +2217,14 @@ local function find_symbol(args)
     for _, f in ipairs(args.files or {}) do
         files[#files + 1] = f
     end
+    local glob_note
     if type(args.glob) == "string" and args.glob ~= "" then
-        if type(args.root) ~= "string" or args.root == "" then
-            err("glob needs the project root; pass explicit files instead")
-        end
-        vim.list_extend(files, vim.fn.globpath(args.root, args.glob, true, true))
+        local paths, why = expand_glob(args.root, args.glob)
+        glob_note = why
+        vim.list_extend(files, paths)
     end
     if #files == 0 then
-        err("no files to search: pass file, files, or glob")
+        err("%s", glob_note or "no files to search: pass file, files, or glob")
     end
     if #files > MAX_QUERY_FILES then
         files = vim.list_slice(files, 1, MAX_QUERY_FILES)
@@ -2044,14 +2459,16 @@ local function undo_edit(args)
     local undone, refused = edits.undo_last(count)
     local out = {}
     for _, e in ipairs(undone) do
-        local item = { file = e.file, symbol = e.name_path, kind = e.kind }
-        if #e.old_lines == 0 then
+        local item = { file = rel_path(e.file), symbol = e.name_path, kind = e.kind }
+        if e.file_op then
+            item.reversed = e.kind
+        elseif #e.old_lines == 0 then
             item.removed_lines = ("%d-%d"):format(e.first, e.first + e.new_count - 1)
         else
             item.restored_lines = ("%d-%d"):format(e.first, e.first + #e.old_lines - 1)
         end
         out[#out + 1] = item
-        last_bufnr = e.bufnr
+        last_bufnr = e.bufnr or last_bufnr
     end
     local result = { undone = out, remaining = edits.count() }
     if #refused > 0 then
@@ -2124,11 +2541,11 @@ local function check_project(args)
     local timeout = (okc and config.options and config.options.post_edit
         and config.options.post_edit.check_timeout_ms) or 5 * 60 * 1000
     -- Shell linters read the disk: flush what the tools changed first.
+    local unsaved
     if args.headless then
-        for _, b in ipairs(vim.api.nvim_list_bufs()) do
-            if vim.bo[b].modified and vim.bo[b].buftype == "" then
-                pcall(vim.api.nvim_buf_call, b, function() vim.cmd("silent write") end)
-            end
+        local failures = M.save_all()
+        if #failures > 0 then
+            unsaved = failures
         end
     end
     local started = vim.uv.now()
@@ -2143,6 +2560,7 @@ local function check_project(args)
     local out = {
         command = cmd, guessed = guessed or nil, exit = result.code,
         seconds = math.floor((vim.uv.now() - started) / 100) / 10,
+        unsaved = unsaved,
     }
     local key = root .. "\0" .. cmd
     local base = check_baseline[key]
@@ -2259,6 +2677,272 @@ local function rename_symbol(args)
         post_edit_report(bufnr, before, args.root, args.headless))
     result.note = edit_note(args)
     return result
+end
+
+-- File lifecycle: create, move, delete.
+--
+-- These exist so that a refactor does not have to leave the editor halfway
+-- through. Adding a file, splitting a module, renaming one - doing those
+-- with a shell means the language servers never hear about it, and the very
+-- next symbol tool is working from a stale picture of the project.
+--
+-- The interesting one is move_file. The LSP file-operation requests let a
+-- server rewrite the project before and after the move, which is how the
+-- import paths in every file that referenced the old name get fixed. Doing
+-- the same move with `mv` leaves the agent to find and repair them by hand.
+
+local FILE_OP_CAPABILITY = {
+    ["workspace/willCreateFiles"] = "willCreate",
+    ["workspace/didCreateFiles"] = "didCreate",
+    ["workspace/willRenameFiles"] = "willRename",
+    ["workspace/didRenameFiles"] = "didRename",
+    ["workspace/willDeleteFiles"] = "willDelete",
+    ["workspace/didDeleteFiles"] = "didDelete",
+}
+
+local function file_op_clients(method)
+    local key = FILE_OP_CAPABILITY[method]
+    local out = {}
+    for _, client in ipairs(vim.lsp.get_clients()) do
+        local workspace = (client.server_capabilities or {}).workspace or {}
+        if (workspace.fileOperations or {})[key] then
+            out[#out + 1] = client
+        end
+    end
+    return out
+end
+
+-- Tell every interested server that files appeared, moved or went away.
+local function notify_file_operation(method, files)
+    for _, client in ipairs(file_op_clients(method)) do
+        pcall(function() client:notify(method, { files = files }) end)
+    end
+end
+
+-- Ask the servers what else has to change for this operation, and apply it.
+-- Returns the list of files touched, so the caller can report and record it.
+local function apply_will_file_operation(method, files)
+    local touched = {}
+    for _, client in ipairs(file_op_clients(method)) do
+        local ok, edit = pcall(request, client, nil, method, { files = files })
+        if ok and edit and (edit.changes or edit.documentChanges) then
+            local affected = summarize_workspace_edit(edit)
+            local snaps = {}
+            for _, f in ipairs(affected) do
+                local okb, b = pcall(load_buf, f.file)
+                if okb then
+                    snaps[#snaps + 1] = { bufnr = b, file = f.file,
+                        old = vim.api.nvim_buf_get_lines(b, 0, -1, false) }
+                end
+            end
+            vim.lsp.util.apply_workspace_edit(edit, client.offset_encoding)
+            for _, snap in ipairs(snaps) do
+                local new = vim.api.nvim_buf_get_lines(snap.bufnr, 0, -1, false)
+                record_edit(snap.bufnr, method, "file_operation", 1, #snap.old, snap.old, new)
+            end
+            vim.list_extend(touched, affected)
+        end
+    end
+    return touched
+end
+
+local function file_uri(path)
+    return vim.uri_from_fname(path)
+end
+
+-- Resolve a path argument for a tool that is about to create something, so
+-- unlike load_buf it must accept a path that does not exist yet.
+local function resolve_new_path(value, what)
+    if type(value) ~= "string" or value == "" then
+        err("missing required argument: %s", what)
+    end
+    return vim.fn.fnamemodify(value, ":p"):gsub("/$", "")
+end
+
+-- Drop a buffer for a file that is no longer there (or is now somewhere
+-- else), so nothing later reads or writes it by accident.
+local function forget_buf(path)
+    for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(bufnr)
+            and vim.api.nvim_buf_get_name(bufnr) == path then
+            pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+        end
+    end
+end
+
+local function create_file(args)
+    local path = resolve_new_path(args.file, "file")
+    if vim.uv.fs_stat(path) then
+        err("%s already exists; edit it with the symbol tools, or delete it first",
+            rel_path(path))
+    end
+    local text = args.text
+    if text ~= nil and type(text) ~= "string" then
+        err("text must be a string")
+    end
+    local dir = vim.fn.fnamemodify(path, ":h")
+    if vim.fn.isdirectory(dir) == 0 and vim.fn.mkdir(dir, "p") == 0 then
+        err("could not create the directory %s", rel_path(dir))
+    end
+    local files = { { uri = file_uri(path) } }
+    apply_will_file_operation("workspace/willCreateFiles", files)
+    local lines = vim.split((text or ""):gsub("\n$", ""), "\n", { plain = true })
+    if vim.fn.writefile(lines, path) ~= 0 then
+        err("could not write %s", rel_path(path))
+    end
+    notify_file_operation("workspace/didCreateFiles", files)
+
+    local before = diag_snapshot()
+    local bufnr = load_buf(path)
+    settle_before_edit(bufnr)
+    local opts = post_edit_options()
+    local _, _, done = polish_after_edit(bufnr, 1, #lines, opts)
+    if args.headless then
+        write_buf(bufnr)
+    end
+    require("agent99.edits").record_file_op({
+        file = path,
+        kind = "create_file",
+        undo = function()
+            local now = vim.uv.fs_stat(path)
+            if not now then
+                return "the file is already gone"
+            end
+            forget_buf(path)
+            if vim.fn.delete(path) ~= 0 then
+                return "could not delete it"
+            end
+            notify_file_operation("workspace/didDeleteFiles", files)
+            return nil
+        end,
+    })
+
+    local result = { created = rel_path(path), lines = #lines, note = edit_note(args) }
+    if #done > 0 then
+        result.polished = table.concat(done, ", ")
+    end
+    return vim.tbl_extend("force", result,
+        post_edit_report(bufnr, before, args.root, args.headless, opts))
+end
+
+local function move_file(args)
+    local from = resolve_new_path(args.from, "from")
+    local to = resolve_new_path(args.to, "to")
+    if not vim.uv.fs_stat(from) then
+        err("%s does not exist", rel_path(from))
+    end
+    if vim.uv.fs_stat(to) then
+        err("%s already exists; delete it first or pick another name", rel_path(to))
+    end
+    -- Moving onto a path whose directory is missing is a common way to ask
+    -- for a new package; make it rather than fail.
+    local dir = vim.fn.fnamemodify(to, ":h")
+    if vim.fn.isdirectory(dir) == 0 and vim.fn.mkdir(dir, "p") == 0 then
+        err("could not create the directory %s", rel_path(dir))
+    end
+
+    local files = { { oldUri = file_uri(from), newUri = file_uri(to) } }
+    local before = diag_snapshot()
+    -- Ask first: this is where a server rewrites the imports that name the
+    -- old path. It has to happen while the file is still at the old one.
+    local touched = apply_will_file_operation("workspace/willRenameFiles", files)
+    if args.headless then
+        M.save_all()
+    end
+    forget_buf(from)
+    local okm, e = vim.uv.fs_rename(from, to)
+    if not okm then
+        err("could not move %s to %s: %s", rel_path(from), rel_path(to), tostring(e))
+    end
+    notify_file_operation("workspace/didRenameFiles", files)
+
+    require("agent99.edits").record_file_op({
+        file = to,
+        kind = "move_file",
+        undo = function()
+            if not vim.uv.fs_stat(to) then
+                return "the moved file is no longer there"
+            end
+            if vim.uv.fs_stat(from) then
+                return "something else now occupies the original path"
+            end
+            forget_buf(to)
+            local ok = vim.uv.fs_rename(to, from)
+            if not ok then
+                return "could not move it back"
+            end
+            notify_file_operation("workspace/didRenameFiles",
+                { { oldUri = file_uri(to), newUri = file_uri(from) } })
+            return nil
+        end,
+    })
+
+    local bufnr = load_buf(to)
+    settle_before_edit(bufnr)
+    local result = {
+        moved = rel_path(from), to = rel_path(to), note = edit_note(args),
+    }
+    if #touched > 0 then
+        result.updated_by_server = touched
+        result.updated_note = "the language server rewrote references to the old path"
+    end
+    return vim.tbl_extend("force", result,
+        post_edit_report(bufnr, before, args.root, args.headless))
+end
+
+local function delete_file(args)
+    local path = resolve_new_path(args.file, "file")
+    local stat = vim.uv.fs_stat(path)
+    if not stat then
+        err("%s does not exist", rel_path(path))
+    end
+    if stat.type == "directory" then
+        err("%s is a directory; this tool deletes one file at a time", rel_path(path))
+    end
+    local okr, contents = pcall(vim.fn.readfile, path, "b")
+    if not okr then
+        err("could not read %s before deleting it", rel_path(path))
+    end
+
+    local files = { { uri = file_uri(path) } }
+    local before = diag_snapshot()
+    local touched = apply_will_file_operation("workspace/willDeleteFiles", files)
+    if args.headless then
+        M.save_all()
+    end
+    forget_buf(path)
+    if vim.fn.delete(path) ~= 0 then
+        err("could not delete %s", rel_path(path))
+    end
+    notify_file_operation("workspace/didDeleteFiles", files)
+
+    require("agent99.edits").record_file_op({
+        file = path,
+        kind = "delete_file",
+        undo = function()
+            if vim.uv.fs_stat(path) then
+                return "something else now occupies that path"
+            end
+            local okw, wrote = pcall(vim.fn.writefile, contents, path, "b")
+            if not okw or wrote ~= 0 then
+                return "could not write the contents back"
+            end
+            notify_file_operation("workspace/didCreateFiles", files)
+            return nil
+        end,
+    })
+
+    local result = {
+        deleted = rel_path(path), lines = #contents, note = edit_note(args),
+        restorable = "undo_edit puts it back with its contents",
+    }
+    if #touched > 0 then
+        result.updated_by_server = touched
+    end
+    -- No buffer left to report against, so report the project-wide picture.
+    local report = post_edit_report(nil, before, args.root, args.headless)
+    report.file = nil
+    return vim.tbl_extend("force", result, report)
 end
 
 -- First line of the contiguous comment block directly above a line, for
@@ -2409,16 +3093,7 @@ local function workspace_support(args)
     if type(root) ~= "string" or root == "" then
         err("missing project root")
     end
-    local files = vim.fn.systemlist({ "git", "-C", root,
-        "ls-files", "--cached", "--others", "--exclude-standard" })
-    if vim.v.shell_error ~= 0 then
-        files = {}
-        for _, f in ipairs(vim.fn.globpath(root, "**/*", true, true)) do
-            if vim.fn.isdirectory(f) == 0 then
-                files[#files + 1] = f:sub(#root + 2)
-            end
-        end
-    end
+    local files = project_files(root)
     local by_ft, sample, ext_cache = {}, {}, {}
     for _, rel in ipairs(files) do
         local ext = rel:match("%.([%w_]+)$") or rel
@@ -2429,7 +3104,9 @@ local function workspace_support(args)
         end
         if ft then
             by_ft[ft] = (by_ft[ft] or 0) + 1
-            sample[ft] = sample[ft] or rel
+            if better_sample(sample[ft], rel) then
+                sample[ft] = rel
+            end
         end
     end
     local fts = vim.tbl_keys(by_ft)
@@ -2898,6 +3575,9 @@ local dispatch_table = {
     insert_before_symbol = insert_symbol_tool("before"),
     undo_edit = undo_edit,
     rename_symbol = rename_symbol,
+    create_file = create_file,
+    move_file = move_file,
+    delete_file = delete_file,
     check_project = check_project,
     enclosing_symbols = enclosing_symbols,
     -- Internal: the bridge reports a disk read so the code window can follow.

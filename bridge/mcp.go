@@ -212,7 +212,12 @@ func callMCPTool(name string, arguments map[string]any) map[string]any {
 	}
 	if editTools[name] && !embeddedMode() {
 		if err := headlessSaveAll(); err != nil {
-			out += "\n\nWarning: edit applied in the editor but " + err.Error()
+			// The tool's own reply says the edit was saved, because in a
+			// headless workspace it normally is. It was not, so this has
+			// to come back as a failure rather than a footnote under a
+			// success: nothing reached the disk.
+			return textResult("Error: the edit was applied in the editor but not saved: "+
+				err.Error()+"\n\nThe reply below describes an edit that is not on disk.\n\n"+out, true)
 		}
 	}
 	return textResult(out, false)

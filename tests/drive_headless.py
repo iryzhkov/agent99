@@ -204,10 +204,63 @@ def main():
         res = b.call("find_symbol", {"file": "lua/testproj/util.lua", "name": "M.greet"})
         check("relative path resolves in root", res.get("count") == 1, res)
 
+        # A glob that matched nothing says so, and says why, instead of
+        # claiming no files were passed at all.
+        try:
+            b.call("find_symbol", {"name": "M.greet", "glob": "nosuch/**/*.lua"})
+            check("empty glob explains itself", False, "call succeeded")
+        except RuntimeError as e:
+            check("empty glob explains itself",
+                  "matched no files" in str(e) and "**/" in str(e), e)
+        # A bare filename reads as "wherever it lives", not "in the root".
+        res = b.call("find_symbol", {"name": "M.greet", "glob": "util.lua"})
+        check("bare filename glob searches subdirectories", res.get("count") == 1, res)
+
+        # A file changed behind the editor's back is picked up rather than
+        # written over. This is the case that used to hang the RPC channel
+        # on nvim's "write anyway?" prompt and silently drop the edit.
+        with open(util) as f:
+            before_external = f.read()
+        with open(util, "w") as f:
+            f.write("-- external edit\n" + before_external)
+        res = b.call("find_symbol", {"file": util, "name": "M.greet"})
+        check("external change is picked up",
+              res.get("count") == 1
+              and res["matches"][0]["lines"].startswith("7"), res)
+        res = b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet", "first_line": 1, "last_line": 1,
+            "text": "function M.greet(name)",
+        })
+        with open(util) as f:
+            after_edit = f.read()
+        check("edit after external change keeps it",
+              "-- external edit" in after_edit and "note" in res, res)
+        with open(util, "w") as f:
+            f.write(before_external)
+
         # File tools run in-process, rooted at the workspace.
         reply = b.rpc("tools/call", {"name": "grep", "arguments": {"pattern": "M.greet"}})
         text = reply["result"]["content"][0]["text"]
         check("grep annotated", "util.lua:" in text and "[M.greet" in text, text)
+        # A path glob is matched against the path from the root, so a
+        # directory prefix has to work the way it reads.
+        reply = b.rpc("tools/call", {"name": "grep", "arguments": {
+            "pattern": "M.greet", "glob": "lua/**/*.lua", "context": 0}})
+        text = reply["result"]["content"][0]["text"]
+        check("grep path glob matches", "util.lua:" in text and text.startswith("/"), text)
+        reply = b.rpc("tools/call", {"name": "grep", "arguments": {
+            "pattern": "M.greet", "glob": "nosuch/**/*.lua", "context": 0}})
+        check("grep path glob excludes",
+              reply["result"]["content"][0]["text"] == "(no matches)", reply)
+
+        # list_files takes the same globs and leaves binaries out.
+        reply = b.rpc("tools/call", {"name": "list_files", "arguments": {"glob": "lua/**/*.lua"}})
+        text = reply["result"]["content"][0]["text"]
+        check("list_files glob", "lua/testproj/util.lua" in text and "tool.zig" not in text, text)
+        reply = b.rpc("tools/call", {"name": "list_files", "arguments": {}})
+        text = reply["result"]["content"][0]["text"]
+        check("list_files hides binaries",
+              "blob.bin" not in text and "not listed" in text, text)
         # A single-file target keeps the filename, so hits stay annotated.
         reply = b.rpc("tools/call", {"name": "grep", "arguments": {
             "pattern": "M.greet", "path": "lua/testproj/util.lua", "context": 0}})
@@ -241,6 +294,47 @@ def main():
                 break
             time.sleep(0.1)
         check("edit autosaved to disk", '.. "!"' in on_disk, on_disk)
+
+        # File lifecycle: create, move, delete, each undoable. (Whether the
+        # new file comes back reformatted depends on the language having a
+        # formatter, which the minimal config's lua_ls does not; the Go and
+        # TypeScript servers do reformat and re-import it.)
+        added = os.path.join(root, "lua", "testproj", "nested", "extra.lua")
+        moved = os.path.join(root, "lua", "testproj", "renamed.lua")
+        res = b.call("create_file", {
+            "file": added,
+            "text": "local M = {}\nfunction M.two()\n    return 2\nend\nreturn M\n",
+        })
+        with open(added) as f:
+            created_text = f.read()
+        check("create_file writes, making parent directories",
+              res.get("created", "").endswith("extra.lua")
+              and "function M.two()" in created_text, res)
+        try:
+            b.call("create_file", {"file": added, "text": "x"})
+            check("create_file refuses to overwrite", False, "call succeeded")
+        except RuntimeError as e:
+            check("create_file refuses to overwrite", "already exists" in str(e), e)
+        # A new file has to be visible to the symbol tools straight away.
+        res = b.call("find_symbol", {"file": added, "name": "M.two"})
+        check("created file is indexed", res.get("count") == 1, res)
+
+        res = b.call("move_file", {"from": added, "to": moved})
+        check("move_file moves",
+              os.path.exists(moved) and not os.path.exists(added), res)
+        res = b.call("delete_file", {"file": moved})
+        check("delete_file deletes",
+              not os.path.exists(moved) and res.get("lines", 0) > 0, res)
+
+        res = b.call("undo_edit", {})
+        check("undo_edit restores a deleted file",
+              os.path.exists(moved) and len(res.get("undone", [])) == 1
+              and res["undone"][0].get("reversed") == "delete_file", res)
+        res = b.call("undo_edit", {})
+        check("undo_edit reverses a move",
+              os.path.exists(added) and not os.path.exists(moved), res)
+        res = b.call("undo_edit", {})
+        check("undo_edit removes a created file", not os.path.exists(added), res)
 
         res = b.call("close_workspace", {})
         check("close_workspace", res.get("closed") is True, res)
