@@ -233,15 +233,24 @@ var lspTools = []tool{
 	},
 	{
 		Name: "check_project",
-		Description: "Run the project's whole-project check (configured, AGENT99_CHECK, or guessed: " +
-			"go vet, tsc --noEmit, cargo check, pyright) from the root. The first call in a " +
+		Description: "Run the project's whole-project check from the root. The first call in a " +
 			"root records a baseline; later calls report only new and resolved lines. Use " +
-			"after a refactor or before finishing.",
+			"after a refactor or before finishing. Without arguments it uses the configured " +
+			"command, AGENT99_CHECK, or a guess (go build+vet, tsc --noEmit, cargo check, " +
+			"pyright) - all type checks, none of which run tests. When that is the wrong gate, " +
+			"pass your own: commands=[...] runs several in turn (one per build configuration) " +
+			"and reports every failure, and remember=true makes them the default for this root.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"command": map[string]any{"type": "string", "description": "Override the check command."},
-				"reset":   map[string]any{"type": "boolean", "description": "Record a fresh baseline from this run."},
+				"command": map[string]any{"type": "string", "description": "Check command to run instead of the default."},
+				"commands": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Several commands, each run in turn; use for a project that needs checking under more than one build configuration.",
+				},
+				"remember": map[string]any{"type": "boolean", "description": "Keep this command for later check_project calls in this root, replacing the guess."},
+				"reset":    map[string]any{"type": "boolean", "description": "Record a fresh baseline from this run."},
 			},
 			"required": []string{},
 		},

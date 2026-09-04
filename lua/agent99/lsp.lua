@@ -2550,6 +2550,13 @@ local function guess_check_command(root)
     return nil
 end
 
+-- A check command the caller has chosen for this project, replacing the guess
+-- for the rest of the session. The guess cannot know that a project needs its
+-- tests run, or needs checking under a second set of build tags; whoever is
+-- working in the repository does, and should not have to repeat it on every
+-- call. Keyed by root, and lives as long as the workspace does.
+local check_override = {}
+
 local function check_project(args)
     local root = args.root
     if type(root) ~= "string" or root == "" then
@@ -2559,17 +2566,44 @@ local function check_project(args)
     local okc, config = pcall(require, "agent99.config")
     local configured = okc and config.options and config.options.post_edit
         and config.options.post_edit.check or nil
-    local cmd = args.command
-    if type(cmd) ~= "string" or cmd == "" then cmd = os.getenv("AGENT99_CHECK") end
-    if not cmd or cmd == "" then cmd = configured end
+
+    -- Explicit for this call, then whatever was remembered for this root,
+    -- then the environment, the user's config, and finally the guess.
+    local cmds
+    if type(args.commands) == "table" and #args.commands > 0 then
+        cmds = {}
+        for _, c in ipairs(args.commands) do
+            if type(c) ~= "string" or c == "" then
+                err("commands must be a list of non-empty shell commands")
+            end
+            cmds[#cmds + 1] = c
+        end
+    elseif type(args.command) == "string" and args.command ~= "" then
+        cmds = { args.command }
+    end
+    local explicit = cmds ~= nil
+    if not cmds and check_override[root] then cmds = check_override[root] end
+    local from_env = os.getenv("AGENT99_CHECK")
+    if not cmds and from_env and from_env ~= "" then cmds = { from_env } end
+    if not cmds and configured and configured ~= "" then cmds = { configured } end
     local guessed = false
-    if not cmd or cmd == "" then
-        cmd = guess_check_command(root)
-        guessed = cmd ~= nil
+    if not cmds then
+        local guess = guess_check_command(root)
+        if guess then
+            cmds = { guess }
+            guessed = true
+        end
     end
-    if not cmd then
-        err("no check command: pass command=, set AGENT99_CHECK, or post_edit.check in setup()")
+    if not cmds then
+        err("no check command: pass command= or commands=, set AGENT99_CHECK, "
+            .. "or post_edit.check in setup()")
     end
+    if explicit and args.remember then
+        check_override[root] = cmds
+    end
+    -- Only for the baseline key and the reply; the commands are run one at a
+    -- time below, not handed to a shell as one line.
+    local cmd = table.concat(cmds, " ; ")
     local timeout = (okc and config.options and config.options.post_edit
         and config.options.post_edit.check_timeout_ms) or 5 * 60 * 1000
     -- Shell linters read the disk: flush what the tools changed first.
@@ -2581,24 +2615,51 @@ local function check_project(args)
         end
     end
     local started = vim.uv.now()
-    local result = await(function(resume)
-        local ok, e = pcall(vim.system, { "sh", "-c", cmd }, {
-            cwd = root, text = true, timeout = timeout,
-        }, vim.schedule_wrap(function(r) resume(r) end))
-        if not ok then resume({ code = -1, stderr = tostring(e) }) end
-    end)
-    local text = ((result.stdout or "") .. (result.stderr or "")):gsub("%s+$", "")
-    local lines = text == "" and {} or vim.split(text, "\n", { plain = true })
+    -- Run each command in turn rather than joining them into one shell line.
+    -- Joining with ";" would report the last command's exit code and hide a
+    -- failure in an earlier one; joining with "&&" would stop at the first
+    -- failure and never check the other build configuration, which is the
+    -- main reason for passing more than one command in the first place.
+    local lines, exit, failed = {}, 0, nil
+    for _, one in ipairs(cmds) do
+        local result = await(function(resume)
+            local ok, e = pcall(vim.system, { "sh", "-c", one }, {
+                cwd = root, text = true, timeout = timeout,
+            }, vim.schedule_wrap(function(r) resume(r) end))
+            if not ok then resume({ code = -1, stderr = tostring(e) }) end
+        end)
+        local text = ((result.stdout or "") .. (result.stderr or "")):gsub("%s+$", "")
+        if #cmds > 1 and text ~= "" then
+            lines[#lines + 1] = ("$ %s"):format(one)
+        end
+        if text ~= "" then
+            vim.list_extend(lines, vim.split(text, "\n", { plain = true }))
+        end
+        if result.code ~= 0 and exit == 0 then
+            exit, failed = result.code, one
+        end
+    end
     local out = {
-        command = cmd, guessed = guessed or nil, exit = result.code,
+        command = #cmds == 1 and cmd or nil,
+        commands = #cmds > 1 and cmds or nil,
+        guessed = guessed or nil,
+        exit = exit,
+        failed_command = failed,
         seconds = math.floor((vim.uv.now() - started) / 100) / 10,
         unsaved = unsaved,
     }
+    if explicit and args.remember then
+        out.remembered = "later check_project calls in this root use this without arguments"
+    elseif not explicit and check_override[root] then
+        out.remembered = "using the command remembered for this root"
+    end
     if guessed then
         out.covers = "type and reference checking only: this does not run the tests, "
             .. "and it checks one build configuration, so code behind another build tag "
-            .. "or feature flag is not analyzed. Run the test suite yourself, and pass "
-            .. "command= (or set AGENT99_CHECK / post_edit.check) for a different gate."
+            .. "or feature flag is not analyzed. If that is the wrong gate for this "
+            .. "project, pass a better one: commands=[...] runs several (one per build "
+            .. "configuration), and remember=true makes it the default for this root "
+            .. "for the rest of the session."
     end
     local key = root .. "\0" .. cmd
     local base = check_baseline[key]
@@ -2618,7 +2679,7 @@ local function check_project(args)
         if #new > CHECK_MAX_LINES then out.new_truncated = #new - CHECK_MAX_LINES end
         out.resolved = #resolved
         if #new == 0 then
-            out.summary = result.code == 0 and "clean, nothing new since the baseline"
+            out.summary = exit == 0 and "clean, nothing new since the baseline"
                 or "nothing new since the baseline (the check still fails as it did before)"
         else
             out.summary = ("%d new lines since the baseline"):format(#new)
@@ -2628,7 +2689,7 @@ local function check_project(args)
         out.baseline = "recorded; later calls report only what changed"
         out.output = vim.list_slice(lines, 1, CHECK_MAX_LINES)
         if #lines > CHECK_MAX_LINES then out.output_truncated = #lines - CHECK_MAX_LINES end
-        if #lines == 0 and result.code == 0 then out.summary = "clean" end
+        if #lines == 0 and exit == 0 then out.summary = "clean" end
     end
     return out
 end
