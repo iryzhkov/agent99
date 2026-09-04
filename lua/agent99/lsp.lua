@@ -2544,6 +2544,26 @@ local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_o
     return vim.tbl_extend("error", fields, post_edit_report(bufnr, before, args.root, args.headless, opts))
 end
 
+-- A unified diff of what an edit would do, for the dry_run of the tools that
+-- otherwise apply immediately. rename_symbol has always been able to show its
+-- blast radius before committing to it; a large body replacement is no less
+-- worth looking at first.
+local function preview_diff(old_lines, new_lines, label)
+    local diff = vim.diff(
+        table.concat(old_lines, "\n") .. "\n",
+        table.concat(new_lines, "\n") .. "\n",
+        { result_type = "unified", ctxlen = 2 })
+    if type(diff) ~= "string" or diff == "" then
+        return { unchanged = true, note = "the replacement is identical to what is there" }
+    end
+    return {
+        dry_run = true,
+        replaced = label,
+        diff = vim.split(diff:gsub("\n$", ""), "\n", { plain = true }),
+        note = "nothing applied; call again without dry_run to make the edit",
+    }
+end
+
 local function replace_symbol_body(args)
     local bufnr, entry = resolve_symbol(args.file, args.name_path)
     if type(args.body) ~= "string" then
@@ -2551,6 +2571,11 @@ local function replace_symbol_body(args)
     end
     local new_lines = vim.split((args.body:gsub("\n+$", "")), "\n", { plain = true })
     local old = vim.api.nvim_buf_get_lines(bufnr, entry.first - 1, entry.last, false)
+    if args.dry_run then
+        return vim.tbl_extend("force",
+            { file = rel_path(vim.api.nvim_buf_get_name(bufnr)) },
+            preview_diff(old, new_lines, entry.path))
+    end
     settle_before_edit(bufnr)
     local before = diag_snapshot()
     vim.api.nvim_buf_set_lines(bufnr, entry.first - 1, entry.last, false, new_lines)
@@ -2580,6 +2605,12 @@ local function replace_symbol_lines(args)
     local abs_last = entry.first + last - 1
     local new_lines = vim.split((args.text:gsub("\n+$", "")), "\n", { plain = true })
     local old = vim.api.nvim_buf_get_lines(bufnr, abs_first - 1, abs_last, false)
+    if args.dry_run then
+        return vim.tbl_extend("force",
+            { file = rel_path(vim.api.nvim_buf_get_name(bufnr)) },
+            preview_diff(old, new_lines,
+                ("lines %d-%d of %s"):format(first, last, entry.path)))
+    end
 
     -- Relative line numbers are read off a snapshot - a find_symbol body or a
     -- grep hit - and an edit anywhere above the symbol moves every one of

@@ -32,18 +32,20 @@ type tool struct {
 }
 
 // Tools in this set are still executable but are left out of the default
-// ("slim") schema advertised to the model: measured usage is near zero and
-// skim/find_symbol cover them, while every advertised schema costs prompt
-// tokens on every round. Restore them with provider.full_tools = true
-// (agent) or AGENT99_FULL_TOOLS=1 (MCP server).
+// ("slim") schema advertised to the model, because skim and find_symbol
+// genuinely cover them and every advertised schema costs prompt tokens on
+// every round. Restore them with provider.full_tools = true (agent) or
+// AGENT99_FULL_TOOLS=1 (MCP server).
+//
+// Keep this list short and justify each entry. It was previously trimmed on
+// "measured usage is near zero", which is circular for a tool the model is
+// never shown: a session tracing a bug asked for a call-hierarchy tool and an
+// implementations tool as missing features while both sat here, implemented
+// and invisible. A tool that is hidden is a tool that does not exist.
 var extraTools = map[string]bool{
 	"install_language": true, // standalone MCP advertises it regardless
-	"type_definition":  true,
-	"implementation":   true,
-	"incoming_calls":   true,
-	"outgoing_calls":   true,
-	"document_symbols": true,
-	"expand_symbol":    true,
+	"document_symbols": true, // skim is the same information, nested
+	"expand_symbol":    true, // find_symbol include_body, plus a hover
 }
 
 func activeTools(all []tool, full bool) []tool {
@@ -200,6 +202,7 @@ var lspTools = []tool{
 				"name_path": map[string]any{"type": "string", "description": "Symbol name path (full path if ambiguous)."},
 				"body":      map[string]any{"type": "string", "description": "Complete replacement source for the symbol."},
 			},
+			"dry_run":  map[string]any{"type": "boolean", "description": "Show a unified diff of the change without applying it."},
 			"required": []string{"file", "name_path", "body"},
 		},
 	},
@@ -219,6 +222,7 @@ var lspTools = []tool{
 					"description": "The text those lines currently hold. Pass it whenever the line numbers came from an earlier call: an edit above the symbol shifts them, and without this the edit silently lands on the wrong lines.",
 				},
 			},
+			"dry_run":  map[string]any{"type": "boolean", "description": "Show a unified diff of the change without applying it."},
 			"required": []string{"file", "name_path", "first_line", "last_line", "text"},
 		},
 	},
@@ -367,8 +371,8 @@ var lspTools = []tool{
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"from":  map[string]any{"type": "string", "description": "File the symbols are in now."},
-				"to":    map[string]any{"type": "string", "description": "File to move them into; created if it does not exist."},
+				"from": map[string]any{"type": "string", "description": "File the symbols are in now."},
+				"to":   map[string]any{"type": "string", "description": "File to move them into; created if it does not exist."},
 				"names": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},

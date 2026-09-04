@@ -386,6 +386,25 @@ def main():
             check("expect= mismatch refuses", "do not hold the expected text" in str(e), e)
         b.call("undo_edit", {"all": True})
 
+        # Navigation tools that were implemented but hidden from the schema
+        # must be advertised: a hidden tool is one nobody knows exists.
+        check("call hierarchy and implementations are advertised",
+              {"incoming_calls", "outgoing_calls", "implementation",
+               "type_definition"} <= tools, sorted(tools))
+
+        # dry_run shows the diff without touching the file.
+        with open(util) as f:
+            before_dry = f.read()
+        res = b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
+            "text": '    return "DRY" .. name', "dry_run": True,
+        })
+        with open(util) as f:
+            check("dry_run leaves the file alone", f.read() == before_dry, res)
+        check("dry_run returns a diff",
+              res.get("dry_run") is True
+              and any(l.startswith("+") for l in res.get("diff", [])), res)
+
         # move_symbols: splitting a file is a symbol operation, not a text
         # one - the doc comments travel with their functions and both files
         # have their imports reorganized afterwards.

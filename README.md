@@ -438,7 +438,7 @@ config's ensure-installed lists to keep them on a fresh machine.
 | `rename_symbol` | `textDocument/rename` project-wide; `dry_run` lists affected files and edit counts first; applied renames enter the undo ledger per file |
 | `check_project` | one project-wide check from the root (`post_edit.check`, `AGENT99_CHECK`, or guessed from go.mod / tsconfig.json / Cargo.toml / pyproject.toml); the first call in a root records a baseline, later calls report only new and resolved lines |
 | `undo_edit` | take back the newest edit(s) of the run (`count`, or `all`), restoring the recorded source, or reversing a create/move/delete; refuses when the region changed since, and does not cover code actions |
-| `replace_symbol_body`, `replace_symbol_lines`, `insert_after_symbol`, `insert_before_symbol` | symbol-addressed edits, applied to editor buffers immediately and tracked (undoable per run). `replace_symbol_lines` takes `expect=`, the text those lines currently hold, so a line number that went stale when something above the symbol moved fails loudly instead of overwriting working code; it also echoes back what it replaced. After every edit the region is formatted through the server and imports organized (a new call into an unimported package costs no extra round), with the formatting confined to the edited lines even where the server only offers whole-file formatting, so a change to a file that was never formatter-clean stays a small diff; then the tool waits for the servers to re-publish and returns only the errors/warnings the edit introduced, plus counts of pre-existing and fixed ones, new errors in other open files, and optionally a linter's output (see `post_edit`) |
+| `replace_symbol_body`, `replace_symbol_lines`, `insert_after_symbol`, `insert_before_symbol` | symbol-addressed edits, applied to editor buffers immediately and tracked (undoable per run). The two replacements take `dry_run` and return a unified diff without applying, the way `rename_symbol` always has. `replace_symbol_lines` takes `expect=`, the text those lines currently hold, so a line number that went stale when something above the symbol moved fails loudly instead of overwriting working code; it also echoes back what it replaced. After every edit the region is formatted through the server and imports organized (a new call into an unimported package costs no extra round), with the formatting confined to the edited lines even where the server only offers whole-file formatting, so a change to a file that was never formatter-clean stays a small diff; then the tool waits for the servers to re-publish and returns only the errors/warnings the edit introduced, plus counts of pre-existing and fixed ones, new errors in other open files, and optionally a linter's output (see `post_edit`) |
 | `move_symbols` | move whole symbols from one file into another, each with its doc comment, reorganizing the imports of both afterwards — the way to split an oversized file, which no other symbol tool can express because the unit is a run of independent declarations rather than one symbol. Creates the destination if missing (inferring a `package X` header where the language has one), and is undoable |
 | `create_file`, `move_file`, `delete_file` | file lifecycle through the language servers (`workspace/*FileOperations`), so a refactor that adds, splits or renames a file does not have to leave the editor. `move_file` has the server rewrite the imports naming the old path before the move; `create_file` makes parent directories, formats and organizes imports, and refuses to overwrite; `delete_file` reports what broke elsewhere. All three are undoable through `undo_edit` |
 | `buffer_lines` | editor's live buffer content, **including unsaved changes** |
@@ -449,12 +449,17 @@ Positions are addressed as `(file, line, symbol-text-on-that-line)` instead
 of raw columns — far more reliable for an LLM, with UTF-16 conversion
 handled on the Lua side.
 
-**Slim default roster**: `type_definition`, `implementation`,
-`incoming_calls`, `outgoing_calls`, `document_symbols`, and `expand_symbol`
-are not advertised by default (near-zero measured usage; skim/find_symbol
-cover them), saving ~1k prompt tokens per round. They remain callable, and
-`full_tools = true` (or `AGENT99_FULL_TOOLS=1` for the MCP server)
-re-advertises them.
+**Slim default roster**: `document_symbols` and `expand_symbol` are not
+advertised by default, because `skim` and `find_symbol include_body` are the
+same information and every advertised schema costs prompt tokens per round.
+They remain callable, and `full_tools = true` (or `AGENT99_FULL_TOOLS=1` for
+the MCP server) re-advertises them.
+
+The list used to be longer, trimmed on measured usage — which is circular for
+a tool the model is never shown. A session tracing a bug asked for a call
+hierarchy and a find-implementations tool as missing features while
+`incoming_calls`, `outgoing_calls` and `implementation` sat in that list,
+implemented and invisible. They are advertised now.
 
 ## Tests
 
