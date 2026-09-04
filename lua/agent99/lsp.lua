@@ -839,6 +839,8 @@ end
 -- from disk with string parsers, so no buffers are created and no language
 -- servers attach; files without a parser are listed with name and size only.
 local MAX_MAP_FILES = 200
+-- Up to this many files, tests are part of the map by default.
+local MAP_SMALL_PROJECT = 40
 local MAX_MAP_ENTRIES = 250
 local MAP_TEXT_MAX = 80
 -- Per-file share of the outline budget, so one file with hundreds of
@@ -950,7 +952,14 @@ local function workspace_map(args)
     -- easier to scan and stable across runs.
     table.sort(files)
     local tests_skipped = 0
-    if not args.include_tests then
+    -- Tests are left out to keep a big map readable; in a small project
+    -- they are the spec (a bug-fix task starts from the failing test) and
+    -- the map has room for them, so they stay in unless asked otherwise.
+    local include_tests = args.include_tests
+    if include_tests == nil then
+        include_tests = #files <= MAP_SMALL_PROJECT
+    end
+    if not include_tests then
         files = vim.tbl_filter(function(f)
             if is_test_path(f) then
                 tests_skipped = tests_skipped + 1
@@ -2788,14 +2797,19 @@ local function edit_chunks(args)
             first_line = args.first_line,
             last_line = args.last_line,
             text = args.text,
-            expect = args.expect
+            expect = args.expect,
+            match = args.match,
+            absolute = args.absolute,
         } }
     end
     local out = {}
     for i, c in ipairs(chunks) do
         local first, last = tonumber(c.first_line), tonumber(c.last_line)
-        if not first or not last then
-            err("chunk %d: missing first_line and last_line (relative to the symbol)", i)
+        if c.match ~= nil and type(c.match) ~= "string" then
+            err("chunk %d: match must be a string: the text to replace, as it is now", i)
+        end
+        if c.match == nil and (not first or not last) then
+            err("chunk %d: give first_line and last_line, or match (the text to replace)", i)
         end
         if type(c.text) ~= "string" then
             err("chunk %d: missing text", i)
@@ -2811,13 +2825,14 @@ local function edit_chunks(args)
             last = last,
             text = c.text,
             expect = c.expect,
+            match = c.match,
+            absolute = c.absolute == true or (c.absolute == nil and args.absolute == true),
             name_path = c.name_path or args.name_path,
             index = i
         }
     end
     return out
 end
-
 local function replace_symbol_lines(args)
     local chunks = edit_chunks(args)
     -- Each chunk addresses its own symbol (default: the call's name_path),
@@ -2837,9 +2852,30 @@ local function replace_symbol_lines(args)
         end
         c.entry = entries[c.name_path]
         local span = c.entry.last - c.entry.first + 1
+        if c.match ~= nil then
+            -- Text-keyed: the lines are wherever this text sits in the
+            -- symbol, which must be exactly one place. No line arithmetic,
+            -- and the text doubles as the expect= guard.
+            local want = vim.trim((c.match:gsub("\n+$", "")))
+            local at, count, n = locate_expected(bufnr, c.entry, want)
+            if not at then
+                if count == 0 then
+                    err("chunk %d: the match text is nowhere in %s; re-read it with find_symbol",
+                        c.index, c.entry.path)
+                end
+                err("chunk %d: the match text occurs %d times in %s; include more context",
+                    c.index, count, c.entry.path)
+            end
+            c.first, c.last, c.expect = at, at + n - 1, c.match
+        elseif c.absolute then
+            -- Numbers as read_file, grep hits and buffer_lines report them.
+            c.first = c.first - c.entry.first + 1
+            c.last = c.last - c.entry.first + 1
+        end
         if c.first < 1 or c.last < c.first or c.last > span then
-            err("chunk %d: lines %s-%s are outside the symbol %s, which has %d lines (1-%d relative)",
-                c.index, tostring(c.first), tostring(c.last), c.entry.path, span, span)
+            err("chunk %d: lines %s-%s are outside the symbol %s, which spans %d-%d (%d lines)",
+                c.index, tostring(c.first + c.entry.first - 1), tostring(c.last + c.entry.first - 1),
+                c.entry.path, c.entry.first, c.entry.last, span)
         end
         c.abs_first = c.entry.first + c.first - 1
         c.abs_last = c.entry.first + c.last - 1
@@ -2910,6 +2946,8 @@ local function replace_symbol_lines(args)
                     text = c.text,
                     expect = c.expect,
                     name_path = c.name_path,
+                    -- Relocated lines are symbol-relative whatever the call used.
+                    absolute = false,
                 }
             end
             actions[#actions + 1] = {
@@ -2919,7 +2957,9 @@ local function replace_symbol_lines(args)
                     first_line = nil,
                     last_line = nil,
                     text = nil,
-                    expect = nil
+                    expect = nil,
+                    match = nil,
+                    absolute = nil,
                 })
             }
         end
@@ -3098,7 +3138,10 @@ local CHECK_MAX_LINES = 60
 -- because a green check here is easy to mistake for a green project.
 local function guess_check_command(root)
     local function has(rel) return vim.uv.fs_stat(root .. "/" .. rel) ~= nil end
-    if has("go.mod") then return "go build ./... && go vet ./..." end
+    -- `go build ./...` writes a binary named after a lone main package into
+    -- the cwd, which fails when a directory of that name exists (a repo with
+    -- its main package in ./bridge). vet compiles everything without that.
+    if has("go.mod") then return "go vet ./..." end
     if has("Cargo.toml") then return "cargo check --message-format short" end
     if has("tsconfig.json") then
         if has("node_modules/.bin/tsc") then return "node_modules/.bin/tsc --noEmit -p ." end

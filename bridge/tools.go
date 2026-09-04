@@ -150,12 +150,13 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "workspace_map",
-		Description: "Every project file with its line count and declarations - classes with their methods one level in - in one cheap call. The first move in an unfamiliar repo. Test files are left out unless include_tests.",
+		Description: "Every project file with its line count and declarations - classes with their methods one level in - in one cheap call. The first move in an unfamiliar repo. In a big project test files are left out unless include_tests; a small one lists them.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"path": map[string]any{"type": "string", "description": "Subdirectory (default: root)."},
-				"glob": map[string]any{"type": "string", "description": "Path glob relative to the root, e.g. src/**/*.go; subdirectories need a **/ prefix."},
+				"path":          map[string]any{"type": "string", "description": "Subdirectory (default: root)."},
+				"glob":          map[string]any{"type": "string", "description": "Path glob relative to the root, e.g. src/**/*.go; subdirectories need a **/ prefix."},
+				"include_tests": map[string]any{"type": "boolean", "description": "List test files too (default: only when the project has 40 files or fewer)."},
 			},
 			"required": []string{},
 		},
@@ -208,14 +209,16 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "replace_symbol_lines",
-		Description: "Replace lines first_line..last_line of a symbol, numbered relative to its declaration (=1) as find_symbol bodies show; prefer over replace_symbol_body for small changes. Several places in one file go in chunks, each naming its own symbol, applied together. Applied to the editor buffer immediately and tracked; returns fresh diagnostics and the text it replaced. Line numbers go stale the moment anything above the symbol changes - pass expect= with the current text of those lines: a stale offset is refused and the refusal offers the relocated edit as a code action, so apply_code_action(token, 1) finishes it without a re-read. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
+		Description: "Replace part of a symbol: either the lines holding `match` (text that occurs once in the symbol - no line arithmetic, prefer this), or lines first_line..last_line, relative to the symbol's declaration (=1) as find_symbol bodies show, or absolute with absolute=true as read_file and grep report them. Several places in one file go in chunks, each naming its own symbol. Applied to the editor buffer immediately and tracked; returns fresh diagnostics and the text it replaced. Line numbers go stale the moment anything above the symbol changes - pass expect= with the current text of those lines: a stale offset is refused and the refusal offers the relocated edit as a code action, so apply_code_action(token, 1) finishes it without a re-read. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"file":       map[string]any{"type": "string", "description": "File containing the symbol."},
 				"name_path":  map[string]any{"type": "string", "description": "Symbol name path; the default for chunks that name none."},
-				"first_line": map[string]any{"type": "integer", "description": "First line to replace, relative to the symbol (1-based)."},
-				"last_line":  map[string]any{"type": "integer", "description": "Last line to replace, relative to the symbol (inclusive)."},
+				"match":      map[string]any{"type": "string", "description": "The lines to replace, as they are now (whole lines); must occur exactly once in the symbol. Replaces first_line/last_line/expect."},
+				"first_line": map[string]any{"type": "integer", "description": "First line to replace, relative to the symbol (1-based) unless absolute."},
+				"last_line":  map[string]any{"type": "integer", "description": "Last line to replace (inclusive)."},
+				"absolute":   map[string]any{"type": "boolean", "description": "first_line/last_line are buffer line numbers (as read_file, grep and buffer_lines report them), not symbol-relative."},
 				"text":       map[string]any{"type": "string", "description": "Replacement for those lines."},
 				"expect": map[string]any{
 					"type":        "string",
@@ -223,17 +226,19 @@ var lspTools = []tool{
 				},
 				"chunks": map[string]any{
 					"type":        "array",
-					"description": "Several non-overlapping replacements in the same file, instead of first_line/last_line/text/expect. Each chunk may name its own symbol (name_path); line numbers are relative to that symbol as it is now. All chunks apply or none.",
+					"description": "Several non-overlapping replacements in the same file, instead of the single-edit fields. Each chunk may name its own symbol (name_path) and addresses its lines by match, or by first_line/last_line (relative to that symbol as it is now, or absolute). Offsets and expect texts are checked together and the call is refused as a whole if any fails; what the new text means is checked afterwards by the language server, like any edit.",
 					"items": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
 							"name_path":  map[string]any{"type": "string", "description": "Symbol this chunk edits (default: the call's name_path)."},
+							"match":      map[string]any{"type": "string", "description": "Whole lines to replace, occurring once in the symbol; alternative to first_line/last_line."},
 							"first_line": map[string]any{"type": "integer"},
 							"last_line":  map[string]any{"type": "integer"},
+							"absolute":   map[string]any{"type": "boolean"},
 							"text":       map[string]any{"type": "string"},
 							"expect":     map[string]any{"type": "string"},
 						},
-						"required": []string{"first_line", "last_line", "text"},
+						"required": []string{"text"},
 					},
 				},
 				"dry_run":          map[string]any{"type": "boolean", "description": "Show a unified diff of the change without applying it."},

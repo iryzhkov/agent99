@@ -209,6 +209,41 @@ def main():
             check("relocated chunks apply in both symbols",
                   "tostring(name):lower()" not in text and '.. "!"' not in text
                   and "    name = tostring(name)\n" in text, res)
+
+        # Text-keyed: match names the lines, no arithmetic; refused when the
+        # text is absent or ambiguous.
+        res = b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet",
+            "match": "name = tostring(name)", "text": "    name = tostring(name):upper()",
+        })
+        check("match addresses the lines by text",
+              res.get("replaced") == "lines 2-2 of M.greet"
+              and "tostring(name):upper()" in open(util).read(), res)
+        try:
+            b.call("replace_symbol_lines", {"file": util, "name_path": "M.greet",
+                                            "match": "no such line", "text": "x"})
+            check("match refuses absent text", False, "call succeeded")
+        except RuntimeError as e:
+            check("match refuses absent text", "nowhere in M.greet" in str(e), e)
+        # Absolute numbers, as read_file reports them: M.greet starts at 6.
+        res = b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet", "absolute": True,
+            "first_line": 7, "last_line": 7, "expect": "name = tostring(name):upper()",
+            "text": "    name = tostring(name)",
+        })
+        check("absolute line numbers",
+              res.get("replaced") == "lines 2-2 of M.greet"
+              and "tostring(name):upper()" not in open(util).read(), res)
+
+        # A small project lists its tests in the map by default.
+        res = b.call("workspace_map", {})
+        check("small project map includes tests",
+              any(f["file"].endswith("util_test.lua") for f in res.get("files", []))
+              and "test files left out" not in (res.get("note") or ""), res)
+        res = b.call("workspace_map", {"include_tests": False})
+        check("include_tests=false leaves them out",
+              not any(f["file"].endswith("util_test.lua") for f in res.get("files", []))
+              and "1 test files left out" in (res.get("note") or ""), res)
         # The pre-existing diagnostics are listed once, then reported as
         # unchanged until they change or full_diagnostics asks again.
         res = b.call("replace_symbol_lines", {
