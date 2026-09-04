@@ -3560,19 +3560,25 @@ local function enclosing_symbols(args)
     for i, line in ipairs(args.lines or {}) do
         local n = tonumber(line)
         local e = innermost_entry(entries, n)
+        -- What the hit *is* does not depend on it being inside a symbol: a
+        -- doc comment above a type, a package-level constant and a line in a
+        -- script all have a kind, and a caller filtering by kind needs it for
+        -- every hit. Only the symbol-relative fields require an enclosing
+        -- symbol.
+        local info = {
+            kind = classify_hit(bufnr, n, (args.cols or {})[i], e),
+            diag = line_diag(bufnr, n),
+        }
         if e then
-            out[tostring(line)] = {
-                path = e.path,
-                decl = decl_line(bufnr, e.first),
-                comment = comment_above(bufnr, e.first),
-                first = e.first,
-                pos = n - e.first + 1,
-                span = e.last - e.first + 1,
-                depth = control_depth(bufnr, n, e.first),
-                kind = classify_hit(bufnr, n, (args.cols or {})[i], e),
-                diag = line_diag(bufnr, n),
-            }
+            info.path = e.path
+            info.decl = decl_line(bufnr, e.first)
+            info.comment = comment_above(bufnr, e.first)
+            info.first = e.first
+            info.pos = n - e.first + 1
+            info.span = e.last - e.first + 1
+            info.depth = control_depth(bufnr, n, e.first)
         end
+        out[tostring(line)] = info
     end
     return { symbols = out }
 end

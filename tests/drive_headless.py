@@ -253,6 +253,47 @@ def main():
         check("grep path glob excludes",
               reply["result"]["content"][0]["text"] == "(no matches)", reply)
 
+        # grep filters. The project has no test file of its own, so one is
+        # added here: tests= is matched on the path, and kind= on what the
+        # classifier says the hit is. "greet" appears as a definition, as
+        # calls, and inside the doc comment above the definition.
+        with open(os.path.join(root, "lua", "testproj", "util_test.lua"), "w") as f:
+            f.write('local util = require("testproj.util")\nprint(util.greet("x"))\n')
+
+        def grep_text(**a):
+            r = b.rpc("tools/call", {"name": "grep", "arguments": a})
+            return r["result"]["content"][0]["text"]
+
+        plain = grep_text(pattern="greet", glob="**/*.lua", context=0)
+        no_tests = grep_text(pattern="greet", glob="**/*.lua", context=0, tests="exclude")
+        only_tests = grep_text(pattern="greet", glob="**/*.lua", context=0, tests="only")
+        check("grep tests=exclude drops test files",
+              "util_test.lua" in plain and "util_test.lua" not in no_tests
+              and "util.lua:" in no_tests, no_tests)
+        check("grep tests=only keeps just them",
+              "util_test.lua" in only_tests
+              and all("util_test.lua" in l or l.startswith("...")
+                      for l in only_tests.split("\n")), only_tests)
+
+        comments = grep_text(pattern="greet", glob="**/*.lua", kind="comment")
+        code = grep_text(pattern="greet", glob="**/*.lua", kind="code")
+        check("grep kind=comment finds the doc comment",
+              "Greet a person" in comments, comments)
+        # The doc comment is still quoted inside a hit's tag, so the test is
+        # that no hit *line* is the comment line itself.
+        check("grep kind=code drops the comment hit",
+              all("]:" in l or l.startswith("...") for l in code.split("\n"))
+              and "Greet a person" not in code.split("]:")[-1], code)
+        defs = grep_text(pattern="greet", glob="**/*.lua", kind="def")
+        check("grep kind=def keeps only declarations",
+              "function M.greet" in defs
+              and all(" def" in l or l.startswith("...") for l in defs.split("\n")), defs)
+        # grep_text goes through rpc, which returns the error as content
+        # rather than raising the way b.call does.
+        bad = grep_text(pattern="greet", kind="nonsense")
+        check("grep rejects an unknown kind", "must be one of" in bad, bad)
+        os.remove(os.path.join(root, "lua", "testproj", "util_test.lua"))
+
         # list_files takes the same globs and leaves binaries out.
         reply = b.rpc("tools/call", {"name": "list_files", "arguments": {"glob": "lua/**/*.lua"}})
         text = reply["result"]["content"][0]["text"]

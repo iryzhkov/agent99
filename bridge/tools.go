@@ -388,13 +388,23 @@ var fileTools = []tool{
 	},
 	{
 		Name:        "grep",
-		Description: "Regex search (ripgrep syntax) with context. Hits carry a tag: path:line [Symbol kind @pos/len dN !SEV ~age · signature · doc]: kind is def/call/comment/string, dN nesting depth, !ERROR an existing diagnostic, test: a test file, ~age needs blame=true. Usually no follow-up read is needed.",
+		Description: "Regex search (ripgrep syntax) with context. Hits carry a tag: path:line [Symbol kind @pos/len dN !SEV ~age · signature · doc]: kind is def/call/comment/string, dN nesting depth, !ERROR an existing diagnostic, test: a test file, ~age needs blame=true. Usually no follow-up read is needed. Narrow with kind= (code skips comments and strings) and tests=, rather than by grepping again with a cleverer pattern.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"pattern": map[string]any{"type": "string", "description": "Regular expression to search for."},
 				"path":    map[string]any{"type": "string", "description": "Subdirectory or file (default: root)."},
 				"glob":    map[string]any{"type": "string", "description": "Path glob relative to the root, e.g. src/**/*.go; subdirectories need a **/ prefix."},
+				"kind": map[string]any{
+					"type":        "string",
+					"enum":        []string{"def", "call", "comment", "string", "code"},
+					"description": "Keep only hits of this kind: code = anything that is not a comment or a string, which drops prose mentions of an identifier. Implies no context lines.",
+				},
+				"tests": map[string]any{
+					"type":        "string",
+					"enum":        []string{"exclude", "only"},
+					"description": "exclude = production code only; only = test files only. Matched on the path, so it is exact.",
+				},
 				"context": map[string]any{"type": "integer", "description": "Context lines around each match (default 2, max 10)."},
 				"blame":   map[string]any{"type": "boolean", "description": "Add git blame age per hit (slower)."},
 			},
@@ -562,6 +572,21 @@ func runGrep(root string, args map[string]any) (string, error) {
 	ctxArg := fmt.Sprintf("-C%d", ctx)
 	glob, _ := args["glob"].(string)
 	blame, _ := args["blame"].(bool)
+	tests, _ := args["tests"].(string)
+	kind, _ := args["kind"].(string)
+	if kind != "" && !grepKinds[kind] {
+		return "", fmt.Errorf("kind must be one of def, call, comment, string, code")
+	}
+	if tests != "" && tests != "exclude" && tests != "only" {
+		return "", fmt.Errorf("tests must be exclude or only")
+	}
+	if kind != "" {
+		// Filtering drops individual match lines, which would leave the
+		// context lines around them orphaned under the wrong hit. A filtered
+		// search is a list, not a reading window.
+		ctx = 0
+		ctxArg = "-C0"
+	}
 	// Both searchers match a glob against the path as they walk it, so a
 	// root-relative glob like "src/**/*.go" only works if the path they
 	// walk is root-relative too. Search from the root with a relative
@@ -604,15 +629,77 @@ func runGrep(root string, args map[string]any) (string, error) {
 		return "", fmt.Errorf("grep failed: %v", err)
 	}
 	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
-	if len(lines) > maxGrepLines {
-		lines = append(lines[:maxGrepLines],
-			fmt.Sprintf("... (truncated at %d matches)", maxGrepLines))
-	}
 	if searchDir != "" {
 		absolutizeGrepPaths(lines, searchDir)
 	}
-	annotateGrepHits(lines, blame)
-	return strings.Join(lines, "\n"), nil
+	// Path-based, so it is exact and costs nothing: no classifier involved,
+	// and it happens before truncation so the cap applies to hits the caller
+	// actually asked for.
+	var testsFiltered int
+	if tests == "exclude" || tests == "only" {
+		kept := lines[:0]
+		for _, l := range lines {
+			isTest := testPathRe.MatchString(grepHitPath(l, searchDir))
+			if (tests == "only") == isTest {
+				kept = append(kept, l)
+			} else {
+				testsFiltered++
+			}
+		}
+		lines = kept
+	}
+	var truncated int
+	if len(lines) > maxGrepLines {
+		truncated = len(lines) - maxGrepLines
+		lines = lines[:maxGrepLines]
+	}
+	drop, unclassified := annotateGrepHits(lines, blame, kind)
+	if len(drop) > 0 {
+		kept := lines[:0]
+		for i, l := range lines {
+			if !drop[i] {
+				kept = append(kept, l)
+			}
+		}
+		lines = kept
+	}
+	var notes []string
+	if truncated > 0 {
+		notes = append(notes, fmt.Sprintf("... (%d more matches not shown; narrow with path=, glob= or a tighter pattern)", truncated))
+	}
+	if testsFiltered > 0 {
+		notes = append(notes, fmt.Sprintf("... (%d hits in test files left out by tests=%s)", testsFiltered, tests))
+	}
+	if unclassified > 0 {
+		notes = append(notes, fmt.Sprintf("... (%d hits could not be classified and so are not shown; "+
+			"drop kind= to see them)", unclassified))
+	}
+	if len(lines) == 0 && len(notes) == 0 {
+		return "(no matches)", nil
+	}
+	return strings.Join(append(lines, notes...), "\n"), nil
+}
+
+// A match line is "path:line:col:text" and a context line is
+// "path-line-text", so the path ends at the first separator that is followed
+// by a line number and another separator. Splitting on the first ":" or "-"
+// instead would cut "/tmp/agent99-headless-7wwbv/proj/x.go:2:..." down to
+// "/tmp/agent99", which is a directory name away from being a real bug in
+// any repository checked out under a hyphenated path.
+var grepHitPathRe = regexp.MustCompile(`^(.*?)[:-]\d+[:-]`)
+
+// The path part of a searcher output line, relative to root, for filters that
+// work on paths. Stripping root first keeps the pattern away from whatever
+// the temporary or checkout directory happens to be called.
+func grepHitPath(line, root string) string {
+	rest := line
+	if root != "" && strings.HasPrefix(rest, root+"/") {
+		rest = rest[len(root)+1:]
+	}
+	if m := grepHitPathRe.FindStringSubmatch(rest); m != nil {
+		return m[1]
+	}
+	return rest
 }
 
 // Put the search root back in front of the paths the searcher printed. It
@@ -684,9 +771,33 @@ func blameAges(file string, lineNos []int) map[int]string {
 // also carries the symbol's signature (its declaration line) and doc-comment
 // summary, so most hits need no follow-up read at all. Best-effort: any
 // failure (no editor, no parser) leaves the plain hits untouched.
-func annotateGrepHits(lines []string, blame bool) {
+// Kinds a caller can filter a search down to. "code" is the useful one in
+// practice: an identifier that also appears in prose above every use of it
+// produces a page of doc-comment hits that answer nothing.
+var grepKinds = map[string]bool{
+	"def": true, "call": true, "comment": true, "string": true, "code": true,
+}
+
+func kindMatches(filter, kind string) bool {
+	switch filter {
+	case "":
+		return true
+	case "code":
+		return kind != "comment" && kind != "string"
+	default:
+		return kind == filter
+	}
+}
+
+// Annotates each hit in place and, when kindFilter is set, reports which hits
+// did not match it and how many could not be classified at all. Classification
+// comes from the editor, so it is bounded (see the caps below); a filter whose
+// answer depends on hits past that bound would be a lie, so the count of
+// unclassified hits is returned for the caller to disclose.
+func annotateGrepHits(lines []string, blame bool, kindFilter string) (drop map[int]bool, unclassified int) {
+	drop = map[int]bool{}
 	if os.Getenv("AGENT99_NO_LSP") != "" {
-		return
+		return drop, 0
 	}
 	type hit struct {
 		idx  int
@@ -727,9 +838,19 @@ func annotateGrepHits(lines []string, blame bool) {
 	}
 	annotated := 0
 	seenSymbol := map[string]bool{}
+	// Classifying costs one editor round trip per file, so it is capped. A
+	// caller filtering by kind is asking for exactly that work, though, so
+	// the caps are raised rather than silently truncating their filter.
+	maxFiles, maxHits := 8, 60
+	if kindFilter != "" {
+		maxFiles, maxHits = 40, 400
+	}
 	for fi, file := range order {
-		if fi >= 8 || annotated >= 60 {
-			return
+		if fi >= maxFiles || annotated >= maxHits {
+			for _, rest := range order[fi:] {
+				unclassified += len(byFile[rest])
+			}
+			return drop, unclassified
 		}
 		var want, cols []any
 		var lineNos []int
@@ -741,7 +862,11 @@ func annotateGrepHits(lines []string, blame bool) {
 		res, err := nvimCall("enclosing_symbols",
 			map[string]any{"file": file, "lines": want, "cols": cols})
 		if err != nil {
-			return // editor unreachable; leave the rest plain too
+			// Editor unreachable; leave the rest plain too.
+			for _, rest := range order[fi:] {
+				unclassified += len(byFile[rest])
+			}
+			return drop, unclassified
 		}
 		var ages map[int]string
 		if blame {
@@ -752,8 +877,19 @@ func annotateGrepHits(lines []string, blame bool) {
 		for _, h := range byFile[file] {
 			info, _ := symbols[fmt.Sprintf("%d", h.line)].(map[string]any)
 			path := ""
+			hitKind := ""
 			if info != nil {
 				path, _ = info["path"].(string)
+				hitKind, _ = info["kind"].(string)
+			}
+			// A blank kind is an answer, not a gap: the classifier walked the
+			// tree and found the hit is a plain reference - definitively not
+			// a comment, string, definition or call. Genuinely unknown hits
+			// are the ones never classified at all, counted where the caps
+			// are applied above.
+			if kindFilter != "" && !kindMatches(kindFilter, hitKind) {
+				drop[h.idx] = true
+				continue
 			}
 			if path == "" {
 				// No symbol info (script file, top-level code): still strip
@@ -817,6 +953,7 @@ func annotateGrepHits(lines []string, blame bool) {
 			annotated++
 		}
 	}
+	return drop, unclassified
 }
 
 // Extensions of files nobody lists a directory to find: images, archives,
