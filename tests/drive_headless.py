@@ -336,6 +336,38 @@ def main():
             time.sleep(0.1)
         check("edit autosaved to disk", '.. "!"' in on_disk, on_disk)
 
+        # A file changed by another tool must be resynced, and the language
+        # servers told, before the next edit is judged. Otherwise a symbol
+        # added to one file with a plain write looks undefined to the file
+        # that uses it, and the edit is reported as breaking something it did
+        # not break.
+        b.call("find_symbol", {"file": util, "name": "M.greet"})   # loads the buffer
+        with open(util) as f:
+            original_util = f.read()
+        # Appended rather than substituted: earlier cases in this file have
+        # already rewritten util.lua, so no particular line is still there to
+        # anchor to.
+        with open(util, "w") as f:
+            f.write(original_util + "\nfunction M.added() return 7 end\n")
+        res = b.call("replace_symbol_lines", {
+            "file": main_lua, "name_path": "run", "first_line": 2, "last_line": 2,
+            "text": '    print(util.greet("world"))',
+        })
+        seen = b.call("buffer_lines", {"file": util})
+        check("an external change is resynced before the next edit is judged",
+              any("M.added" in l for l in seen.get("lines", [])), seen)
+        check("and the edit is not blamed for it",
+              res.get("diagnostics_after") == "no new errors or warnings"
+              or not isinstance(res.get("diagnostics_after"), list)
+              or not any("added" in d for d in res["diagnostics_after"]), res)
+        # Put the file back, then read it through agent99 so the buffer
+        # follows: undo_edit saves, and the conflict guard would - correctly -
+        # refuse to write a buffer whose file had changed underneath it.
+        with open(util, "w") as f:
+            f.write(original_util)
+        b.call("find_symbol", {"file": util, "name": "M.greet"})
+        b.call("undo_edit", {"all": True})
+
         # A stale relative offset must fail rather than clobber, and every
         # replace echoes back what it replaced.
         res = b.call("replace_symbol_lines", {

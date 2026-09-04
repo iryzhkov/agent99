@@ -245,6 +245,47 @@ function M.save_all()
     return failures
 end
 
+-- Tell every language server that these files changed underneath it. A
+-- server reads unopened files from disk and caches what it found, so until it
+-- is told otherwise it keeps answering from the old content.
+local function notify_changed_files(paths)
+    if #paths == 0 then return end
+    local changes = {}
+    for _, path in ipairs(paths) do
+        changes[#changes + 1] = { uri = vim.uri_from_fname(path), type = 2 }
+    end
+    for _, client in ipairs(vim.lsp.get_clients()) do
+        pcall(function()
+            client:notify("workspace/didChangeWatchedFiles", { changes = changes })
+        end)
+    end
+end
+
+-- Bring every buffer back in line with disk and tell the servers what moved.
+--
+-- Run before an edit is judged, because the judgement is about more than the
+-- file being edited. A constant added to one file with a plain Edit, and a
+-- use of it added to another through the symbol tools, is one change to the
+-- project: report diagnostics on the second file while the server still has
+-- the old first file and it says the constant is undefined. That reads as a
+-- real error, and an agent that has been told to trust these diagnostics
+-- then stops trusting them.
+local function resync_open_buffers()
+    local changed = {}
+    for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_loaded(bufnr) and vim.bo[bufnr].buftype == "" then
+            local path = vim.api.nvim_buf_get_name(bufnr)
+            if path ~= "" and not vim.bo[bufnr].modified and disk_moved_on(bufnr, path) then
+                if pcall(sync_buf, bufnr, path) then
+                    changed[#changed + 1] = path
+                end
+            end
+        end
+    end
+    notify_changed_files(changed)
+    return changed
+end
+
 local function load_buf(file)
     if type(file) ~= "string" or file == "" then
         err("missing required argument: file")
@@ -1271,6 +1312,12 @@ local DIAG_GROUP_SHOW = 3
 
 local function diagnostics(args)
     local bufnr = load_buf(args.file)
+    -- Same reason as before an edit: a file changed by another tool is stale
+    -- in the server until it is told, and this file's diagnostics may depend
+    -- on it.
+    if #resync_open_buffers() > 0 then
+        sleep(300)
+    end
     -- Give a freshly attached server a moment to publish.
     get_client(bufnr, "textDocument/didOpen")
     local deadline = vim.uv.now() + 1000
@@ -1631,6 +1678,14 @@ end
 -- attach and publish, or every problem the file already had would be
 -- reported as caused by the edit.
 local function settle_before_edit(bufnr)
+    -- Unconditional: a file changed by another tool is stale in the server
+    -- whether or not this buffer is freshly loaded.
+    local moved = resync_open_buffers()
+    if #moved > 0 then
+        -- Give the servers a moment to re-analyze what they were just told
+        -- about, or the diagnostics snapshot taken next is the old picture.
+        sleep(300)
+    end
     if not fresh_buf(bufnr) then return end
     if #vim.lsp.get_clients({ bufnr = bufnr }) == 0
         and #enabled_lsp_configs_for(vim.bo[bufnr].filetype) == 0 then
@@ -1767,6 +1822,11 @@ local function post_edit_report(bufnr, before, root, headless, opts)
         report.diagnostics_after = "no new errors or warnings"
     else
         report.diagnostics_after = new_here
+        -- A server analyzes one build configuration and can lag a change it
+        -- has only just been told about, so a surprising error here is worth
+        -- confirming rather than chasing.
+        report.if_unexpected = "these come from the language server; check_project "
+            .. "runs the project's own build or check for ground truth"
     end
     if #new_elsewhere > 0 then
         report.new_errors_elsewhere = new_elsewhere
