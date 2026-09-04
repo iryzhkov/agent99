@@ -460,10 +460,18 @@ by an error naming the field, because a `vim.ui.select` in a headless
 instance would hang forever. Without a user configuration, built-ins cover
 Go (Delve, spawned by agent99 so its output is captured), Python (debugpy
 from the project's venv, the system interpreter or Mason's package, with the
-program run under the project's venv), and C/C++/Rust (codelldb, then
-lldb-dap, then gdb 14+'s own DAP mode). `install_debugger(language)` fetches
-delve/debugpy/codelldb through Mason. JavaScript/TypeScript has no built-in
-yet (js-debug's two-stage launch is deferred); a user configuration works.
+program run under the project's venv), C/C++/Rust (codelldb, then lldb-dap,
+then gdb 14+'s own DAP mode), JavaScript/TypeScript (vscode-js-debug from
+Mason's js-debug-adapter; `.ts` files run through Node's own type stripping,
+so breakpoints in TypeScript need no build; the program lives in a child
+session js-debug opens, which the tools follow) and Java (Microsoft's
+java-debug, a jdtls plugin: agent99 adds Mason's java-debug-adapter bundle
+to the jdtls config when the user set none, asks the running jdtls for a
+debug port, and resolves the main class and classpath through it; the
+project must be one jdtls imports, that is Maven, Gradle or Eclipse
+`.project` files, a bare folder of sources gets a wrong classpath).
+`install_debugger(language)` fetches delve, debugpy, codelldb,
+js-debug-adapter and java-debug-adapter through Mason.
 
 **One stop, one turn.** Launch, attach, continue, step and wait all reply
 with the same stop context: reason, frame (`file`, `line`, `symbol`,
@@ -510,9 +518,9 @@ the legitimate use), and streaming output outside replies.
 | `debug_continue`, `debug_step`, `debug_wait` | resume (or run to a line), step over/into/out `count` times, wait for a running program (`wait_ms=0` = just report, `pause_after` interrupts); every one replies with the stop context: frame with symbol, source window, locals, stack, output since the last reply, tracked expressions, stale-source warning |
 | `debug_stack`, `debug_variables`, `debug_evaluate`, `debug_output` | the rest on demand: deeper stack with external frames collapsed, variables of a frame one level deep or one path expanded, an expression in a frame, and the captured output (up to 200 lines, surviving the exit) |
 | `debug_stop` | terminate a launched program or disconnect from an attached one (left running unless `force`), remove the agent's breakpoints, kill the adapter if it lingers |
-| `install_debugger` | standalone MCP only: delve/debugpy/codelldb through Mason, for a language whose `debugger` field says none |
-| `workspace_map` | the whole workspace's shape in one call: every project file with its line count and its declarations, descending one level into classes so nested languages list their methods (string parsers on disk content — no buffers created, no servers attached); the outline budget is shared across files (`+N more` marks a cut), test files are left out unless `include_tests`; the intended first move in an unfamiliar repo, ahead of skim/grep |
-| `skim` | structure of up to 20 files in one call: every function/class/method declaration line with line numbers, nested (treesitter, LSP-symbol fallback; C/C++ take the server's symbols first because macros confuse the grammar) — measures ~6-25% of the tokens of reading the same files |
+| `install_debugger` | standalone MCP only: delve, debugpy, codelldb, js-debug-adapter or java-debug-adapter through Mason, for a language whose `debugger` field says none |
+| `workspace_map` | the whole workspace's shape in one call: every project file with its line count and its declarations, descending one level into classes so nested languages list their methods (string parsers on disk content — no buffers created, no servers attached); the outline budget is shared across files (`+N more` marks a cut), test files are left out unless `include_tests`; the intended first move in an unfamiliar repo, ahead of skim/grep. Markdown files list their headings |
+| `skim` | structure of up to 20 files in one call: every function/class/method declaration line with line numbers, nested (treesitter, LSP-symbol fallback; C/C++ take the server's symbols first because macros confuse the grammar) — measures ~6-25% of the tokens of reading the same files. Markdown headings index like declarations, so a README's sections are name paths (`Install/Requirements`) for `find_symbol`, the section edits and grep's hit tags |
 | `find_symbol` | look up symbols by `/`-joined name path across files/globs, optionally returning the full body — fetch exactly one function instead of a whole file. Constants and module-level variables are included by folding in the server's document symbols, which treesitter's declaration nodes leave out |
 | `ts_query` | structural multi-file search: a treesitter s-expression query with `@captures` and `#eq?`/`#match?` predicates — for questions grep can't ask |
 | `definition`, `type_definition`, `implementation` | `textDocument/*` via live client |
@@ -586,8 +594,9 @@ a skip line, which `AGENT99_TEST_REQUIRE_DEBUG=1` turns into a failure.
   checked rather than reporting success; verify them by building or testing
   with the tags that include the file.
 - Debugging: one session at a time (the tools say so when nvim-dap has
-  more), no stdin to the debuggee, no JavaScript/TypeScript built-in
-  adapter, and attach-by-pid needs `ptrace_scope=0` on Linux.
+  more), no stdin to the debuggee, attach-by-pid needs `ptrace_scope=0` on
+  Linux, Java needs a project jdtls can import (not a bare folder), and
+  java-debug reports exit code 0 whatever the program returned.
 
 ## Ideas / next steps
 

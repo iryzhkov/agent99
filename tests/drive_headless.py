@@ -90,6 +90,38 @@ def main():
         check("workspace_map skips binaries",
               blob and blob[0].get("skipped") == "binary", res)
 
+        # Markdown headings index like declarations: nested outline, a
+        # section by name path with its body ending before the next heading,
+        # grep hits tagged with their section, and section edits.
+        notes = os.path.join(root, "NOTES.md")
+        res = b.call("skim", {"files": [notes]})
+        outline = res["files"][0].get("outline", [])
+        check("skim outlines markdown sections",
+              any(l.strip().startswith("5-") and "## Layout" in l for l in outline)
+              and any("### Modules" in l for l in outline), res)
+        res = b.call("find_symbol", {"file": notes, "name": "Layout/Modules", "include_body": True})
+        body = res.get("matches", [{}])[0].get("body", [])
+        check("find_symbol reads a markdown section",
+              res.get("count") == 1 and body and body[0].endswith("### Modules")
+              and not any("## Running" in l for l in body), res)
+        r = b.rpc("tools/call", {"name": "grep", "arguments": {"pattern": "messy", "path": "NOTES.md"}})
+        hit = r["result"]["content"][0]["text"]
+        check("grep tags the markdown section", "Test project/Layout/Modules" in hit, hit)
+        res = b.call("insert_after_symbol", {
+            "file": notes, "name_path": "Running",
+            "text": "## Caveats\n\nNone yet.\n",
+        })
+        with open(notes) as f:
+            check("insert_after_symbol appends a markdown section",
+                  f.read().rstrip().endswith("## Caveats\n\nNone yet."), res)
+        res = b.call("replace_symbol_body", {
+            "file": notes, "name_path": "Caveats",
+            "body": "## Caveats\n\nOne, now.\n",
+        })
+        with open(notes) as f:
+            check("replace_symbol_body rewrites a markdown section",
+                  "One, now." in f.read() and "None yet." not in open(notes).read(), res)
+
         # Edits in a headless workspace must not claim to be unsaved.
         res = b.call("replace_symbol_lines", {
             "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,

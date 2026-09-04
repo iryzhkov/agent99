@@ -532,8 +532,11 @@ local TS_WANTED_EXACT = {
     type_alias_declaration = true,
     type_item = true,
     mod_item = true,
+    -- Markdown's grammar nests a "section" per heading, so a document's
+    -- headings index like declarations: "Install/Requirements" is a name
+    -- path, and a section is a body. INI files use the same node name.
+    section = true,
 }
-
 -- True for node types the workspace map must not descend into: call
 -- arguments hold callbacks ("describe(..., () => {})", "$constructor(name,
 -- (inst, def) => {})") that are not declarations of the file.
@@ -549,10 +552,15 @@ end
 -- Declarations that hold other declarations, as opposed to a function whose
 -- body is statements. The workspace map descends into these one level.
 local TS_CONTAINER = {
-    class = true, struct = true, interface = true, impl = true,
-    module = true, trait = true, enum = true,
+    class = true,
+    struct = true,
+    interface = true,
+    impl = true,
+    module = true,
+    trait = true,
+    enum = true,
+    section = true,
 }
-
 local function ts_container(node_type)
     local container = false
     for segment in node_type:gmatch("[^_]+") do
@@ -2103,7 +2111,26 @@ end
 
 local index_cache = {}
 
+-- A Markdown section is named by its heading, without the markers: the
+-- "## Install" line of an ATX heading, or the text line of a setext one.
+local function section_name(node, bufnr)
+    for child in node:iter_children() do
+        if child:type():find("heading$") then
+            local text = vim.treesitter.get_node_text(child, bufnr)
+            local first = text:match("^[^\n]*") or text
+            first = first:gsub("^%s*#+%s*", ""):gsub("%s*#+%s*$", "")
+            first = vim.trim(first)
+            if first ~= "" then return first end
+        end
+    end
+    return nil
+end
+
 local function ts_node_name(node, bufnr)
+    if node:type() == "section" then
+        local heading = section_name(node, bufnr)
+        if heading then return heading end
+    end
     local name_field = node:field("name")
     if name_field and name_field[1] then
         local name = vim.treesitter.get_node_text(name_field[1], bufnr)
@@ -2171,7 +2198,13 @@ local function ts_index(bufnr)
         for child in node:iter_children() do
             if child:named() then
                 if ts_wanted(child:type()) then
-                    local srow, _, erow = child:range()
+                    local srow, _, erow, ecol = child:range()
+                    -- A node ending at column 0 stopped at the previous
+                    -- line's newline (a Markdown section runs up to the
+                    -- next heading): its last line is the one before.
+                    if ecol == 0 and erow > srow then
+                        erow = erow - 1
+                    end
                     local name = ts_node_name(child, bufnr)
                     local path = prefix == "" and name or (prefix .. "/" .. name)
                     entries[#entries + 1] = {
@@ -2290,6 +2323,13 @@ end
 local annotate_locations
 
 -- Rank: 1 exact path, 2 path suffix / exact name, 3 name substring.
+-- Language servers may name a symbol with its signature ("main(String[])",
+-- "accumulate(List<Integer>) : int" from jdtls); a name path written
+-- without one still has to find it.
+local function strip_signature(s)
+    return (s:gsub("%b()", ""):gsub("%s*:%s*[^/]*$", ""):gsub("%s+$", ""))
+end
+
 local function match_rank(entry, name)
     if entry.path == name then
         return 1
@@ -2302,12 +2342,24 @@ local function match_rank(entry, name)
     if entry.name == name then
         return 2
     end
+    if not name:find("(", 1, true) and entry.name:find("(", 1, true) then
+        local bare_path = strip_signature(entry.path)
+        if bare_path == name then
+            return 1
+        end
+        if #bare_path > n and bare_path:sub(-n) == name
+            and bare_path:sub(-n - 1, -n - 1) == "/" then
+            return 2
+        end
+        if strip_signature(entry.name) == name then
+            return 2
+        end
+    end
     if entry.name:lower():find(name:lower(), 1, true) then
         return 3
     end
     return nil
 end
-
 local MAX_FIND_RESULTS = 20
 local MAX_BODY_LINES = 200
 
@@ -3574,6 +3626,18 @@ local function workspace_support(args)
         if i > SUPPORT_MAX_FILETYPES then break end
         local parser = has_parser(ft)
         local configs = enabled_lsp_configs_for(ft)
+        -- What could run this language under a debugger, so a client
+        -- learns the option exists even when the debug tools are off.
+        -- Probed before the server starts: for Java the probe also adds
+        -- the java-debug bundle to the jdtls config, which only counts
+        -- for a client that has not started yet.
+        local debugger
+        if not DATA_FILETYPES[ft] then
+            local okd, dbg = pcall(function()
+                return require("agent99.dap").debugger_for(ft, root)
+            end)
+            if okd then debugger = dbg end
+        end
         local clients = {}
         if #configs > 0 then
             local okb, bufnr = pcall(load_buf, root .. "/" .. sample[ft])
@@ -3593,22 +3657,13 @@ local function workspace_support(args)
             files = by_ft[ft],
             treesitter_parser = parser,
             lsp = #clients > 0 and table.concat(clients, ",") or "none",
+            debugger = debugger,
         }
         if #clients == 0 and #configs > 0 then
             entry.lsp = "none (configured: " .. table.concat(configs, ",") .. ", did not attach)"
         end
         if not parser and #clients == 0 and not DATA_FILETYPES[ft] then
             blind[#blind + 1] = ft
-        end
-        -- What could run this language under a debugger, so a client
-        -- learns the option exists even when the debug tools are off.
-        if not DATA_FILETYPES[ft] then
-            local okd, dbg = pcall(function()
-                return require("agent99.dap").debugger_for(ft, root)
-            end)
-            if okd and dbg then
-                entry.debugger = dbg
-            end
         end
         out[#out + 1] = entry
     end

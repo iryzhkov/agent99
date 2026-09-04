@@ -277,10 +277,37 @@ end
 -- Listeners: one set, installed once, keyed "agent99"
 ------------------------------------------------------------------------
 
+-- Ours: the session we started or adopted, or a child of it (js-debug
+-- runs the program in a child session opened by a startDebugging request).
 local function our_session(session)
-    return state.session ~= nil and session == state.session
+    if state.session == nil or session == nil then return false end
+    local s = session
+    for _ = 1, 8 do
+        if s == state.session then return true end
+        s = s.parent
+        if s == nil then return false end
+    end
+    return false
 end
 
+-- The session requests go to: the child that last stopped, else the root.
+local function active_session()
+    local a = state.active
+    if a and not a.closed and our_session(a) then return a end
+    return state.session
+end
+
+-- Root and every live child, for breakpoint updates.
+local function all_sessions()
+    local out = {}
+    local function add(s)
+        if not s or s.closed then return end
+        out[#out + 1] = s
+        for _, child in pairs(s.children or {}) do add(child) end
+    end
+    add(state.session)
+    return out
+end
 local function session_ended(reason)
     if state.exit == nil then
         state.exit = { reason = reason }
@@ -303,6 +330,7 @@ local function install_listeners(dap)
     end
     L.after.event_stopped[key] = function(session, body)
         if not our_session(session) then return end
+        state.active = session
         state.stop = body or {}
         state.stop.at = now()
         wake("stopped", body)
@@ -314,6 +342,13 @@ local function install_listeners(dap)
     end
     L.after.event_terminated[key] = function(session)
         if not our_session(session) then return end
+        if session ~= state.session then
+            -- A child (the program) ended; the root adapter session may
+            -- linger. The exit path closes it once the reply is built.
+            state.child_ended = true
+            wake("exited", { terminated = true })
+            return
+        end
         session_ended("terminated")
         wake("exited", { terminated = true })
     end
@@ -670,7 +705,263 @@ BUILTIN.gdb = {
     end,
     hint = "gdb attaches by pid; lower /proc/sys/kernel/yama/ptrace_scope or run the target under gdbserver",
 }
+-- JavaScript and TypeScript: vscode-js-debug, as Mason's js-debug-adapter
+-- (node dapDebugServer.js PORT). Its launch config must carry the type
+-- "pwa-node", which js-debug reads to pick the debug target, so the
+-- adapter is registered under that name rather than an agent99_ one. The
+-- program runs in a child session that js-debug opens through a
+-- startDebugging reverse request; the listeners follow it (see our_session).
+local function js_debug_launcher()
+    local mason = vim.fn.stdpath("data") .. "/mason/packages/js-debug-adapter/js-debug/src/dapDebugServer.js"
+    if file_exists(mason) and vim.fn.executable("node") == 1 then return mason end
+    local bin = exe("js-debug-adapter")
+    if bin then return bin end
+    return nil
+end
 
+BUILTIN["js-debug"] = {
+    name = "js-debug",
+    dap_type = "pwa-node",
+    filetypes = { "javascript", "typescript", "javascriptreact", "typescriptreact" },
+    install = {
+        mason = "js-debug-adapter",
+        manual =
+        "download js-debug-dap-*.tar.gz from https://github.com/microsoft/vscode-js-debug/releases and put js-debug-adapter on PATH"
+    },
+    find = function(_) return js_debug_launcher() end,
+    adapter = function(launcher)
+        local executable
+        if launcher:match("%.js$") then
+            executable = { command = vim.fn.exepath("node"), args = { launcher, "${port}" } }
+        else
+            executable = { command = launcher, args = { "${port}" } }
+        end
+        return { type = "server", host = "127.0.0.1", port = "${port}", executable = executable }
+    end,
+    launch = function(args, root)
+        local program = args.program or args.file
+        if not program then
+            err("debug_launch for JavaScript/TypeScript needs file (the script to run) or program")
+        end
+        return {
+            request = "launch",
+            name = "agent99",
+            program = program,
+            cwd = args.cwd or root,
+            args = args.args,
+            env = args.env,
+            console = "internalConsole",
+            stopOnEntry = args.stop_on_entry or false,
+            skipFiles = { "<node_internals>/**" },
+            -- Node 22+ runs .ts files by stripping types, keeping line
+            -- numbers, so breakpoints in TypeScript land without a build.
+            runtimeExecutable = vim.fn.exepath("node"),
+        }
+    end,
+    attach = function(args)
+        if args.pid then
+            return { request = "attach", name = "agent99", processId = args.pid }
+        end
+        return {
+            request = "attach",
+            name = "agent99",
+            address = args.host or "127.0.0.1",
+            port = args.port,
+            skipFiles = { "<node_internals>/**" }
+        }
+    end,
+    hint = "start the target with node --inspect-brk=127.0.0.1:PORT script.js, then debug_attach(host, port)",
+    -- The inspector port is not a DAP port: attach still goes through
+    -- js-debug, with the address in the configuration.
+    remote_adapter = false,
+}
+
+-- Java: Microsoft's java-debug, which is a plugin of the jdtls language
+-- server. The adapter asks the running jdtls for a debug port
+-- (vscode.java.startDebugSession); launching needs the main class and the
+-- classpath, which jdtls resolves too. So jdtls must be attached to the
+-- workspace with the java-debug bundle in its init_options - agent99 adds
+-- the Mason-installed bundle to the jdtls config when the user set none.
+local function java_debug_bundle()
+    local dir = vim.fn.stdpath("data") .. "/mason/packages/java-debug-adapter/extension/server"
+    local jars = vim.fn.glob(dir .. "/com.microsoft.java.debug.plugin-*.jar", true, true)
+    return jars[1]
+end
+
+-- Register the bundle with the jdtls config before its client starts.
+-- Returns true when the running or future jdtls carries it.
+local function ensure_java_bundle()
+    local jar = java_debug_bundle()
+    if not jar then return false end
+    local okc, cfg = pcall(function() return vim.lsp.config.jdtls end)
+    if not okc or not cfg then return false end
+    local bundles = vim.tbl_get(cfg, "init_options", "bundles") or {}
+    for _, b in ipairs(bundles) do
+        if b == jar then return true end
+    end
+    if #bundles > 0 then
+        return false -- the user's own list; do not touch it
+    end
+    pcall(function()
+        vim.lsp.config("jdtls", { init_options = { bundles = { jar } } })
+    end)
+    return true
+end
+local JDTLS_ATTACH_MS = 90000
+
+-- A jdtls client attached to `file` (or any Java file of the root), waited
+-- for because jdtls takes a while to come up.
+local function jdtls_client(root, file)
+    local lsp = I()
+    local sample = file
+    if not sample then
+        sample = vim.fn.glob(root .. "/**/*.java", true, true)[1]
+    end
+    if not sample then
+        err("no Java file to attach jdtls to under %s", root)
+    end
+    local bufnr = lsp.load_buf(sample)
+    local deadline = now() + JDTLS_ATTACH_MS
+    while now() < deadline do
+        for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+            if c.name == "jdtls" and c.initialized then
+                return c, bufnr
+            end
+        end
+        lsp.sleep(250)
+    end
+    err("jdtls did not attach to %s within %d s; install_language(\"java\") installs it, "
+        .. "and install_debugger(\"java\") adds the java-debug bundle", lsp.rel_path(sample), JDTLS_ATTACH_MS / 1000)
+end
+
+local function jdtls_command(client, bufnr, command, arguments)
+    local timer = uv.new_timer()
+    local rpc_err, result = I().await(function(resume)
+        timer:start(60000, 0, vim.schedule_wrap(function()
+            resume({ message = "timed out after 60 s" }, nil)
+        end))
+        local ok = client:request("workspace/executeCommand",
+            { command = command, arguments = arguments or {} },
+            function(e, r) resume(e, r) end, bufnr)
+        if not ok then resume({ message = "failed to send request" }, nil) end
+    end)
+    timer:stop()
+    timer:close()
+    if rpc_err then
+        local msg = rpc_err.message or vim.inspect(rpc_err)
+        if msg:find("not found") or msg:find("No delegateCommandHandler") then
+            msg = msg .. " (jdtls is running without the java-debug bundle; restart it after install_debugger(\"java\"))"
+        end
+        err("jdtls command %s failed: %s", command, msg)
+    end
+    return result
+end
+
+BUILTIN.java = {
+    name = "java",
+    dap_type = "java",
+    filetypes = { "java" },
+    install = {
+        mason = "java-debug-adapter",
+        manual = "install jdtls and the java-debug bundle (Mason: jdtls, java-debug-adapter)"
+    },
+    find = function(_)
+        local jar = java_debug_bundle()
+        if not jar then return nil end
+        if not exe("jdtls") then return nil end
+        ensure_java_bundle()
+        return jar
+    end,
+    adapter = function(_, root)
+        return function(callback, config)
+            local client = nil
+            for _, c in ipairs(vim.lsp.get_clients({ name = "jdtls" })) do
+                client = c
+            end
+            if not client then
+                state.launch_error = "no jdtls client is running for " .. root
+                wake("failed", state.launch_error)
+                return
+            end
+            client:request("workspace/executeCommand", { command = "vscode.java.startDebugSession", arguments = {} },
+                function(e, port)
+                    if e or type(port) ~= "number" then
+                        state.launch_error = "vscode.java.startDebugSession failed: "
+                            .. tostring(e and e.message or port)
+                            .. " (is the java-debug bundle in jdtls's init_options.bundles?)"
+                        wake("failed", state.launch_error)
+                        return
+                    end
+                    vim.schedule(function()
+                        callback({ type = "server", host = "127.0.0.1", port = port })
+                    end)
+                end, config.__bufnr)
+        end
+    end,
+    launch = function(args, root)
+        local client, bufnr = jdtls_client(root, args.file)
+        local main_class, project_name = args.program, nil
+        if not main_class or main_class:find("/") then
+            -- Resolve from the file: jdtls lists the main classes it knows.
+            local mains = jdtls_command(client, bufnr, "vscode.java.resolveMainClass", {}) or {}
+            local want = args.file and vim.fn.fnamemodify(args.file, ":p") or nil
+            for _, m in ipairs(mains) do
+                if want == nil or (m.filePath and vim.fn.fnamemodify(m.filePath, ":p") == want) then
+                    main_class, project_name = m.mainClass, m.projectName
+                    break
+                end
+            end
+            if not main_class then
+                local names = {}
+                for _, m in ipairs(mains) do names[#names + 1] = m.mainClass end
+                err("no main class found%s; jdtls knows: %s (pass program=\"pkg.Main\")",
+                    args.file and (" in " .. I().rel_path(args.file)) or "",
+                    #names > 0 and table.concat(names, ", ") or "none yet (jdtls may still be indexing; retry)")
+            end
+        else
+            local mains = jdtls_command(client, bufnr, "vscode.java.resolveMainClass", {}) or {}
+            for _, m in ipairs(mains) do
+                if m.mainClass == main_class then project_name = m.projectName end
+            end
+        end
+        local paths = jdtls_command(client, bufnr, "vscode.java.resolveClasspath", { main_class, project_name })
+        local cfg = {
+            request = "launch",
+            name = "agent99",
+            mainClass = main_class,
+            projectName = project_name,
+            modulePaths = paths and paths[1] or {},
+            classPaths = paths and paths[2] or {},
+            cwd = args.cwd or root,
+            args = args.args and table.concat(args.args, " ") or nil,
+            env = args.env,
+            console = "internalConsole",
+            stopOnEntry = args.stop_on_entry or false,
+            __bufnr = bufnr,
+        }
+        if #cfg.classPaths == 0 and #cfg.modulePaths == 0 then
+            err("jdtls resolved no classpath for %s; the project may still be importing, retry in a moment", main_class)
+        end
+        return cfg
+    end,
+    attach = function(args, root)
+        local _, bufnr = jdtls_client(root, args.file)
+        if not args.port then
+            err(
+            "Java attaches to a JVM started with -agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=*:PORT; pass host and port")
+        end
+        return {
+            request = "attach",
+            name = "agent99",
+            hostName = args.host or "127.0.0.1",
+            port = args.port,
+            __bufnr = bufnr
+        }
+    end,
+    hint =
+    "start the JVM with -agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=*:PORT and debug_attach(host, port)",
+    remote_adapter = false,
+}
 -- Filetype -> ordered candidate adapters.
 local BY_FILETYPE = {
     go = { "delve" },
@@ -679,8 +970,21 @@ local BY_FILETYPE = {
     cpp = { "codelldb", "lldb-dap", "gdb" },
     rust = { "codelldb", "lldb-dap", "gdb" },
     zig = { "codelldb", "lldb-dap", "gdb" },
+    javascript = { "js-debug" },
+    typescript = { "js-debug" },
+    javascriptreact = { "js-debug" },
+    typescriptreact = { "js-debug" },
+    java = { "java" },
 }
 
+-- Mason package -> built-in spec, for install_debugger.
+local PACKAGE_SPEC = {
+    delve = "delve",
+    debugpy = "debugpy",
+    codelldb = "codelldb",
+    ["js-debug-adapter"] = "js-debug",
+    ["java-debug-adapter"] = "java",
+}
 local function filetype_of(file)
     if not file then return nil end
     return vim.filetype.match({ filename = file })
@@ -814,7 +1118,7 @@ local function describe_bp(b, next_id)
             out.requested_line = b.line
             out.line = rec.state.line
         end
-        if rec.state.message then out.note = rec.state.message end
+        if rec.state.message and rec.state.message ~= "" then out.note = rec.state.message end
     elseif state.session then
         out.verified = false
     else
@@ -848,14 +1152,21 @@ local function sync_breakpoints(session)
         end
     end
     if next(bps) == nil then return end
-    local timer = uv.new_timer()
-    I().await(function(resume)
-        timer:start(REQUEST_TIMEOUT_MS, 0, vim.schedule_wrap(function() resume() end))
-        local ok = pcall(session.set_breakpoints, session, bps, function() resume() end)
-        if not ok then resume() end
-    end)
-    timer:stop()
-    timer:close()
+    -- Children (js-debug runs the program in one) need the update too.
+    local targets = { session }
+    for _, s in ipairs(all_sessions()) do
+        if s ~= session then targets[#targets + 1] = s end
+    end
+    for _, s in ipairs(targets) do
+        local timer = uv.new_timer()
+        I().await(function(resume)
+            timer:start(REQUEST_TIMEOUT_MS, 0, vim.schedule_wrap(function() resume() end))
+            local ok = pcall(s.set_breakpoints, s, vim.deepcopy(bps), function() resume() end)
+            if not ok then resume() end
+        end)
+        timer:stop()
+        timer:close()
+    end
 end
 -- Remove every breakpoint the agent placed, leaving the user's alone.
 local function clear_own_breakpoints()
@@ -1090,22 +1401,29 @@ local function exit_reply()
         reply.exit_code = state.exit.code
         reply.reason = state.exit.reason
     end
+    if reply.exit_code == nil then
+        -- js-debug reports the code as a line of output, not an event.
+        for _, line in ipairs(output_tail(20)) do
+            local code = line:match("[Pp]rocess exited with code (%-?%d+)")
+            if code then reply.exit_code = tonumber(code) end
+        end
+    end
     if not state.had_breakpoints and state.request == "launch" then
         reply.note =
         "no breakpoints were set, so the program ran to its end; place one with debug_breakpoint and relaunch with debug_launch()"
     end
     return reply
 end
-
 -- Tear the session state down after an exit has been reported once.
 local function finish_session()
     if #state.output > 0 then
         last_output = output_tail(OUTPUT_CAP_LINES)
     end
     local keep = {
-        config = state.config,
-        launch_args = state.launch_args,
-        adapter = state.adapter,
+        config = state.config or state.last_config,
+        launch_args = state.launch_args or state.last_launch_args,
+        adapter = state.adapter or state.last_adapter,
+        dap_type = state.dap_type or state.last_dap_type,
         track = state.track,
         variables_mode = state.variables_mode,
         breakpoints = state.breakpoints,
@@ -1118,6 +1436,7 @@ local function finish_session()
     state.last_config = keep.config
     state.last_launch_args = keep.launch_args
     state.last_adapter = keep.adapter
+    state.last_dap_type = keep.dap_type
     state.track = keep.track
     state.variables_mode = keep.variables_mode
     state.finished = keep.finished
@@ -1189,7 +1508,7 @@ end
 -- Turn a wait_event outcome into the reply for it.
 local function outcome_reply(kind, root, timeout_note)
     if kind == "stopped" then
-        return stop_reply(state.session, root)
+        return stop_reply(active_session(), root)
     elseif kind == "exited" then
         -- `terminated` follows `exited` a moment later and closes the
         -- session; give it that moment so nothing sees a half-dead one.
@@ -1197,6 +1516,19 @@ local function outcome_reply(kind, root, timeout_note)
         local deadline = now() + 1500
         while s and not s.closed and now() < deadline do
             I().sleep(50)
+        end
+        if s and not s.closed then
+            -- The program is gone but the root adapter session lingers
+            -- (js-debug keeps its parent open): end it ourselves.
+            pcall(function()
+                s.adapter.options = { disconnect_timeout_sec = 1 }
+                s:disconnect({ terminateDebuggee = true }, function() end)
+            end)
+            deadline = now() + 1500
+            while not s.closed and now() < deadline do
+                I().sleep(50)
+            end
+            if not s.closed then pcall(s.close, s) end
         end
         local reply = exit_reply()
         finish_session()
@@ -1264,7 +1596,7 @@ local function need_session(dap, root)
         return nil, reply
     end
     touch()
-    return s
+    return active_session()
 end
 
 ------------------------------------------------------------------------
@@ -1319,7 +1651,7 @@ local function session_options(args)
 end
 
 -- Start `config` with `adapter` and wait for the first stop or exit.
-local function start_session(dap, adapter_name, adapter, config, args, root, request_kind)
+local function start_session(dap, adapter_name, adapter, config, args, root, request_kind, dap_type)
     if state.session and not state.session.closed and state.exit == nil then
         err(
             "a debug session is already active (%s, %s); debug_stop it first, or debug_launch() with no arguments to restart",
@@ -1329,11 +1661,12 @@ local function start_session(dap, adapter_name, adapter, config, args, root, req
     ensure_idle_timer()
     local keep_bps = state.breakpoints
     local keep_track, keep_mode = state.track, state.variables_mode
-    local keep_last = { state.last_config, state.last_launch_args, state.last_adapter }
+    local keep_last = { state.last_config, state.last_launch_args, state.last_adapter, state.last_dap_type }
     state = new_state()
     state.breakpoints = keep_bps
     state.track, state.variables_mode = keep_track, keep_mode
-    state.last_config, state.last_launch_args, state.last_adapter = keep_last[1], keep_last[2], keep_last[3]
+    state.last_config, state.last_launch_args = keep_last[1], keep_last[2]
+    state.last_adapter, state.last_dap_type = keep_last[3], keep_last[4]
     session_options(args)
     state.origin = "agent"
     state.request = request_kind
@@ -1345,14 +1678,19 @@ local function start_session(dap, adapter_name, adapter, config, args, root, req
     touch()
     record_fingerprints(args.file)
 
-    local type_name = "agent99_" .. adapter_name
-    dap.adapters[type_name] = adapter
+    -- Built-ins register under a private name; adapters that read the
+    -- configuration's type themselves (js-debug's "pwa-node", java) and
+    -- user configurations keep theirs, reusing an adapter the user defined.
+    local type_name = dap_type or ("agent99_" .. adapter_name)
+    if not dap_type or dap.adapters[type_name] == nil then
+        dap.adapters[type_name] = adapter
+    end
     dap.defaults[type_name].auto_continue_if_many_stopped = false
     config = vim.deepcopy(config)
     config.type = type_name
     config.request = request_kind
     config.name = config.name or "agent99"
-
+    state.dap_type = type_name
     state.claiming = true
     local wait_ms = clamp_wait(args.wait_ms)
     local ok_run, run_err = pcall(dap.run, config, { new = true })
@@ -1432,11 +1770,12 @@ local function launch(args)
             if args[k] ~= nil then merged[k] = args[k] end
         end
         local adapter_name = state.adapter or state.last_adapter
-        local adapter = dap.adapters["agent99_" .. adapter_name]
+        local dap_type = state.dap_type or state.last_dap_type
+        local adapter = dap.adapters[dap_type or ("agent99_" .. adapter_name)]
         if type(adapter) == "nil" then
             err("the previous adapter (%s) is gone; pass file or program again", adapter_name)
         end
-        return start_session(dap, adapter_name, adapter, cfg, merged, root, cfg.request or "launch")
+        return start_session(dap, adapter_name, adapter, cfg, merged, root, cfg.request or "launch", dap_type)
     end
     -- A user configuration by name (or the first launch entry for the file).
     local ft = filetype_of(args.file) or filetype_of(args.program)
@@ -1462,11 +1801,11 @@ local function launch(args)
         if not adapter then
             err("configuration %q references adapter %q which is not defined", cfg.name or "?", tostring(cfg.type))
         end
-        return start_session(dap, cfg.type, adapter, cfg, args, root, cfg.request or "launch")
+        return start_session(dap, cfg.type, adapter, cfg, args, root, cfg.request or "launch", cfg.type)
     end
     local spec, bin = pick_adapter(dap, args, root, "launch")
     local cfg = spec.launch(args, root, bin)
-    return start_session(dap, spec.name, spec.adapter(bin, root), cfg, args, root, "launch")
+    return start_session(dap, spec.name, spec.adapter(bin, root), cfg, args, root, "launch", spec.dap_type)
 end
 
 local function attach(args)
@@ -1481,18 +1820,20 @@ local function attach(args)
         if #candidates == 0 then err("no nvim-dap attach configuration named %q", args.config) end
         local cfg = evaluate_user_config(candidates[1])
         local adapter = dap.adapters[cfg.type]
-        return start_session(dap, cfg.type, adapter, cfg, args, root, "attach")
+        return start_session(dap, cfg.type, adapter, cfg, args, root, "attach", cfg.type)
     end
     local spec, bin = pick_adapter(dap, args, root, "attach")
-    local cfg = spec.attach(args)
+    local cfg = spec.attach(args, root)
     local adapter
-    if args.port and not args.pid then
+    if args.port and not args.pid and spec.remote_adapter ~= false then
+        -- host/port names a DAP server (Delve's headless server, debugpy's
+        -- listener): connect to it directly instead of spawning an adapter.
         adapter = spec.remote_adapter and spec.remote_adapter(args)
             or { type = "server", host = args.host or "127.0.0.1", port = args.port }
     else
         adapter = spec.adapter(bin, root)
     end
-    local ok, reply = pcall(start_session, dap, spec.name, adapter, cfg, args, root, "attach")
+    local ok, reply = pcall(start_session, dap, spec.name, adapter, cfg, args, root, "attach", spec.dap_type)
     if not ok then
         local msg = tostring(reply)
         if args.pid and (msg:find("ptrace") or msg:find("Operation not permitted") or msg:find("attach")) then
@@ -1944,9 +2285,18 @@ local function debug_output(args)
 end
 
 local DEBUGGER_PACKAGES = {
-    go = "delve", python = "debugpy", c = "codelldb", cpp = "codelldb", rust = "codelldb", zig = "codelldb",
+    go = "delve",
+    python = "debugpy",
+    c = "codelldb",
+    cpp = "codelldb",
+    rust = "codelldb",
+    zig = "codelldb",
+    javascript = "js-debug-adapter",
+    typescript = "js-debug-adapter",
+    javascriptreact = "js-debug-adapter",
+    typescriptreact = "js-debug-adapter",
+    java = "java-debug-adapter",
 }
-
 local function install_debugger(args)
     local ft = args.language
     if type(ft) ~= "string" or ft == "" then err("missing required argument: language") end
@@ -1956,7 +2306,7 @@ local function install_debugger(args)
     if not package then
         err("no known debug adapter package for %s; pass package explicitly", ft)
     end
-    local spec = BUILTIN[package] or BUILTIN.codelldb
+    local spec = BUILTIN[PACKAGE_SPEC[package] or package] or BUILTIN.codelldb
     local out = { language = ft, package = package }
     local already = spec.find and spec.find(root)
     if already then

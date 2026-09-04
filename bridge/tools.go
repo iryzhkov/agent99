@@ -461,7 +461,7 @@ var debugTools = []tool{
 	{
 		Name: "debug_launch",
 		Description: "Start the program under a debugger and wait for the first stop or its exit. file picks the adapter by " +
-			"filetype (Go: its package; Python: the script; C/C++/Rust: pass program, the binary). No arguments relaunches " +
+			"filetype (Go: its package; Python/JS/TS: the script; Java: the file with main; C/C++/Rust: pass program, the binary). No arguments relaunches " +
 			"the previous configuration with breakpoints kept. Replies with the stop context: frame, source, locals, stack, output.",
 		InputSchema: map[string]any{
 			"type": "object",
@@ -472,7 +472,7 @@ var debugTools = []tool{
 				"cwd":           map[string]any{"type": "string", "description": "Working directory (default: root)."},
 				"env":           map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}, "description": "Extra environment variables."},
 				"config":        map[string]any{"type": "string", "description": "Name of a user nvim-dap configuration to run instead of a built-in adapter."},
-				"adapter":       map[string]any{"type": "string", "enum": []string{"delve", "debugpy", "codelldb", "lldb-dap", "gdb"}, "description": "Force a built-in adapter."},
+				"adapter":       map[string]any{"type": "string", "enum": []string{"delve", "debugpy", "codelldb", "lldb-dap", "gdb", "js-debug", "java"}, "description": "Force a built-in adapter."},
 				"stop_on_entry": map[string]any{"type": "boolean", "description": "Stop at the first line (default false: run to the first breakpoint or exit)."},
 				"variables":     map[string]any{"type": "string", "enum": []string{"summary", "names", "none"}, "description": "How much of the locals every stop reply carries (default summary)."},
 				"track":         map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Expressions evaluated in the top frame at every stop."},
@@ -491,7 +491,7 @@ var debugTools = []tool{
 				"pid":       map[string]any{"type": "integer", "description": "Process id to attach to."},
 				"host":      map[string]any{"type": "string", "description": "Debug server host (default 127.0.0.1)."},
 				"port":      map[string]any{"type": "integer", "description": "Debug server port."},
-				"adapter":   map[string]any{"type": "string", "enum": []string{"delve", "debugpy", "codelldb", "lldb-dap", "gdb"}, "description": "Adapter to use; else picked from file's filetype."},
+				"adapter":   map[string]any{"type": "string", "enum": []string{"delve", "debugpy", "codelldb", "lldb-dap", "gdb", "js-debug", "java"}, "description": "Adapter to use; else picked from file's filetype."},
 				"file":      map[string]any{"type": "string", "description": "A source file of the target, to pick the adapter by filetype."},
 				"config":    map[string]any{"type": "string", "description": "Name of a user nvim-dap attach configuration."},
 				"variables": map[string]any{"type": "string", "enum": []string{"summary", "names", "none"}},
