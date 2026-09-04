@@ -1583,7 +1583,9 @@ local function format_region(bufnr, first, last, mode)
 end
 
 local polish_ns = vim.api.nvim_create_namespace("agent99_polish")
-
+-- Anchor for a multi-region edit's span: its own namespace, because
+-- polish_after_edit clears polish_ns after every region it formats.
+local span_ns = vim.api.nvim_create_namespace("agent99_span")
 -- After an edit wrote `count` lines at `first`, format that region and
 -- organize imports (both optional), then return where the region ended up
 -- (imports added above it shift it) plus a list of what was done.
@@ -1616,17 +1618,29 @@ local function polish_after_edit(bufnr, first, count, opts)
     local s = vim.api.nvim_buf_get_extmark_by_id(bufnr, polish_ns, m_start, {})
     vim.api.nvim_buf_clear_namespace(bufnr, polish_ns, 0, -1)
     local new_total = vim.api.nvim_buf_line_count(bufnr)
-    local new_tail = vim.api.nvim_buf_get_lines(bufnr, new_total - #tail, -1, false)
-    if s and s[1] and vim.deep_equal(tail, new_tail) then
+    -- A range formatter can reach past the region it was given (lua_ls
+    -- drops a blank line after a function that shrank). The part of the
+    -- old tail that no longer matches is folded into the edited region,
+    -- and handed back so the ledger's "before" covers it too; otherwise an
+    -- undo would restore the region and leave the formatter's change.
+    local keep = 0
+    while keep < #tail and keep < new_total do
+        local old_line = tail[#tail - keep]
+        local new_line = vim.api.nvim_buf_get_lines(bufnr, new_total - keep - 1, new_total - keep, false)[1]
+        if old_line ~= new_line then break end
+        keep = keep + 1
+    end
+    local extra_old = {}
+    for i = 1, #tail - keep do extra_old[#extra_old + 1] = tail[i] end
+    if s and s[1] then
         local new_first = s[1] + 1
-        local new_count = (new_total - #tail) - s[1]
+        local new_count = (new_total - keep) - s[1]
         if new_count >= 0 then
-            return new_first, new_count, done
+            return new_first, new_count, done, extra_old
         end
     end
-    return first, count, done
+    return first, count, done, extra_old
 end
-
 -- Pre-existing diagnostics in the edited file are listed rather than counted,
 -- up to this many; past it the rest become a tally.
 local PREEXISTING_LISTED = 10
@@ -2643,9 +2657,53 @@ end
 -- Shared tail of every edit tool: the lines are already in the buffer;
 -- polish (format, imports), record the final region in the ledger, and
 -- build the reply with the post-edit report.
-local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_old, old_lines, count, fields)
+local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_old, old_lines, count, fields, regions)
     local opts = post_edit_options()
-    local pfirst, pcount, done = polish_after_edit(bufnr, first, count, opts)
+    local pfirst, pcount, done, extra_old
+    if regions and #regions > 1 then
+        -- Several edited regions far apart (chunks in different symbols):
+        -- format each one on its own, bottom-up, so the code between them
+        -- is left alone, then organize imports once. The span that goes in
+        -- the ledger is re-measured from an extmark at its start and the
+        -- untouched tail of the file, the same anchors polish_after_edit
+        -- uses for one region.
+        local tail = vim.api.nvim_buf_get_lines(bufnr, first - 1 + count, -1, false)
+        local m_start = vim.api.nvim_buf_set_extmark(bufnr, span_ns, first - 1, 0, { right_gravity = false })
+        local seen = {}
+        local format_only = vim.tbl_extend("force", opts, { organize_imports = false })
+        for i = #regions, 1, -1 do
+            local _, _, d = polish_after_edit(bufnr, regions[i].first, regions[i].count, format_only)
+            for _, x in ipairs(d) do seen[x] = true end
+        end
+        local _, _, d = polish_after_edit(bufnr, first, 0, vim.tbl_extend("force", opts, { format = false }))
+        for _, x in ipairs(d) do seen[x] = true end
+        done = vim.tbl_keys(seen)
+        table.sort(done)
+        local s = vim.api.nvim_buf_get_extmark_by_id(bufnr, span_ns, m_start, {})
+        vim.api.nvim_buf_clear_namespace(bufnr, span_ns, 0, -1)
+        local new_total = vim.api.nvim_buf_line_count(bufnr)
+        -- Same tail rule as polish_after_edit: whatever a formatter changed
+        -- below the span joins the recorded region.
+        local keep = 0
+        while keep < #tail and keep < new_total do
+            local new_line = vim.api.nvim_buf_get_lines(bufnr, new_total - keep - 1, new_total - keep, false)[1]
+            if tail[#tail - keep] ~= new_line then break end
+            keep = keep + 1
+        end
+        extra_old = {}
+        for i = 1, #tail - keep do extra_old[#extra_old + 1] = tail[i] end
+        pfirst, pcount = first, count
+        if s and s[1] then
+            pfirst = s[1] + 1
+            pcount = math.max(0, (new_total - keep) - s[1])
+        end
+    else
+        pfirst, pcount, done, extra_old = polish_after_edit(bufnr, first, count, opts)
+    end
+    if extra_old and #extra_old > 0 then
+        old_lines = vim.list_extend(vim.list_slice(old_lines, 1, #old_lines), extra_old)
+        last_old = last_old + #extra_old
+    end
     local new_lines = vim.api.nvim_buf_get_lines(bufnr, pfirst - 1, pfirst - 1 + pcount, false)
     record_edit(bufnr, ledger_path, kind, pfirst, last_old + (pfirst - first), old_lines, new_lines)
     fields.file = vim.api.nvim_buf_get_name(bufnr)
@@ -2654,9 +2712,9 @@ local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_o
     if #done > 0 then
         fields.polished = table.concat(done, ", ")
     end
-    return vim.tbl_extend("error", fields, post_edit_report(bufnr, before, args.root, args.headless, opts, args.full_diagnostics))
+    return vim.tbl_extend("error", fields,
+        post_edit_report(bufnr, before, args.root, args.headless, opts, args.full_diagnostics))
 end
-
 -- A unified diff of what an edit would do, for the dry_run of the tools that
 -- otherwise apply immediately. rename_symbol has always been able to show its
 -- blast radius before committing to it; a large body replacement is no less
@@ -2716,9 +2774,9 @@ local function locate_expected(bufnr, entry, want)
         end
     end
     if #hits == 1 then
-        return hits[1], 1
+        return hits[1], 1, n
     end
-    return nil, #hits
+    return nil, #hits, n
 end
 
 -- The chunks of a replace_symbol_lines call: the single first_line/
@@ -2745,35 +2803,58 @@ local function edit_chunks(args)
         if c.expect ~= nil and type(c.expect) ~= "string" then
             err("chunk %d: expect must be a string: the text those lines currently hold", i)
         end
-        out[i] = { first = first, last = last, text = c.text, expect = c.expect }
+        if c.name_path ~= nil and type(c.name_path) ~= "string" then
+            err("chunk %d: name_path must be a string", i)
+        end
+        out[i] = {
+            first = first,
+            last = last,
+            text = c.text,
+            expect = c.expect,
+            name_path = c.name_path or args.name_path,
+            index = i
+        }
     end
     return out
 end
 
 local function replace_symbol_lines(args)
-    local bufnr, entry = resolve_symbol(args.file, args.name_path)
-    local span = entry.last - entry.first + 1
     local chunks = edit_chunks(args)
-    for i, c in ipairs(chunks) do
+    -- Each chunk addresses its own symbol (default: the call's name_path),
+    -- so one call can touch the four functions one concept lives in. All
+    -- in one file: the ledger, the polish and the diagnostics report are
+    -- per buffer.
+    local bufnr
+    local entries = {}
+    for _, c in ipairs(chunks) do
+        if not c.name_path then
+            err("chunk %d: missing name_path (none on the call either)", c.index)
+        end
+        if not entries[c.name_path] then
+            local b, entry = resolve_symbol(args.file, c.name_path)
+            bufnr = bufnr or b
+            entries[c.name_path] = entry
+        end
+        c.entry = entries[c.name_path]
+        local span = c.entry.last - c.entry.first + 1
         if c.first < 1 or c.last < c.first or c.last > span then
             err("chunk %d: lines %s-%s are outside the symbol %s, which has %d lines (1-%d relative)",
-                i, tostring(c.first), tostring(c.last), entry.path, span, span)
+                c.index, tostring(c.first), tostring(c.last), c.entry.path, span, span)
         end
-    end
-    table.sort(chunks, function(a, b) return a.first < b.first end)
-    for i = 2, #chunks do
-        if chunks[i].first <= chunks[i - 1].last then
-            err("chunks overlap: lines %d-%d and %d-%d", chunks[i - 1].first,
-                chunks[i - 1].last, chunks[i].first, chunks[i].last)
-        end
-    end
-    for _, c in ipairs(chunks) do
-        c.abs_first = entry.first + c.first - 1
-        c.abs_last = entry.first + c.last - 1
+        c.abs_first = c.entry.first + c.first - 1
+        c.abs_last = c.entry.first + c.last - 1
         c.new_lines = vim.split((c.text:gsub("\n+$", "")), "\n", { plain = true })
         c.old = vim.api.nvim_buf_get_lines(bufnr, c.abs_first - 1, c.abs_last, false)
     end
-
+    local entry = chunks[1].entry
+    local symbols = vim.tbl_count(entries)
+    table.sort(chunks, function(a, b) return a.abs_first < b.abs_first end)
+    for i = 2, #chunks do
+        if chunks[i].abs_first <= chunks[i - 1].abs_last then
+            err("chunks overlap: lines %d-%d of %s and %d-%d of %s", chunks[i - 1].first,
+                chunks[i - 1].last, chunks[i - 1].entry.path, chunks[i].first, chunks[i].last, chunks[i].entry.path)
+        end
+    end
     -- Relative line numbers are read off a snapshot - a find_symbol body or a
     -- grep hit - and an edit anywhere above the symbol moves every one of
     -- them. The numbers stay perfectly valid-looking after the shift, so the
@@ -2784,17 +2865,18 @@ local function replace_symbol_lines(args)
     -- once in the symbol, it offers the relocated edit as a code action, so
     -- the fix is one apply_code_action call and no re-read.
     local stale, relocated = {}, {}
-    for i, c in ipairs(chunks) do
+    for _, c in ipairs(chunks) do
         if c.expect ~= nil and not args.force then
             local want = vim.trim((c.expect:gsub("\n+$", "")))
             local have = vim.trim(table.concat(c.old, "\n"))
             if want ~= have then
-                local at, count = locate_expected(bufnr, entry, want)
-                stale[#stale + 1] = { chunk = i, c = c, have = have, want = want, at = at, count = count }
+                -- The relocated range is as long as the expected text, not
+                -- as long as the requested one: a caller who miscounted the
+                -- last line still meant the text it named.
+                local at, count, n = locate_expected(bufnr, c.entry, want)
+                stale[#stale + 1] = { c = c, have = have, want = want, at = at, count = count, n = n }
                 if at then
-                    relocated[#relocated + 1] = vim.tbl_extend("force", c, {
-                        first_line = at, last_line = at + (c.last - c.first),
-                    })
+                    relocated[c] = { first_line = at, last_line = at + n - 1 }
                 end
             end
         end
@@ -2804,31 +2886,30 @@ local function replace_symbol_lines(args)
         for _, s in ipairs(stale) do
             lines[#lines + 1] = ("lines %d-%d of %s do not hold the expected text, so the numbers are "
                     .. "probably from before an earlier edit shifted them.\nexpected: %s\nfound:    %s")
-                :format(s.c.first, s.c.last, entry.path, vim.inspect(s.want), vim.inspect(s.have))
+                :format(s.c.first, s.c.last, s.c.entry.path, vim.inspect(s.want), vim.inspect(s.have))
             if s.at then
                 lines[#lines + 1] = ("the expected text is at lines %d-%d (relative) instead."):format(
-                    s.at, s.at + (s.c.last - s.c.first))
+                    s.at, s.at + s.n - 1)
             elseif s.count > 1 then
-                lines[#lines + 1] = ("the expected text occurs %d times in the symbol; pick with more context."):format(
-                s.count)
+                lines[#lines + 1] = ("the expected text occurs %d times in %s; pick with more context."):format(
+                    s.count, s.c.entry.path)
             else
-                lines[#lines + 1] = "the expected text is nowhere in the symbol; re-read it with find_symbol."
+                lines[#lines + 1] = ("the expected text is nowhere in %s; re-read it with find_symbol."):format(
+                    s.c.entry.path)
             end
         end
         local actions = {}
-        if #relocated == #stale then
+        if vim.tbl_count(relocated) == #stale then
             -- Every stale chunk has one home: the whole call, relocated.
             local moved = {}
             for _, c in ipairs(chunks) do
-                local r
-                for _, rc in ipairs(relocated) do
-                    if rc.first == c.first then r = rc end
-                end
+                local r = relocated[c]
                 moved[#moved + 1] = {
                     first_line = r and r.first_line or c.first,
                     last_line = r and r.last_line or c.last,
                     text = c.text,
-                    expect = c.expect
+                    expect = c.expect,
+                    name_path = c.name_path,
                 }
             end
             actions[#actions + 1] = {
@@ -2861,7 +2942,7 @@ local function replace_symbol_lines(args)
         local previews = {}
         for _, c in ipairs(chunks) do
             previews[#previews + 1] = preview_diff(c.old, c.new_lines,
-                ("lines %d-%d of %s"):format(c.first, c.last, entry.path))
+                ("lines %d-%d of %s"):format(c.first, c.last, c.entry.path))
         end
         if #previews == 1 then
             return vim.tbl_extend("force", { file = rel_path(vim.api.nvim_buf_get_name(bufnr)) }, previews[1])
@@ -2875,18 +2956,37 @@ local function replace_symbol_lines(args)
     local span_first, span_last = chunks[1].abs_first, chunks[#chunks].abs_last
     local span_old = vim.api.nvim_buf_get_lines(bufnr, span_first - 1, span_last, false)
     local delta = 0
+    local regions = {}
     for i = #chunks, 1, -1 do
         local c = chunks[i]
         vim.api.nvim_buf_set_lines(bufnr, c.abs_first - 1, c.abs_last, false, c.new_lines)
         delta = delta + #c.new_lines - #c.old
     end
-    local label = #chunks == 1
-        and ("lines %d-%d of %s"):format(chunks[1].first, chunks[1].last, entry.path)
-        or ("%d chunks (lines %d-%d) of %s"):format(#chunks, chunks[1].first, chunks[#chunks].last, entry.path)
-    local result = finish_edit(bufnr, args, before,
-        ("%s:%d-%d"):format(entry.path, chunks[1].first, chunks[#chunks].last),
+    -- Where each chunk landed, after the ones below it moved nothing and the
+    -- ones above shifted it by their growth.
+    local shift = 0
+    for _, c in ipairs(chunks) do
+        regions[#regions + 1] = { first = c.abs_first + shift, count = #c.new_lines }
+        shift = shift + #c.new_lines - #c.old
+    end
+    local label
+    if #chunks == 1 then
+        label = ("lines %d-%d of %s"):format(chunks[1].first, chunks[1].last, entry.path)
+    elseif symbols == 1 then
+        label = ("%d chunks (lines %d-%d) of %s"):format(#chunks, chunks[1].first, chunks[#chunks].last, entry.path)
+    else
+        local names = {}
+        for _, c in ipairs(chunks) do
+            if not vim.tbl_contains(names, c.entry.path) then names[#names + 1] = c.entry.path end
+        end
+        label = ("%d chunks in %s"):format(#chunks, table.concat(names, ", "))
+    end
+    local ledger_path = symbols == 1
+        and ("%s:%d-%d"):format(entry.path, chunks[1].first, chunks[#chunks].last)
+        or ("%d symbols:%d-%d"):format(symbols, span_first, span_last)
+    local result = finish_edit(bufnr, args, before, ledger_path,
         "replace_lines", span_first, span_last, span_old, #span_old + delta,
-        { replaced = label })
+        { replaced = label }, symbols > 1 and regions or nil)
     -- Always echo what was there. Without `expect` this is the only way a
     -- caller finds out an offset had drifted, and it costs a few lines.
     if #chunks == 1 then
@@ -2894,7 +2994,8 @@ local function replace_symbol_lines(args)
     else
         local echo = {}
         for _, c in ipairs(chunks) do
-            echo[#echo + 1] = { lines = ("%d-%d"):format(c.first, c.last), replaced_text = c.old }
+            echo[#echo + 1] = { symbol = symbols > 1 and c.entry.path or nil,
+                lines = ("%d-%d"):format(c.first, c.last), replaced_text = c.old }
         end
         result.replaced_chunks = echo
     end

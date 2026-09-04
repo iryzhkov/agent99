@@ -208,12 +208,12 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "replace_symbol_lines",
-		Description: "Replace lines first_line..last_line of a symbol, numbered relative to its declaration (=1) as find_symbol bodies show; prefer over replace_symbol_body for small changes. Several places in one symbol go in chunks, applied together. Applied to the editor buffer immediately and tracked; returns fresh diagnostics and the text it replaced. Line numbers go stale the moment anything above the symbol changes - pass expect= with the current text of those lines: a stale offset is refused and the refusal offers the relocated edit as a code action, so apply_code_action(token, 1) finishes it without a re-read. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
+		Description: "Replace lines first_line..last_line of a symbol, numbered relative to its declaration (=1) as find_symbol bodies show; prefer over replace_symbol_body for small changes. Several places in one file go in chunks, each naming its own symbol, applied together. Applied to the editor buffer immediately and tracked; returns fresh diagnostics and the text it replaced. Line numbers go stale the moment anything above the symbol changes - pass expect= with the current text of those lines: a stale offset is refused and the refusal offers the relocated edit as a code action, so apply_code_action(token, 1) finishes it without a re-read. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"file":       map[string]any{"type": "string", "description": "File containing the symbol."},
-				"name_path":  map[string]any{"type": "string", "description": "Symbol name path."},
+				"name_path":  map[string]any{"type": "string", "description": "Symbol name path; the default for chunks that name none."},
 				"first_line": map[string]any{"type": "integer", "description": "First line to replace, relative to the symbol (1-based)."},
 				"last_line":  map[string]any{"type": "integer", "description": "Last line to replace, relative to the symbol (inclusive)."},
 				"text":       map[string]any{"type": "string", "description": "Replacement for those lines."},
@@ -223,10 +223,11 @@ var lspTools = []tool{
 				},
 				"chunks": map[string]any{
 					"type":        "array",
-					"description": "Several non-overlapping replacements in the same symbol, instead of first_line/last_line/text/expect. Line numbers all refer to the symbol as it is now; all chunks apply or none.",
+					"description": "Several non-overlapping replacements in the same file, instead of first_line/last_line/text/expect. Each chunk may name its own symbol (name_path); line numbers are relative to that symbol as it is now. All chunks apply or none.",
 					"items": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
+							"name_path":  map[string]any{"type": "string", "description": "Symbol this chunk edits (default: the call's name_path)."},
 							"first_line": map[string]any{"type": "integer"},
 							"last_line":  map[string]any{"type": "integer"},
 							"text":       map[string]any{"type": "string"},
@@ -238,7 +239,7 @@ var lspTools = []tool{
 				"dry_run":          map[string]any{"type": "boolean", "description": "Show a unified diff of the change without applying it."},
 				"full_diagnostics": map[string]any{"type": "boolean", "description": "List the pre-existing diagnostics again even when they have not changed since the last reply."},
 			},
-			"required": []string{"file", "name_path"},
+			"required": []string{"file"},
 		},
 	},
 	{

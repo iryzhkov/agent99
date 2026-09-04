@@ -9,6 +9,7 @@ instance uses the minimal config, not the user's).
 """
 
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -132,7 +133,6 @@ def main():
             check("stale expect is refused", False, "call succeeded")
         except RuntimeError as e:
             msg = str(e)
-            import re
             m = re.search(r"token=(\d+)", msg)
             check("stale expect is refused with a relocation",
                   "at lines 2-2 (relative)" in msg and m is not None, msg)
@@ -168,8 +168,47 @@ def main():
             check("chunked edit is all-or-nothing", False, "call succeeded")
         except RuntimeError as e:
             check("chunked edit is all-or-nothing",
-                  "nowhere in the symbol" in str(e) and open(util).read() == text, e)
+                  "nowhere in M.greet" in str(e) and open(util).read() == text, e)
 
+        # Chunks may name their own symbols: one concept living in two
+        # functions is one call. The relocated range follows the expected
+        # text's length, so a miscounted last_line still lands right.
+        res = b.call("replace_symbol_lines", {
+            "file": util,
+            "chunks": [
+                {"name_path": "M.greet", "first_line": 2, "last_line": 2,
+                 "expect": "name = tostring(name)", "text": "    name = tostring(name):lower()"},
+                {"name_path": "M.shout", "first_line": 2, "last_line": 2,
+                 "expect": 'return string.upper(M.greet(name))',
+                 "text": "    return string.upper(M.greet(name)) .. \"!\""},
+            ],
+        })
+        text = open(util).read()
+        check("chunks across symbols apply together",
+              "tostring(name):lower()" in text and '.. "!"' in text
+              and [c.get("symbol") for c in res.get("replaced_chunks", [])] == ["M.greet", "M.shout"], res)
+        try:
+            b.call("replace_symbol_lines", {
+                "file": util,
+                "chunks": [
+                    {"name_path": "M.greet", "first_line": 1, "last_line": 3,
+                     "expect": "name = tostring(name):lower()", "text": "    name = tostring(name)"},
+                    {"name_path": "M.shout", "first_line": 3, "last_line": 3,
+                     "expect": 'return string.upper(M.greet(name)) .. "!"',
+                     "text": "    return string.upper(M.greet(name))"},
+                ],
+            })
+            check("stale chunks across symbols are refused", False, "call succeeded")
+        except RuntimeError as e:
+            m = re.search(r"token=(\d+)", str(e))
+            check("stale chunks across symbols are refused with a relocation",
+                  "at lines 2-2 (relative)" in str(e) and m is not None, e)
+            assert m is not None
+            res = b.call("apply_code_action", {"token": m.group(1), "index": 1})
+            text = open(util).read()
+            check("relocated chunks apply in both symbols",
+                  "tostring(name):lower()" not in text and '.. "!"' not in text
+                  and "    name = tostring(name)\n" in text, res)
         # The pre-existing diagnostics are listed once, then reported as
         # unchanged until they change or full_diagnostics asks again.
         res = b.call("replace_symbol_lines", {
@@ -247,9 +286,13 @@ def main():
         res = b.call("undo_edit", {})
         with open(util) as f:
             on_disk = f.read()
+        # The formatter drops the blank line after the inserted function; the
+        # ledger folds that into the edit, so the undo puts the blank back
+        # too (and reports a restore rather than a removal).
         check("undo_edit removes the insert",
               len(res.get("undone", [])) == 1 and "M.extra" not in on_disk
-              and res.get("undone")[0].get("removed_lines"), res)
+              and on_disk.endswith("end\n\nreturn M\n")
+              and (res["undone"][0].get("removed_lines") or res["undone"][0].get("restored_lines")), res)
         check("undo_edit keeps older edits", res.get("remaining", 0) >= 1, res)
         res = b.call("undo_edit", {"all": True})
         with open(util) as f:
