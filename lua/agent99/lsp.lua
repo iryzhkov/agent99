@@ -62,6 +62,17 @@ end
 -- Load `file` into a (possibly hidden) buffer. bufload triggers filetype
 -- detection, so vim.lsp.enable()-style auto-attach fires just as it would
 -- for an interactively opened file.
+local loaded_at = {}
+
+-- Test files by the common conventions; the map leaves them out unless
+-- asked, and find_symbol ranks them after production code.
+local function is_test_path(path)
+    return path:find("_test%.%w+$") or path:find("%.test%.%w+$")
+        or path:find("%.spec%.%w+$") or path:find("^tests?/") or path:find("/tests?/")
+        or path:find("^test_[^/]*%.py$") or path:find("/test_[^/]*%.py$")
+        or path:find("/__tests__/") or path:find("/testdata/")
+end
+
 local function load_buf(file)
     if type(file) ~= "string" or file == "" then
         err("missing required argument: file")
@@ -73,12 +84,46 @@ local function load_buf(file)
     local bufnr = vim.fn.bufadd(path)
     if not vim.api.nvim_buf_is_loaded(bufnr) then
         vim.fn.bufload(bufnr)
+        loaded_at[bufnr] = vim.uv.now()
     end
     return bufnr, path
 end
 
+-- Buffers loaded within this window may have a server still indexing its
+-- project (tsserver, gopls on a big module); whole-project queries that
+-- come back near-empty are retried once after a pause.
+local FRESH_BUF_MS = 15000
+local FRESH_RETRY_MS = 1500
+
+local function fresh_buf(bufnr)
+    local t = loaded_at[bufnr]
+    return t ~= nil and (vim.uv.now() - t) < FRESH_BUF_MS
+end
+
 -- Wait for an attached client that supports `method`. Attaching can take a
 -- moment when the buffer was just loaded and the server is still starting.
+-- Names of the enabled vim.lsp configs whose filetypes include ft.
+local function enabled_lsp_configs_for(ft)
+    local names = {}
+    local ok, enabled = pcall(function() return vim.lsp._enabled_configs end)
+    if not ok or type(enabled) ~= "table" then
+        return names
+    end
+    for name in pairs(enabled) do
+        local okc, cfg = pcall(function() return vim.lsp.config[name] end)
+        if okc and type(cfg) == "table" then
+            for _, cft in ipairs(cfg.filetypes or {}) do
+                if cft == ft then
+                    names[#names + 1] = name
+                    break
+                end
+            end
+        end
+    end
+    table.sort(names)
+    return names
+end
+
 local function get_client(bufnr, method, timeout_ms)
     local deadline = vim.uv.now() + (timeout_ms or ATTACH_TIMEOUT_MS)
     while true do
@@ -151,6 +196,17 @@ local function position_params(bufnr, client, args)
     }
 end
 
+-- Paths in results are relative to the working directory (the workspace
+-- root in headless mode) when they lie under it; tools resolve relative
+-- paths against the root, so the model can pass them straight back.
+local function rel_path(path)
+    local cwd = vim.fn.getcwd()
+    if path:sub(1, #cwd + 1) == cwd .. "/" then
+        return path:sub(#cwd + 2)
+    end
+    return path
+end
+
 local function line_preview(path, lnum)
     local bufnr = vim.fn.bufnr(path)
     if bufnr ~= -1 and vim.api.nvim_buf_is_loaded(bufnr) then
@@ -175,12 +231,11 @@ local function format_locations(result)
         local range = loc.targetSelectionRange or loc.range
         local path = vim.uri_to_fname(uri)
         local lnum = range.start.line + 1
-        out[#out + 1] = {
-            file = path,
-            line = lnum,
-            end_line = range["end"].line + 1,
-            text = line_preview(path, lnum),
-        }
+        local item = { file = path, line = lnum, text = line_preview(path, lnum) }
+        if range["end"].line ~= range.start.line then
+            item.end_line = range["end"].line + 1
+        end
+        out[#out + 1] = item
     end
     local res = { count = total, locations = out }
     if total > MAX_LOCATIONS then
@@ -220,11 +275,18 @@ local function flatten_symbols(symbols, depth, out, bufnr)
     for _, s in ipairs(symbols or {}) do
         local range = s.selectionRange or (s.location and s.location.range)
         local lnum = range and (range.start.line + 1) or 0
-        out[#out + 1] = ("%s%d: %s %s — %s"):format(
-            string.rep("  ", depth), lnum, symbol_kind(s.kind), s.name,
-            bufnr and lnum > 0 and decl_line(bufnr, lnum) or "")
-        if s.children then
-            flatten_symbols(s.children, depth + 1, out, bufnr)
+        local kind = symbol_kind(s.kind)
+        if kind == "Null" then
+            -- clangd's wrapper for a macro-opened namespace: show what is
+            -- inside it at this depth, not the macro itself.
+            flatten_symbols(s.children, depth, out, bufnr)
+        else
+            out[#out + 1] = ("%s%d: %s %s — %s"):format(
+                string.rep("  ", depth), lnum, kind, s.name,
+                bufnr and lnum > 0 and decl_line(bufnr, lnum) or "")
+            if s.children then
+                flatten_symbols(s.children, depth + 1, out, bufnr)
+            end
         end
     end
     return out
@@ -246,10 +308,37 @@ local TS_WANTED = {
 local TS_EXCLUDED = {
     call = true, parameter = true, parameters = true, argument = true,
     arguments = true, index = true, expression = true, pointer = true,
-    import = true, type = true,
+    import = true, type = true, body = true,
 }
 
+-- Whole node types wanted despite an excluded segment: JavaScript's
+-- "const f = function () {}" is a function_expression; Go's structs and
+-- interfaces live under type_declaration; TypeScript's "type X = ..." is a
+-- type_alias_declaration; Rust's "type"/"mod" items are declarations too.
+local TS_WANTED_EXACT = {
+    function_expression = true,
+    type_declaration = true,
+    type_alias_declaration = true,
+    type_item = true,
+    mod_item = true,
+}
+
+-- True for node types the workspace map must not descend into: call
+-- arguments hold callbacks ("describe(..., () => {})", "$constructor(name,
+-- (inst, def) => {})") that are not declarations of the file.
+local function ts_opaque(node_type)
+    for segment in node_type:gmatch("[^_]+") do
+        if segment == "call" or segment == "arguments" or segment == "argument" then
+            return true
+        end
+    end
+    return false
+end
+
 local function ts_wanted(node_type)
+    if TS_WANTED_EXACT[node_type] then
+        return true
+    end
     local wanted = false
     for segment in node_type:gmatch("[^_]+") do
         if TS_EXCLUDED[segment] then
@@ -275,20 +364,22 @@ local function ts_outline(bufnr)
     end
     local out = {}
     local last_row = -1
+    local extra, extra_last_row = 0, -1
     local function walk(node, depth)
-        if #out >= MAX_SKIM_ENTRIES then
-            return
-        end
         for child in node:iter_children() do
-            if #out >= MAX_SKIM_ENTRIES then
-                return
-            end
             if child:named() then
                 if ts_wanted(child:type()) then
                     local srow, _, erow = child:range()
                     -- A wrapper and its inner node often start on the same
                     -- row (e.g. declaration + definition); emit it once.
-                    if srow ~= last_row then
+                    if #out >= MAX_SKIM_ENTRIES then
+                        -- Past the cap, keep counting top-level-ish entries
+                        -- so the tail note can say what was left out.
+                        if srow ~= extra_last_row and depth <= 1 then
+                            extra_last_row = srow
+                            extra = extra + 1
+                        end
+                    elseif srow ~= last_row then
                         last_row = srow
                         local span = erow > srow
                             and ("%d-%d"):format(srow + 1, erow + 1)
@@ -296,7 +387,9 @@ local function ts_outline(bufnr)
                         out[#out + 1] = ("%s%s: %s"):format(
                             string.rep("  ", depth), span, decl_line(bufnr, srow + 1))
                     end
-                    walk(child, depth + 1)
+                    if #out < MAX_SKIM_ENTRIES or depth < 1 then
+                        walk(child, depth + 1)
+                    end
                 else
                     walk(child, depth)
                 end
@@ -304,6 +397,11 @@ local function ts_outline(bufnr)
         end
     end
     walk(trees[1]:root(), 0)
+    if extra > 0 then
+        local last_line = tonumber(out[#out]:match("^%s*(%d+)")) or 0
+        out[#out + 1] = ("… +%d more declarations after line %d; find_symbol or "
+            .. "read_file with offset reach them"):format(extra, last_line)
+    end
     return out
 end
 
@@ -399,6 +497,27 @@ local function ts_query(args)
     return res
 end
 
+-- Filetypes with nothing to outline; a missing parser for these is not
+-- worth a warning.
+local DATA_FILETYPES = {
+    text = true, gitignore = true, gitattributes = true, gitcommit = true,
+    conf = true, dosini = true, json = true, jsonc = true, yaml = true,
+    toml = true, markdown = true, gomod = true, gosum = true, license = true,
+    csv = true, xml = true, html = true, css = true, svg = true,
+    ["" ] = true,
+}
+
+local function has_parser(ft)
+    local lang = vim.treesitter.language.get_lang(ft) or ft
+    -- add() returns nil (no error) for a missing parser on recent Neovim;
+    -- inspect() is the reliable "is it loaded" probe.
+    pcall(vim.treesitter.language.add, lang)
+    return (pcall(vim.treesitter.language.inspect, lang))
+end
+
+-- Filetypes whose treesitter outline is unreliable when a server is up.
+local PREFER_LSP_OUTLINE = { c = true, cpp = true, objc = true, objcpp = true, cuda = true }
+
 local function skim(args)
     local files = args.files
     if type(files) ~= "table" or #files == 0 then
@@ -417,24 +536,40 @@ local function skim(args)
                 file = vim.api.nvim_buf_get_name(bufnr),
                 total_lines = vim.api.nvim_buf_line_count(bufnr),
             }
-            local outline = ts_outline(bufnr)
+            local function lsp_outline(timeout_ms)
+                local okc, client = pcall(get_client, bufnr,
+                    "textDocument/documentSymbol", timeout_ms)
+                if not okc then return nil end
+                local okr, syms = pcall(request, client, bufnr,
+                    "textDocument/documentSymbol",
+                    { textDocument = { uri = vim.uri_from_bufnr(bufnr) } })
+                if not okr then return nil end
+                local flat = flatten_symbols(syms, 0, {}, bufnr)
+                return #flat > 0 and flat or nil
+            end
+            local outline
+            if PREFER_LSP_OUTLINE[vim.bo[bufnr].filetype] then
+                -- Macro-heavy C and C++ confuse the treesitter grammar
+                -- (FMT_BEGIN_NAMESPACE swallowing a file, expressions read
+                -- as declarators); the language server's symbols are exact.
+                outline = lsp_outline(3000)
+            end
+            outline = outline or ts_outline(bufnr)
             if not (outline and #outline > 0) then
                 -- No parser (or nothing recognized): try LSP symbols, briefly.
-                local okc, client = pcall(get_client, bufnr,
-                    "textDocument/documentSymbol", 1500)
-                if okc then
-                    local okr, syms = pcall(request, client, bufnr,
-                        "textDocument/documentSymbol",
-                        { textDocument = { uri = vim.uri_from_bufnr(bufnr) } })
-                    if okr then
-                        outline = flatten_symbols(syms, 0, {}, bufnr)
-                    end
-                end
+                outline = lsp_outline(1500)
             end
             if outline and #outline > 0 then
                 entry.outline = outline
             else
-                entry.note = "no outline available for this file; read it instead"
+                local ft = vim.bo[bufnr].filetype
+                if ft ~= "" and not has_parser(ft)
+                    and #vim.lsp.get_clients({ bufnr = bufnr }) == 0 then
+                    entry.note = ("no treesitter parser and no language server for %s: "
+                        .. "no outline; read the file instead"):format(ft)
+                else
+                    entry.note = "no outline available for this file; read it instead"
+                end
             end
             out[#out + 1] = entry
         end
@@ -447,9 +582,32 @@ end
 -- from disk with string parsers, so no buffers are created and no language
 -- servers attach; files without a parser are listed with name and size only.
 local MAX_MAP_FILES = 200
-local MAX_MAP_ENTRIES = 400
+local MAX_MAP_ENTRIES = 250
+local MAP_TEXT_MAX = 80
+-- Per-file share of the outline budget, so one file with hundreds of
+-- declarations cannot blank out the rest of the map.
+local MAP_FILE_MIN = 8
+local MAP_FILE_MAX = 60
 
-local function top_level_outline(path, budget)
+local MAX_MAP_FILE_BYTES = 2 * 1024 * 1024
+
+-- Filetypes seen by workspace_map that have no treesitter parser: reported
+-- once per call so the client knows why outlines are missing.
+local function top_level_outline(path, budget, missing)
+    -- Returns outline (or nil), line count, and a skip reason for files that
+    -- are not source text.
+    if vim.fn.getfsize(path) > MAX_MAP_FILE_BYTES then
+        return nil, nil, "large"
+    end
+    -- readfile() maps NUL bytes to newlines, so sniff the raw head instead.
+    local fh = io.open(path, "rb")
+    if fh then
+        local head = fh:read(4096)
+        fh:close()
+        if head and head:find("%z") then
+            return nil, nil, "binary"
+        end
+    end
     local ok, lines = pcall(vim.fn.readfile, path)
     if not ok or #lines == 0 then
         return nil, 0
@@ -462,35 +620,44 @@ local function top_level_outline(path, budget)
     local okp, parser = pcall(vim.treesitter.get_string_parser,
         table.concat(lines, "\n"), lang)
     if not okp or not parser then
+        if missing and not DATA_FILETYPES[ft] then
+            missing[ft] = (missing[ft] or 0) + 1
+        end
         return nil, #lines
     end
     local okt, trees = pcall(function() return parser:parse() end)
     if not okt or not trees or not trees[1] then
         return nil, #lines
     end
-    local out = {}
+    local out, extra = {}, 0
     -- Emit declaration-shaped nodes but never descend into them: only the
-    -- top level of each file, which is what a first look needs.
+    -- top level of each file, which is what a first look needs. Past the
+    -- budget, keep counting so the entry can say how much was left out.
     local function walk(node)
         for child in node:iter_children() do
-            if #out >= budget then
-                return
-            end
             if child:named() then
-                if ts_wanted(child:type()) then
-                    local srow = child:range()
-                    local text = (lines[srow + 1] or ""):gsub("^%s+", "")
-                    if #text > 100 then
-                        text = text:sub(1, 100) .. "…"
+                local ctype = child:type()
+                if ts_wanted(ctype) then
+                    if #out >= budget then
+                        extra = extra + 1
+                    else
+                        local srow = child:range()
+                        local text = (lines[srow + 1] or ""):gsub("^%s+", "")
+                        if #text > MAP_TEXT_MAX then
+                            text = text:sub(1, MAP_TEXT_MAX) .. "…"
+                        end
+                        out[#out + 1] = ("%d: %s"):format(srow + 1, text)
                     end
-                    out[#out + 1] = ("%d: %s"):format(srow + 1, text)
-                else
+                elseif not ts_opaque(ctype) then
                     walk(child)
                 end
             end
         end
     end
     walk(trees[1]:root())
+    if extra > 0 then
+        out[#out + 1] = ("… +%d more declarations (skim the file for all of them)"):format(extra)
+    end
     return out, #lines
 end
 
@@ -513,14 +680,32 @@ local function workspace_map(args)
             end
         end
     end
-    if type(args.glob) == "string" and args.glob ~= "" then
-        local re = vim.regex(vim.fn.glob2regpat(args.glob))
+    -- git lists tracked files before untracked ones; a path-sorted map is
+    -- easier to scan and stable across runs.
+    table.sort(files)
+    local tests_skipped = 0
+    if not args.include_tests then
         files = vim.tbl_filter(function(f)
-            return re:match_str(f) ~= nil
+            if is_test_path(f) then
+                tests_skipped = tests_skipped + 1
+                return false
+            end
+            return true
+        end, files)
+    end
+    if type(args.glob) == "string" and args.glob ~= "" then
+        -- Same feel as ripgrep's -g: a bare "*.go" matches at any depth and
+        -- "**/*.go" also matches files in the root itself.
+        local re = vim.regex(vim.fn.glob2regpat(args.glob))
+        local anywhere = not args.glob:find("/", 1, true)
+        files = vim.tbl_filter(function(f)
+            local probe = anywhere and vim.fs.basename(f) or f
+            return re:match_str(probe) ~= nil or re:match_str("/" .. f) ~= nil
         end, files)
     end
     local total_files = #files
     local out, entries = {}, 0
+    local missing, skipped = {}, 0
     for i, rel in ipairs(files) do
         if i > MAX_MAP_FILES then
             break
@@ -529,35 +714,109 @@ local function workspace_map(args)
             sleep(0) -- yield so the editor stays responsive on big repos
         end
         local entry = { file = rel }
-        local outline, nlines = top_level_outline(target .. "/" .. rel,
-            MAX_MAP_ENTRIES - entries)
-        entry.lines = nlines
-        if outline and #outline > 0 and entries < MAX_MAP_ENTRIES then
+        local outline, nlines, skip = top_level_outline(target .. "/" .. rel,
+            MAP_FILE_MAX, missing)
+        if skip then
+            entry.skipped = skip
+            skipped = skipped + 1
+        else
+            entry.lines = nlines
+        end
+        if outline and #outline > 0 then
             entry.outline = outline
-            entries = entries + #outline
         end
         out[#out + 1] = entry
     end
-    local note
-    if total_files > MAX_MAP_FILES then
-        note = ("showing first %d of %d files; narrow with path or glob")
-            :format(MAX_MAP_FILES, total_files)
-    elseif entries >= MAX_MAP_ENTRIES then
-        note = "outline budget exhausted; later files are listed without outlines"
+    -- Share the outline budget: files with few declarations keep them all,
+    -- the rest split what is left evenly (smallest first, so nothing is
+    -- cut that would have fit), ending with a "+N more" line.
+    local order, cut_files = {}, 0
+    for i, entry in ipairs(out) do
+        if entry.outline then order[#order + 1] = i end
     end
-    return { file_count = total_files, files = out, note = note }
+    table.sort(order, function(a, b) return #out[a].outline < #out[b].outline end)
+    for k, i in ipairs(order) do
+        local outline = out[i].outline
+        local share = math.floor((MAX_MAP_ENTRIES - entries) / (#order - k + 1))
+        local keep = math.max(MAP_FILE_MIN, share)
+        if #outline > keep then
+            local last = outline[#outline]
+            local extra = #outline - keep
+            local more = last:match("^… %+(%d+) more") -- fold a cap line from the parse
+            if more then extra = extra + tonumber(more) - 1 end
+            local cut = { unpack(outline, 1, keep) }
+            cut[#cut + 1] = ("… +%d more declarations (skim the file for all of them)"):format(extra)
+            out[i].outline = cut
+            cut_files = cut_files + 1
+            entries = entries + keep + 1
+        else
+            entries = entries + #outline
+        end
+    end
+    local notes = {}
+    if total_files > MAX_MAP_FILES then
+        notes[#notes + 1] = ("showing first %d of %d files; narrow with path or glob")
+            :format(MAX_MAP_FILES, total_files)
+    elseif cut_files > 0 then
+        notes[#notes + 1] = ("%d outlines were shortened to fit the map (\"+N more\" lines); "
+            .. "skim those files for the full list"):format(cut_files)
+    end
+    if tests_skipped > 0 then
+        notes[#notes + 1] = ("%d test files left out; include_tests=true lists them"):format(tests_skipped)
+    end
+    if next(missing) then
+        local parts = {}
+        for ft, n in pairs(missing) do
+            parts[#parts + 1] = ("%s (%d files)"):format(ft, n)
+        end
+        table.sort(parts)
+        notes[#notes + 1] = "no treesitter parser installed for: " .. table.concat(parts, ", ")
+            .. "; those files are listed without outlines (skim/find_symbol/ts_query"
+            .. " are blind to them too - grep and read_file still work)"
+    end
+    if skipped > 0 then
+        notes[#notes + 1] = ("%d binary or oversized files skipped"):format(skipped)
+    end
+    return {
+        file_count = total_files,
+        files = out,
+        note = #notes > 0 and table.concat(notes, ". ") or nil,
+    }
+end
+
+-- Some servers answer hover with a progress placeholder while they are
+-- still indexing (lua_ls: "Workspace loading: 3 / 120"). That is not an
+-- answer; wait a little and ask again.
+local HOVER_RETRY_MS = 500
+local HOVER_RETRY_DEADLINE_MS = 8000
+
+local function placeholder_hover(text)
+    return text:find("^%s*Workspace loading") ~= nil
+        or text:find("^%s*Loading workspace") ~= nil
 end
 
 local function hover(args)
     local bufnr = load_buf(args.file)
     local client = get_client(bufnr, "textDocument/hover")
-    local result = request(client, bufnr, "textDocument/hover",
-        position_params(bufnr, client, args))
-    if not (result and result.contents) then
-        return { hover = nil, note = "no hover information at this position" }
+    local params = position_params(bufnr, client, args)
+    local deadline = vim.uv.now() + HOVER_RETRY_DEADLINE_MS
+    local text
+    while true do
+        local result = request(client, bufnr, "textDocument/hover", params)
+        if not (result and result.contents) then
+            return { hover = nil, note = "no hover information at this position" }
+        end
+        local lines = vim.lsp.util.convert_input_to_markdown_lines(result.contents)
+        text = table.concat(lines, "\n")
+        if not placeholder_hover(text) or vim.uv.now() >= deadline then
+            break
+        end
+        sleep(HOVER_RETRY_MS)
     end
-    local lines = vim.lsp.util.convert_input_to_markdown_lines(result.contents)
-    return { hover = table.concat(lines, "\n") }
+    if placeholder_hover(text) then
+        return { hover = nil, note = "the language server is still indexing (" .. text .. "); retry shortly" }
+    end
+    return { hover = text }
 end
 
 local function document_symbols(args)
@@ -568,12 +827,40 @@ local function document_symbols(args)
     return { outline = flatten_symbols(result, 0, {}, bufnr) }
 end
 
+-- Servers such as lua_ls answer workspace/symbol with everything in their
+-- library path (the Neovim runtime, every plugin) and rank loosely, so the
+-- project's own symbols drown. Keep in-project hits first, ranked by how
+-- literally the name matches, and only a handful from outside the root.
+local MAX_EXTERNAL_SYMBOLS = 10
+
+local function symbol_match_rank(name, query)
+    local n, q = name:lower(), query:lower()
+    local last = n:match("([^%.:/]+)$") or n
+    if last == q or n == q then
+        return 1
+    end
+    if last:find(q, 1, true) then
+        return 2
+    end
+    if n:find(q, 1, true) then
+        return 3
+    end
+    return 4
+end
+
 local function workspace_symbols(args)
     local query = args.query
     if type(query) ~= "string" then
         err("missing required argument: query")
     end
-    local out, seen_client = {}, false
+    local root = type(args.root) == "string" and args.root ~= "" and args.root or nil
+    local function in_root(file)
+        if not root or not file then
+            return false
+        end
+        return file == root or file:sub(1, #root + 1) == root .. "/"
+    end
+    local inside, outside, seen_client = {}, {}, false
     for _, client in ipairs(vim.lsp.get_clients()) do
         if client:supports_method("workspace/symbol") then
             local bufnr = next(client.attached_buffers or {})
@@ -581,16 +868,22 @@ local function workspace_symbols(args)
                 seen_client = true
                 local result = request(client, bufnr, "workspace/symbol", { query = query })
                 for _, s in ipairs(result or {}) do
-                    if #out >= MAX_LOCATIONS then break end
                     local loc = s.location or {}
-                    out[#out + 1] = {
+                    local file = loc.uri and vim.uri_to_fname(loc.uri) or nil
+                    local item = {
                         name = s.name,
                         kind = symbol_kind(s.kind),
-                        file = loc.uri and vim.uri_to_fname(loc.uri) or nil,
+                        file = file,
                         line = loc.range and (loc.range.start.line + 1) or nil,
                         container = s.containerName,
                         server = client.name,
+                        rank = symbol_match_rank(s.name or "", query),
                     }
+                    if in_root(file) or not root then
+                        inside[#inside + 1] = item
+                    else
+                        outside[#outside + 1] = item
+                    end
                 end
             end
         end
@@ -598,7 +891,37 @@ local function workspace_symbols(args)
     if not seen_client then
         err("no active LSP client supports workspace/symbol")
     end
-    return { count = #out, symbols = out }
+    local function by_rank(a, b)
+        if a.rank ~= b.rank then
+            return a.rank < b.rank
+        end
+        return (a.name or "") < (b.name or "")
+    end
+    table.sort(inside, by_rank)
+    table.sort(outside, by_rank)
+    local out = {}
+    for i, item in ipairs(inside) do
+        if i > MAX_LOCATIONS then break end
+        item.rank = nil
+        out[#out + 1] = item
+    end
+    local external = 0
+    for _, item in ipairs(outside) do
+        if #out >= MAX_LOCATIONS or external >= MAX_EXTERNAL_SYMBOLS then break end
+        item.rank = nil
+        item.external = true
+        out[#out + 1] = item
+        external = external + 1
+    end
+    local note
+    if #outside > external then
+        note = ("%d more matches outside the project (libraries, runtime) omitted")
+            :format(#outside - external)
+    end
+    if #inside == 0 and root then
+        note = "no match inside the project" .. (note and ("; " .. note) or "")
+    end
+    return { count = #out, project_matches = #inside, symbols = out, note = note }
 end
 
 -- Titles of the code actions available for one diagnostic, so the agent
@@ -620,12 +943,25 @@ local function quick_fix_titles(bufnr, client, d)
         return nil
     end
     local titles = {}
-    for i, a in ipairs(actions) do
-        if i > 3 then break end
-        titles[i] = a.title
+    for _, a in ipairs(actions) do
+        -- lua_ls and friends offer "Disable diagnostics ..." actions; those
+        -- silence the problem instead of fixing it and must not be sold to
+        -- the model as quick fixes.
+        if not a.title:find("^Disable diagnostics") and not a.title:find("^Ignore ") then
+            titles[#titles + 1] = a.title
+            if #titles == 3 then break end
+        end
+    end
+    if #titles == 0 then
+        return nil
     end
     return titles
 end
+
+-- Diagnostics sharing a severity and code beyond this many are folded:
+-- the first DIAG_GROUP_SHOW stay verbose, the rest become a line list.
+local DIAG_GROUP_MIN = 4
+local DIAG_GROUP_SHOW = 3
 
 local function diagnostics(args)
     local bufnr = load_buf(args.file)
@@ -636,25 +972,61 @@ local function diagnostics(args)
         sleep(100)
     end
     local okc, action_client = pcall(get_client, bufnr, "textDocument/codeAction", 1000)
-    local out = {}
-    for i, d in ipairs(vim.diagnostic.get(bufnr)) do
-        local entry = {
-            line = d.lnum + 1,
-            col = d.col + 1,
-            severity = vim.diagnostic.severity[d.severity],
-            message = d.message,
-            source = d.source,
-            code = d.code,
-        }
-        if okc and i <= 8 and d.severity <= vim.diagnostic.severity.WARN then
-            entry.quick_fixes = quick_fix_titles(bufnr, action_client, d)
+    local diags = vim.diagnostic.get(bufnr)
+    table.sort(diags, function(a, b)
+        if a.severity ~= b.severity then return a.severity < b.severity end
+        if a.lnum ~= b.lnum then return a.lnum < b.lnum end
+        return a.col < b.col
+    end)
+    -- Many diagnostics with one code (an unresolved dependency reported on
+    -- every import) collapse into the first few plus a line list.
+    local by_code, groups = {}, {}
+    for _, d in ipairs(diags) do
+        local key = tostring(d.severity) .. ":" .. tostring(d.code or d.message)
+        if not by_code[key] then
+            by_code[key] = { n = 0, shown = 0, lines = {} }
+            groups[#groups + 1] = by_code[key]
         end
-        out[#out + 1] = entry
+        by_code[key].n = by_code[key].n + 1
+    end
+    local out, total = {}, #diags
+    for i, d in ipairs(diags) do
+        local key = tostring(d.severity) .. ":" .. tostring(d.code or d.message)
+        local g = by_code[key]
+        if g.n > DIAG_GROUP_MIN and g.shown >= DIAG_GROUP_SHOW then
+            g.lines[#g.lines + 1] = d.lnum + 1
+            if not g.summary then
+                g.summary = {
+                    severity = vim.diagnostic.severity[d.severity],
+                    code = d.code,
+                    source = d.source,
+                    more = g.n - DIAG_GROUP_SHOW,
+                    lines = g.lines,
+                    message = ("%d more %s like the ones above, at the listed lines")
+                        :format(g.n - DIAG_GROUP_SHOW, tostring(d.code or "")),
+                }
+                out[#out + 1] = g.summary
+            end
+        else
+            g.shown = g.shown + 1
+            local entry = {
+                line = d.lnum + 1,
+                col = d.col + 1,
+                severity = vim.diagnostic.severity[d.severity],
+                message = d.message,
+                source = d.source,
+                code = d.code,
+            }
+            if okc and i <= 8 and d.severity <= vim.diagnostic.severity.WARN then
+                entry.quick_fixes = quick_fix_titles(bufnr, action_client, d)
+            end
+            out[#out + 1] = entry
+        end
     end
     return {
-        count = #out,
+        count = total,
         diagnostics = out,
-        note = #out > 0
+        note = total > 0
             and "quick_fixes lists code actions the language server can apply for you: "
             .. "use code_actions + apply_code_action at that line instead of editing by hand"
             or nil,
@@ -663,20 +1035,343 @@ end
 
 -- Fresh diagnostics right after an edit, returned inside the edit tool's
 -- own result so problems surface without an extra round.
-local function post_edit_diagnostics(bufnr)
-    sleep(700)
-    local out = {}
-    for _, d in ipairs(vim.diagnostic.get(bufnr)) do
-        if d.severity <= vim.diagnostic.severity.WARN then
-            out[#out + 1] = ("%s line %d: %s"):format(
-                vim.diagnostic.severity[d.severity], d.lnum + 1, d.message)
-            if #out >= 10 then break end
+-- Post-edit report. Before the edit, diag_snapshot() records every error
+-- and warning (all buffers) keyed by file, severity and message - not by
+-- line, so an edit that shifts code does not make old problems look new.
+-- After the edit, post_edit_report() waits for the servers to re-publish,
+-- optionally runs linters, then splits what it sees into new, fixed and
+-- pre-existing, so the model reads what its edit caused and nothing else.
+local function post_edit_options()
+    local ok, config = pcall(require, "agent99.config")
+    local opts = ok and config.options and config.options.post_edit
+    return vim.tbl_deep_extend("force", {
+        wait_ms = 4000, commands = {}, nvim_lint = true, lint_timeout_ms = 30000,
+        format = "range", organize_imports = true,
+    }, opts or {})
+end
+
+-- Servers whose only formatting is whole-file and canonical (gofmt), so
+-- formatting the file after an edit never produces an unrelated diff.
+local FILE_FORMAT_OK = { go = true }
+
+local function client_for(bufnr, method)
+    for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+        if c:supports_method(method, bufnr) then
+            return c
         end
     end
-    if #out == 0 then
-        return nil
+    return nil
+end
+
+-- Run the server's source.organizeImports action on the buffer. Returns
+-- true when an action was applied.
+local function organize_imports(bufnr)
+    local client = client_for(bufnr, "textDocument/codeAction")
+    if not client then return false end
+    local last = vim.api.nvim_buf_line_count(bufnr)
+    local ok, actions = pcall(request, client, bufnr, "textDocument/codeAction", {
+        textDocument = { uri = vim.uri_from_bufnr(bufnr) },
+        range = { start = { line = 0, character = 0 }, ["end"] = { line = last, character = 0 } },
+        context = { diagnostics = {}, only = { "source.organizeImports" }, triggerKind = 1 },
+    })
+    if not ok or type(actions) ~= "table" or #actions == 0 then return false end
+    local action = actions[1]
+    if not action.edit and not action.command and client:supports_method("codeAction/resolve") then
+        local okr, resolved = pcall(request, client, bufnr, "codeAction/resolve", action)
+        if okr and resolved then action = resolved end
     end
-    return out
+    local applied = false
+    if action.edit then
+        pcall(vim.lsp.util.apply_workspace_edit, action.edit, client.offset_encoding)
+        applied = true
+    end
+    if action.command then
+        local cmd = type(action.command) == "table" and action.command or action
+        pcall(function() client:exec_cmd(cmd, { bufnr = bufnr }) end)
+        applied = true
+    end
+    return applied
+end
+
+-- The file's own indentation (majority of indented lines: tabs or spaces,
+-- and the smallest space step), so formatting matches the code around the
+-- edit rather than the headless instance's buffer defaults.
+local function detect_indent(bufnr)
+    local tabs, spaces, step = 0, 0, nil
+    for _, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, 2000, false)) do
+        local ws = line:match("^(%s+)%S")
+        if ws then
+            if ws:sub(1, 1) == "\t" then
+                tabs = tabs + 1
+            else
+                spaces = spaces + 1
+                local n = #ws
+                if n > 0 and (not step or n < step) then step = n end
+            end
+        end
+    end
+    if tabs == 0 and spaces == 0 then
+        local sw = vim.bo[bufnr].shiftwidth
+        return { insertSpaces = vim.bo[bufnr].expandtab,
+            tabSize = sw > 0 and sw or vim.bo[bufnr].tabstop }
+    end
+    if tabs > spaces then
+        return { insertSpaces = false, tabSize = vim.bo[bufnr].tabstop }
+    end
+    return { insertSpaces = true, tabSize = step or 4 }
+end
+
+-- Format lines first..last (1-based, inclusive) through the server: range
+-- formatting when offered, else whole-file formatting for filetypes where
+-- that is canonical. Returns true when edits were applied.
+local function format_region(bufnr, first, last, mode)
+    if mode == "range" or mode == true then
+        local client = client_for(bufnr, "textDocument/rangeFormatting")
+        if client then
+            local ok, edits = pcall(request, client, bufnr, "textDocument/rangeFormatting", {
+                textDocument = { uri = vim.uri_from_bufnr(bufnr) },
+                range = { start = { line = first - 1, character = 0 },
+                    ["end"] = { line = last, character = 0 } },
+                options = detect_indent(bufnr),
+            })
+            if ok and type(edits) == "table" and #edits > 0 then
+                pcall(vim.lsp.util.apply_text_edits, edits, bufnr, client.offset_encoding)
+                return true
+            end
+            return false
+        end
+    end
+    if mode == "file" or FILE_FORMAT_OK[vim.bo[bufnr].filetype] then
+        local client = client_for(bufnr, "textDocument/formatting")
+        if not client then return false end
+        local ok, edits = pcall(request, client, bufnr, "textDocument/formatting", {
+            textDocument = { uri = vim.uri_from_bufnr(bufnr) },
+            options = detect_indent(bufnr),
+        })
+        if ok and type(edits) == "table" and #edits > 0 then
+            pcall(vim.lsp.util.apply_text_edits, edits, bufnr, client.offset_encoding)
+            return true
+        end
+    end
+    return false
+end
+
+local polish_ns = vim.api.nvim_create_namespace("agent99_polish")
+
+-- After an edit wrote `count` lines at `first`, format that region and
+-- organize imports (both optional), then return where the region ended up
+-- (imports added above it shift it) plus a list of what was done.
+local function polish_after_edit(bufnr, first, count, opts)
+    local done = {}
+    if not (opts.format or opts.organize_imports) then
+        return first, count, done
+    end
+    if not client_for(bufnr, "textDocument/didOpen") then
+        return first, count, done
+    end
+    local total = vim.api.nvim_buf_line_count(bufnr)
+    local start_row = first - 1
+    -- The region's start is tracked by an extmark (imports added above it
+    -- move it down); its end is anchored by the untouched tail of the file,
+    -- which neither range formatting nor import edits reach.
+    local tail = vim.api.nvim_buf_get_lines(bufnr, start_row + count, -1, false)
+    local m_start = vim.api.nvim_buf_set_extmark(bufnr, polish_ns, start_row, 0,
+        { right_gravity = false })
+    if opts.format and count > 0 then
+        if format_region(bufnr, first, first + count - 1, opts.format) then
+            done[#done + 1] = "formatted"
+        end
+    end
+    if opts.organize_imports then
+        if organize_imports(bufnr) then
+            done[#done + 1] = "organized imports"
+        end
+    end
+    local s = vim.api.nvim_buf_get_extmark_by_id(bufnr, polish_ns, m_start, {})
+    vim.api.nvim_buf_clear_namespace(bufnr, polish_ns, 0, -1)
+    local new_total = vim.api.nvim_buf_line_count(bufnr)
+    local new_tail = vim.api.nvim_buf_get_lines(bufnr, new_total - #tail, -1, false)
+    if s and s[1] and vim.deep_equal(tail, new_tail) then
+        local new_first = s[1] + 1
+        local new_count = (new_total - #tail) - s[1]
+        if new_count >= 0 then
+            return new_first, new_count, done
+        end
+    end
+    return first, count, done
+end
+
+local function diag_signature(d)
+    return ("%s|%s|%s"):format(vim.api.nvim_buf_get_name(d.bufnr),
+        d.severity, (d.message or ""):gsub("%s+", " "))
+end
+
+local function diag_snapshot()
+    local counts = {}
+    for _, d in ipairs(vim.diagnostic.get(nil)) do
+        if d.severity <= vim.diagnostic.severity.WARN then
+            local sig = diag_signature(d)
+            counts[sig] = (counts[sig] or 0) + 1
+        end
+    end
+    return counts
+end
+
+-- Wait until diagnostics for bufnr change (any server), then a short
+-- settle window for servers that publish twice (syntax, then semantic).
+-- Returns once nothing has changed for settle_ms or the deadline passes.
+local function wait_for_diagnostics(bufnr, wait_ms, settle_ms)
+    local deadline = vim.uv.now() + wait_ms
+    local last_change = nil
+    local group = vim.api.nvim_create_augroup("agent99_post_edit_" .. bufnr, { clear = true })
+    vim.api.nvim_create_autocmd("DiagnosticChanged", {
+        group = group, buffer = bufnr,
+        callback = function() last_change = vim.uv.now() end,
+    })
+    local changed = false
+    while vim.uv.now() < deadline do
+        if last_change then
+            changed = true
+            if vim.uv.now() - last_change >= settle_ms then break end
+        end
+        sleep(100)
+    end
+    pcall(vim.api.nvim_del_augroup_by_id, group)
+    return changed
+end
+
+-- Before the first edit in a freshly loaded file, give its server time to
+-- attach and publish, or every problem the file already had would be
+-- reported as caused by the edit.
+local function settle_before_edit(bufnr)
+    if not fresh_buf(bufnr) then return end
+    if #vim.lsp.get_clients({ bufnr = bufnr }) == 0
+        and #enabled_lsp_configs_for(vim.bo[bufnr].filetype) == 0 then
+        return -- nothing will ever attach
+    end
+    local okc = pcall(get_client, bufnr, "textDocument/didOpen", 3000)
+    if okc then
+        wait_for_diagnostics(bufnr, 2500, 300)
+    end
+end
+
+local function expand_command(template, bufnr, root)
+    local file = vim.api.nvim_buf_get_name(bufnr)
+    return (template:gsub("{file}", vim.fn.shellescape(file))
+        :gsub("{dir}", vim.fn.shellescape(vim.fs.dirname(file)))
+        :gsub("{root}", vim.fn.shellescape(root or vim.fn.getcwd())))
+end
+
+local function run_lint_command(template, bufnr, root, timeout_ms)
+    local cmd = expand_command(template, bufnr, root)
+    local result = await(function(resume)
+        local ok, e = pcall(vim.system, { "sh", "-c", cmd }, {
+            cwd = root, text = true, timeout = timeout_ms,
+        }, vim.schedule_wrap(function(r) resume(r) end))
+        if not ok then resume({ code = -1, stderr = tostring(e) }) end
+    end)
+    local text = ((result.stdout or "") .. (result.stderr or "")):gsub("%s+$", "")
+    local lines = text == "" and {} or vim.split(text, "\n", { plain = true })
+    if #lines > 30 then
+        lines = vim.list_slice(lines, 1, 30)
+        lines[#lines + 1] = "… (output truncated)"
+    end
+    return { command = cmd, exit = result.code, output = lines }
+end
+
+local function post_edit_report(bufnr, before, root, headless, opts)
+    opts = opts or post_edit_options()
+    local ft = vim.bo[bufnr].filetype
+    -- Kick nvim-lint before waiting so its diagnostics join the same report.
+    if opts.nvim_lint then
+        local okl, lint = pcall(require, "lint")
+        if okl and type(lint.try_lint) == "function"
+            and lint.linters_by_ft and lint.linters_by_ft[ft] then
+            pcall(lint.try_lint)
+        end
+    end
+    local attached = #vim.lsp.get_clients({ bufnr = bufnr }) > 0
+    if attached then
+        wait_for_diagnostics(bufnr, opts.wait_ms, 300)
+    end
+    local report = {}
+    -- AGENT99_LINT_<FILETYPE> in the environment (handy for `claude mcp add
+    -- -e`) overrides the configured command for that filetype.
+    local template = os.getenv("AGENT99_LINT_" .. ft:upper():gsub("[^%w]", "_"))
+    if not template or template == "" then
+        template = opts.commands and opts.commands[ft]
+    end
+    if type(template) == "string" and template ~= "" then
+        -- A shell linter reads the disk. Headless edits are saved anyway
+        -- (the bridge does it after the call), so write now; in a live
+        -- editor the user's buffer is theirs to save, so lint only if it
+        -- is already clean on disk.
+        if headless then
+            pcall(vim.api.nvim_buf_call, bufnr, function() vim.cmd("silent write") end)
+        end
+        if not vim.bo[bufnr].modified then
+            report.lint = run_lint_command(template, bufnr, root, opts.lint_timeout_ms)
+        else
+            report.lint = "skipped: buffer has unsaved changes; save it and run " .. template
+        end
+    end
+    -- Diff against the snapshot: consume matching signatures as
+    -- pre-existing, the rest are new; leftovers in the snapshot were fixed.
+    local remaining = vim.deepcopy(before or {})
+    local new_here, new_elsewhere = {}, {}
+    local preexisting = { errors = 0, warnings = 0 }
+    for _, d in ipairs(vim.diagnostic.get(nil)) do
+        if d.severity <= vim.diagnostic.severity.WARN then
+            local sig = diag_signature(d)
+            if (remaining[sig] or 0) > 0 then
+                remaining[sig] = remaining[sig] - 1
+                if d.severity == vim.diagnostic.severity.ERROR then
+                    preexisting.errors = preexisting.errors + 1
+                else
+                    preexisting.warnings = preexisting.warnings + 1
+                end
+            elseif d.bufnr == bufnr then
+                new_here[#new_here + 1] = ("%s line %d: %s"):format(
+                    vim.diagnostic.severity[d.severity], d.lnum + 1, d.message)
+            elseif d.severity == vim.diagnostic.severity.ERROR then
+                new_elsewhere[#new_elsewhere + 1] = ("%s:%d: %s"):format(
+                    vim.fn.fnamemodify(vim.api.nvim_buf_get_name(d.bufnr), ":."),
+                    d.lnum + 1, d.message)
+            end
+        end
+    end
+    local fixed = 0
+    for _, n in pairs(remaining) do fixed = fixed + n end
+    if #new_here > 15 then
+        local extra = #new_here - 15
+        new_here = vim.list_slice(new_here, 1, 15)
+        new_here[#new_here + 1] = ("… +%d more new diagnostics in this file"):format(extra)
+    end
+    if #new_elsewhere > 10 then
+        local extra = #new_elsewhere - 10
+        new_elsewhere = vim.list_slice(new_elsewhere, 1, 10)
+        new_elsewhere[#new_elsewhere + 1] = ("… +%d more"):format(extra)
+    end
+    if not attached then
+        report.diagnostics_after = "no language server attached to this file; nothing checked"
+    elseif #new_here == 0 then
+        report.diagnostics_after = "no new errors or warnings"
+    else
+        report.diagnostics_after = new_here
+    end
+    if #new_elsewhere > 0 then
+        report.new_errors_elsewhere = new_elsewhere
+    end
+    local prior = {}
+    if preexisting.errors > 0 then prior[#prior + 1] = preexisting.errors .. " errors" end
+    if preexisting.warnings > 0 then prior[#prior + 1] = preexisting.warnings .. " warnings" end
+    if #prior > 0 then
+        report.preexisting = table.concat(prior, " and ") .. " were there before the edit (unchanged)"
+    end
+    if fixed > 0 then
+        report.fixed = fixed .. " diagnostics from before the edit are gone"
+    end
+    return report
 end
 
 local function call_hierarchy(direction)
@@ -861,7 +1556,9 @@ local function apply_code_action(args)
     return {
         applied = action.title,
         changed_files = changed,
-        note = "changes live in editor buffers (unsaved); use buffer_lines to inspect them",
+        note = args.headless
+            and "changes applied and saved to disk"
+            or "changes live in editor buffers (unsaved); use buffer_lines to inspect them",
     }
 end
 
@@ -913,11 +1610,54 @@ local index_cache = {}
 local function ts_node_name(node, bufnr)
     local name_field = node:field("name")
     if name_field and name_field[1] then
-        return vim.treesitter.get_node_text(name_field[1], bufnr)
+        local name = vim.treesitter.get_node_text(name_field[1], bufnr)
+        -- Go methods: qualify by receiver type so "jsonBinding/Bind" and
+        -- "xmlBinding/Bind" stay distinct (a suffix match on "Bind" still
+        -- finds both).
+        local recv = node:field("receiver")
+        if recv and recv[1] then
+            local text = vim.treesitter.get_node_text(recv[1], bufnr):gsub("%[.-%]", "")
+            local rtype = text:match("([%w_]+)%s*%)?%s*$") or text:match("%*?([%w_]+)")
+            if rtype and rtype ~= "" then
+                return rtype .. "/" .. name
+            end
+        end
+        return name
     end
+    -- Declarations that wrap the named node (Go type_declaration holding a
+    -- type_spec): take the first child that carries a name.
+    for child in node:iter_children() do
+        local cname = child:field("name")
+        if cname and cname[1] then
+            return vim.treesitter.get_node_text(cname[1], bufnr)
+        end
+    end
+    -- Anonymous functions take the name of the declaration they sit in:
+    -- "const Zod = $constructor('Zod', (inst, def) => {" is Zod, a Lua
+    -- table field "hover = function(args)" is hover. Stay on the same
+    -- line so a callback deep inside a body is not named after it.
     local srow = node:range()
+    local parent = node:parent()
+    for _ = 1, 4 do
+        if not parent then break end
+        local prow = parent:range()
+        if prow ~= srow then break end
+        local pname = parent:field("name")
+        if pname and pname[1] then
+            return vim.treesitter.get_node_text(pname[1], bufnr)
+        end
+        parent = parent:parent()
+    end
     local line = vim.api.nvim_buf_get_lines(bufnr, srow, srow + 1, false)[1] or ""
-    return line:match("([%w_.:]+)%s*%(") or line:match("([%w_.:]+)%s*[={:]")
+    -- A function assigned to a name ("references = function(args)",
+    -- "M.x = function", "const shout = (name) => ...") is named by the
+    -- left-hand side; only then fall back to the first "ident(" on the
+    -- line, which for those forms would be "function" or the first callee.
+    return line:match("([%w_.:$]+)%s*=%s*function%s*[%(<]")
+        or line:match("([%w_.:$]+)%s*=%s*async%s*function%s*[%(<]")
+        or line:match("([%w_.:$]+)%s*=%s*async%s*%(")
+        or line:match("([%w_.:$]+)%s*=%s*%(")
+        or line:match("([%w_.:$]+)%s*%(") or line:match("([%w_.:$]+)%s*[={:]")
         or ("line" .. (srow + 1))
 end
 
@@ -967,10 +1707,15 @@ local function lsp_index(bufnr)
     local function walk(list, prefix)
         for _, s in ipairs(list or {}) do
             local range = s.range or (s.location and s.location.range)
-            if range then
+            local kind = symbol_kind(s.kind)
+            if range and kind == "Null" then
+                -- clangd wraps a macro-opened namespace (FMT_BEGIN_NAMESPACE)
+                -- in a Null symbol: not a name anyone addresses, skip it.
+                walk(s.children, prefix)
+            elseif range then
                 local path = prefix == "" and s.name or (prefix .. "/" .. s.name)
                 entries[#entries + 1] = {
-                    path = path, name = s.name, kind = symbol_kind(s.kind),
+                    path = path, name = s.name, kind = kind,
                     first = range.start.line + 1, last = range["end"].line + 1,
                 }
                 walk(s.children, path)
@@ -987,24 +1732,19 @@ local function symbol_index(bufnr)
     if cached and cached.tick == tick then
         return cached.entries
     end
-    local entries = ts_index(bufnr)
+    local entries
+    if PREFER_LSP_OUTLINE[vim.bo[bufnr].filetype] then
+        -- Same reasoning as skim: clangd's symbols beat the C/C++ grammar.
+        entries = lsp_index(bufnr)
+    end
+    if not entries or #entries == 0 then
+        entries = ts_index(bufnr)
+    end
     if not entries or #entries == 0 then
         entries = lsp_index(bufnr) or {}
     end
     index_cache[bufnr] = { tick = tick, entries = entries }
     return entries
-end
-
-local function innermost_path(entries, line)
-    local best
-    for _, e in ipairs(entries) do
-        if e.first <= line and line <= e.last then
-            if not best or (e.last - e.first) < (best.last - best.first) then
-                best = e
-            end
-        end
-    end
-    return best and best.path or nil
 end
 
 -- annotate_locations is defined after the enclosing-symbol helpers below;
@@ -1075,18 +1815,43 @@ local function find_symbol(args)
         files = vim.list_slice(files, 1, MAX_QUERY_FILES)
     end
     local found = {}
-    for _, f in ipairs(files) do
-        local okb, bufnr = pcall(load_buf, f)
-        if okb then
-            for _, entry in ipairs(symbol_index(bufnr)) do
-                local rank = match_rank(entry, name)
-                if rank then
-                    found[#found + 1] = { rank = rank, bufnr = bufnr, entry = entry }
+    local function collect(query)
+        for _, f in ipairs(files) do
+            local okb, bufnr = pcall(load_buf, f)
+            if okb then
+                for _, entry in ipairs(symbol_index(bufnr)) do
+                    local rank = match_rank(entry, query)
+                    if rank then
+                        found[#found + 1] = { rank = rank, bufnr = bufnr, entry = entry }
+                    end
                 end
             end
         end
     end
-    table.sort(found, function(a, b) return a.rank < b.rank end)
+    collect(name)
+    -- "Flask/route" when route lives on a base class: fall back to the last
+    -- path segment and say so, instead of an empty answer.
+    local fallback
+    local leaf = name:match("([^/]+)$")
+    if #found == 0 and leaf and leaf ~= name then
+        collect(leaf)
+        if #found > 0 then
+            fallback = ("no symbol matched %s; showing matches for %s"):format(name, leaf)
+        end
+    end
+    -- Within a rank, shorter names first (the closest to what was asked),
+    -- then by file for a stable order; table.sort alone is not stable.
+    for _, m in ipairs(found) do
+        m.file = vim.api.nvim_buf_get_name(m.bufnr)
+        m.test = is_test_path(m.file)
+    end
+    table.sort(found, function(a, b)
+        if a.rank ~= b.rank then return a.rank < b.rank end
+        if (a.test ~= nil) ~= (b.test ~= nil) then return a.test == nil end
+        if #a.entry.name ~= #b.entry.name then return #a.entry.name < #b.entry.name end
+        if a.file ~= b.file then return a.file < b.file end
+        return a.entry.first < b.entry.first
+    end)
     local out = {}
     for i, m in ipairs(found) do
         if i > MAX_FIND_RESULTS then break end
@@ -1096,7 +1861,7 @@ local function find_symbol(args)
             file = vim.api.nvim_buf_get_name(m.bufnr),
             lines = ("%d-%d"):format(m.entry.first, m.entry.last),
         }
-        if args.include_body and m.rank <= 2 and i <= 5 then
+        if args.include_body and (m.rank <= 2 or #found == 1) and i <= 5 then
             item.body = symbol_body(m.bufnr, m.entry)
             if i == 1 then
                 pcall(function()
@@ -1106,10 +1871,19 @@ local function find_symbol(args)
         end
         out[i] = item
     end
+    local note
+    if #found == 0 then
+        note = "no symbol matched; try skim to see what exists"
+    elseif fallback then
+        note = fallback
+    elseif #found > MAX_FIND_RESULTS then
+        note = ("showing the best %d of %d matches; use a longer name or a name "
+            .. "path (\"Type/method\") or narrow with file/glob"):format(MAX_FIND_RESULTS, #found)
+    end
     return {
         count = #found,
         matches = out,
-        note = #found == 0 and "no symbol matched; try skim to see what exists" or nil,
+        note = note,
     }
 end
 
@@ -1143,6 +1917,15 @@ local function resolve_symbol(file, name_path)
     return bufnr, candidates[1].entry
 end
 
+-- The MCP server passes headless=true when it drives its own Neovim and
+-- writes buffers to disk after each edit; then "unsaved" would be a lie.
+local function edit_note(args)
+    if args.headless then
+        return "applied and saved to disk"
+    end
+    return "applied to the editor buffer (unsaved)"
+end
+
 local function record_edit(bufnr, entry_path, kind, first, last, old_lines, new_lines)
     require("agent99.edits").record({
         file = vim.api.nvim_buf_get_name(bufnr),
@@ -1157,6 +1940,23 @@ local function record_edit(bufnr, entry_path, kind, first, last, old_lines, new_
     })
 end
 
+-- Shared tail of every edit tool: the lines are already in the buffer;
+-- polish (format, imports), record the final region in the ledger, and
+-- build the reply with the post-edit report.
+local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_old, old_lines, count, fields)
+    local opts = post_edit_options()
+    local pfirst, pcount, done = polish_after_edit(bufnr, first, count, opts)
+    local new_lines = vim.api.nvim_buf_get_lines(bufnr, pfirst - 1, pfirst - 1 + pcount, false)
+    record_edit(bufnr, ledger_path, kind, pfirst, last_old + (pfirst - first), old_lines, new_lines)
+    fields.file = vim.api.nvim_buf_get_name(bufnr)
+    fields.lines = pcount > 0 and ("%d-%d"):format(pfirst, pfirst + pcount - 1) or tostring(pfirst)
+    fields.note = edit_note(args)
+    if #done > 0 then
+        fields.polished = table.concat(done, ", ")
+    end
+    return vim.tbl_extend("error", fields, post_edit_report(bufnr, before, args.root, args.headless, opts))
+end
+
 local function replace_symbol_body(args)
     local bufnr, entry = resolve_symbol(args.file, args.name_path)
     if type(args.body) ~= "string" then
@@ -1164,15 +1964,11 @@ local function replace_symbol_body(args)
     end
     local new_lines = vim.split((args.body:gsub("\n+$", "")), "\n", { plain = true })
     local old = vim.api.nvim_buf_get_lines(bufnr, entry.first - 1, entry.last, false)
+    settle_before_edit(bufnr)
+    local before = diag_snapshot()
     vim.api.nvim_buf_set_lines(bufnr, entry.first - 1, entry.last, false, new_lines)
-    record_edit(bufnr, entry.path, "replace", entry.first, entry.last, old, new_lines)
-    return {
-        replaced = entry.path,
-        file = vim.api.nvim_buf_get_name(bufnr),
-        lines = ("%d-%d"):format(entry.first, entry.first + #new_lines - 1),
-        note = "applied to the editor buffer (unsaved)",
-        diagnostics_after = post_edit_diagnostics(bufnr),
-    }
+    return finish_edit(bufnr, args, before, entry.path, "replace", entry.first, entry.last,
+        old, #new_lines, { replaced = entry.path })
 end
 
 -- Edit a slice of a symbol, addressed by line numbers RELATIVE to the
@@ -1197,16 +1993,12 @@ local function replace_symbol_lines(args)
     local abs_last = entry.first + last - 1
     local new_lines = vim.split((args.text:gsub("\n+$", "")), "\n", { plain = true })
     local old = vim.api.nvim_buf_get_lines(bufnr, abs_first - 1, abs_last, false)
+    settle_before_edit(bufnr)
+    local before = diag_snapshot()
     vim.api.nvim_buf_set_lines(bufnr, abs_first - 1, abs_last, false, new_lines)
-    record_edit(bufnr, ("%s:%d-%d"):format(entry.path, first, last), "replace_lines",
-        abs_first, abs_last, old, new_lines)
-    return {
-        replaced = ("lines %d-%d of %s"):format(first, last, entry.path),
-        file = vim.api.nvim_buf_get_name(bufnr),
-        lines = ("%d-%d"):format(abs_first, abs_first + #new_lines - 1),
-        note = "applied to the editor buffer (unsaved)",
-        diagnostics_after = post_edit_diagnostics(bufnr),
-    }
+    return finish_edit(bufnr, args, before, ("%s:%d-%d"):format(entry.path, first, last),
+        "replace_lines", abs_first, abs_last, old, #new_lines,
+        { replaced = ("lines %d-%d of %s"):format(first, last, entry.path) })
 end
 
 local function insert_symbol_tool(where)
@@ -1224,16 +2016,249 @@ local function insert_symbol_tool(where)
             row = entry.first - 1
             table.insert(lines, "")
         end
+        settle_before_edit(bufnr)
+        local before = diag_snapshot()
         vim.api.nvim_buf_set_lines(bufnr, row, row, false, lines)
-        record_edit(bufnr, entry.path, "insert_" .. where, row + 1, row, {}, lines)
+        return finish_edit(bufnr, args, before, entry.path, "insert_" .. where, row + 1, row,
+            {}, #lines, { inserted = ("%s %s"):format(where, entry.path) })
+    end
+end
+
+-- undo_edit: take back the newest symbol edits of this run (this server
+-- session, headless), restoring the recorded lines. Code actions applied
+-- through apply_code_action are the editor's own edits and are not in the
+-- ledger; the reply says so when nothing is left to undo.
+local function undo_edit(args)
+    local edits = require("agent99.edits")
+    local count = tonumber(args.count) or 1
+    if args.all then count = nil end
+    if edits.count() == 0 then
         return {
-            inserted = ("%s %s"):format(where, entry.path),
-            file = vim.api.nvim_buf_get_name(bufnr),
-            lines = ("%d-%d"):format(row + 1, row + #lines),
-            note = "applied to the editor buffer (unsaved)",
-            diagnostics_after = post_edit_diagnostics(bufnr),
+            undone = {},
+            note = "no symbol edits recorded in this run; apply_code_action edits are "
+                .. "not tracked here - reverse those with another code action or an edit",
         }
     end
+    local last_bufnr
+    local before = diag_snapshot()
+    local undone, refused = edits.undo_last(count)
+    local out = {}
+    for _, e in ipairs(undone) do
+        local item = { file = e.file, symbol = e.name_path, kind = e.kind }
+        if #e.old_lines == 0 then
+            item.removed_lines = ("%d-%d"):format(e.first, e.first + e.new_count - 1)
+        else
+            item.restored_lines = ("%d-%d"):format(e.first, e.first + #e.old_lines - 1)
+        end
+        out[#out + 1] = item
+        last_bufnr = e.bufnr
+    end
+    local result = { undone = out, remaining = edits.count() }
+    if #refused > 0 then
+        result.refused = refused
+    end
+    if last_bufnr then
+        local opts = post_edit_options()
+        if opts.organize_imports then
+            -- Imports added for the undone code would now be unused (an
+            -- error in Go); let the server drop them again.
+            local seen = {}
+            for _, e in ipairs(undone) do
+                if e.bufnr and not seen[e.bufnr] and vim.api.nvim_buf_is_valid(e.bufnr) then
+                    seen[e.bufnr] = true
+                    organize_imports(e.bufnr)
+                end
+            end
+        end
+        result = vim.tbl_extend("error", result,
+            post_edit_report(last_bufnr, before, args.root, args.headless, opts))
+        result.note = edit_note(args)
+    end
+    return result
+end
+
+-- check_project: one project-wide check (type checker, vet, cargo check)
+-- with a baseline. The first run in a root records its output; later runs
+-- report only lines that are new since the baseline and lines that went
+-- away, so "is the project still green after my refactor" is one call
+-- with a short answer.
+local check_baseline = {}
+local CHECK_MAX_LINES = 60
+
+local function guess_check_command(root)
+    local function has(rel) return vim.uv.fs_stat(root .. "/" .. rel) ~= nil end
+    if has("go.mod") then return "go vet ./..." end
+    if has("Cargo.toml") then return "cargo check --message-format short" end
+    if has("tsconfig.json") then
+        if has("node_modules/.bin/tsc") then return "node_modules/.bin/tsc --noEmit -p ." end
+        if vim.fn.executable("tsc") == 1 then return "tsc --noEmit -p ." end
+    end
+    if has("pyproject.toml") or has("setup.py") or has("setup.cfg") then
+        if vim.fn.executable("pyright") == 1 then return "pyright" end
+        if vim.fn.executable("mypy") == 1 then return "mypy ." end
+    end
+    if has("CMakeLists.txt") and has("build") then return "cmake --build build" end
+    return nil
+end
+
+local function check_project(args)
+    local root = args.root
+    if type(root) ~= "string" or root == "" then
+        root = vim.fn.getcwd()
+    end
+    local opts = post_edit_options()
+    local okc, config = pcall(require, "agent99.config")
+    local configured = okc and config.options and config.options.post_edit
+        and config.options.post_edit.check or nil
+    local cmd = args.command
+    if type(cmd) ~= "string" or cmd == "" then cmd = os.getenv("AGENT99_CHECK") end
+    if not cmd or cmd == "" then cmd = configured end
+    local guessed = false
+    if not cmd or cmd == "" then
+        cmd = guess_check_command(root)
+        guessed = cmd ~= nil
+    end
+    if not cmd then
+        err("no check command: pass command=, set AGENT99_CHECK, or post_edit.check in setup()")
+    end
+    local timeout = (okc and config.options and config.options.post_edit
+        and config.options.post_edit.check_timeout_ms) or 5 * 60 * 1000
+    -- Shell linters read the disk: flush what the tools changed first.
+    if args.headless then
+        for _, b in ipairs(vim.api.nvim_list_bufs()) do
+            if vim.bo[b].modified and vim.bo[b].buftype == "" then
+                pcall(vim.api.nvim_buf_call, b, function() vim.cmd("silent write") end)
+            end
+        end
+    end
+    local started = vim.uv.now()
+    local result = await(function(resume)
+        local ok, e = pcall(vim.system, { "sh", "-c", cmd }, {
+            cwd = root, text = true, timeout = timeout,
+        }, vim.schedule_wrap(function(r) resume(r) end))
+        if not ok then resume({ code = -1, stderr = tostring(e) }) end
+    end)
+    local text = ((result.stdout or "") .. (result.stderr or "")):gsub("%s+$", "")
+    local lines = text == "" and {} or vim.split(text, "\n", { plain = true })
+    local out = {
+        command = cmd, guessed = guessed or nil, exit = result.code,
+        seconds = math.floor((vim.uv.now() - started) / 100) / 10,
+    }
+    local key = root .. "\0" .. cmd
+    local base = check_baseline[key]
+    if base and not args.reset then
+        local base_set, now_set = {}, {}
+        for _, l in ipairs(base) do base_set[l] = (base_set[l] or 0) + 1 end
+        for _, l in ipairs(lines) do now_set[l] = (now_set[l] or 0) + 1 end
+        local new, resolved = {}, {}
+        for _, l in ipairs(lines) do
+            if (base_set[l] or 0) > 0 then base_set[l] = base_set[l] - 1 else new[#new + 1] = l end
+        end
+        for _, l in ipairs(base) do
+            if (now_set[l] or 0) > 0 then now_set[l] = now_set[l] - 1 else resolved[#resolved + 1] = l end
+        end
+        out.baseline_lines = #base
+        out.new = vim.list_slice(new, 1, CHECK_MAX_LINES)
+        if #new > CHECK_MAX_LINES then out.new_truncated = #new - CHECK_MAX_LINES end
+        out.resolved = #resolved
+        if #new == 0 then
+            out.summary = result.code == 0 and "clean, nothing new since the baseline"
+                or "nothing new since the baseline (the check still fails as it did before)"
+        else
+            out.summary = ("%d new lines since the baseline"):format(#new)
+        end
+    else
+        check_baseline[key] = lines
+        out.baseline = "recorded; later calls report only what changed"
+        out.output = vim.list_slice(lines, 1, CHECK_MAX_LINES)
+        if #lines > CHECK_MAX_LINES then out.output_truncated = #lines - CHECK_MAX_LINES end
+        if #lines == 0 and result.code == 0 then out.summary = "clean" end
+    end
+    return out
+end
+
+-- rename_symbol: textDocument/rename across the project. dry_run reports
+-- which files and how many places would change; otherwise the edit is
+-- applied, each touched file goes into the undo ledger as a whole-file
+-- entry, and the origin file's diagnostics are reported like any edit.
+local function summarize_workspace_edit(edit)
+    local per_file, order = {}, {}
+    local function add(uri, n)
+        local file = vim.uri_to_fname(uri)
+        if not per_file[file] then
+            per_file[file] = 0
+            order[#order + 1] = file
+        end
+        per_file[file] = per_file[file] + n
+    end
+    for uri, edits in pairs(edit.changes or {}) do
+        add(uri, #edits)
+    end
+    local file_ops = {}
+    for _, dc in ipairs(edit.documentChanges or {}) do
+        if dc.textDocument then
+            add(dc.textDocument.uri, #(dc.edits or {}))
+        elseif dc.kind then
+            file_ops[#file_ops + 1] = dc.kind .. " " .. (dc.uri or dc.newUri or dc.oldUri or "?")
+        end
+    end
+    table.sort(order)
+    local files = {}
+    for _, file in ipairs(order) do
+        files[#files + 1] = { file = file, edits = per_file[file] }
+    end
+    return files, file_ops
+end
+
+local function rename_symbol(args)
+    local bufnr = load_buf(args.file)
+    local new_name = args.new_name
+    if type(new_name) ~= "string" or new_name == "" then
+        err("missing required argument: new_name")
+    end
+    local client = get_client(bufnr, "textDocument/rename")
+    local params = position_params(bufnr, client, args)
+    if client:supports_method("textDocument/prepareRename") then
+        local okp, prep = pcall(request, client, bufnr, "textDocument/prepareRename", params)
+        if okp and prep == nil then
+            err("the server refuses to rename at this position (not a renamable symbol)")
+        end
+    end
+    params.newName = new_name
+    local edit = request(client, bufnr, "textDocument/rename", params)
+    if not edit or (not edit.changes and not edit.documentChanges) then
+        err("the server returned no edit for this rename")
+    end
+    local files, file_ops = summarize_workspace_edit(edit)
+    local total = 0
+    for _, f in ipairs(files) do total = total + f.edits end
+    if args.dry_run then
+        return { dry_run = true, new_name = new_name, files = files,
+            total_edits = total, file_operations = #file_ops > 0 and file_ops or nil,
+            note = "nothing applied; call again without dry_run to rename" }
+    end
+    settle_before_edit(bufnr)
+    local before = diag_snapshot()
+    -- Whole-file snapshots of every touched file feed the undo ledger.
+    local snaps = {}
+    for _, f in ipairs(files) do
+        local okb, b = pcall(load_buf, f.file)
+        if okb then
+            snaps[#snaps + 1] = { bufnr = b, file = f.file,
+                old = vim.api.nvim_buf_get_lines(b, 0, -1, false) }
+        end
+    end
+    vim.lsp.util.apply_workspace_edit(edit, client.offset_encoding)
+    for _, snap in ipairs(snaps) do
+        local new = vim.api.nvim_buf_get_lines(snap.bufnr, 0, -1, false)
+        record_edit(snap.bufnr, "rename " .. new_name, "rename", 1, #snap.old, snap.old, new)
+    end
+    local result = { renamed_to = new_name, files = files, total_edits = total,
+        file_operations = #file_ops > 0 and file_ops or nil }
+    result = vim.tbl_extend("error", result,
+        post_edit_report(bufnr, before, args.root, args.headless))
+    result.note = edit_note(args)
+    return result
 end
 
 -- First line of the contiguous comment block directly above a line, for
@@ -1368,6 +2393,386 @@ local function line_diag(bufnr, line)
     return worst
 end
 
+-- Internal: what the editor can do for the languages in a workspace, so a
+-- client that opened a headless instance learns up front when a language
+-- has no parser (skim/find_symbol/ts_query blind) or no language server
+-- (definition/references/hover/diagnostics blind). Counts files per
+-- filetype from the git index, checks the parser instantly, and for the
+-- filetypes that have an enabled LSP config loads one sample file and
+-- waits briefly for a client to attach (the binary may be missing).
+local SUPPORT_MAX_FILETYPES = 6
+local SUPPORT_ATTACH_MS = 2500
+
+
+local function workspace_support(args)
+    local root = args.root
+    if type(root) ~= "string" or root == "" then
+        err("missing project root")
+    end
+    local files = vim.fn.systemlist({ "git", "-C", root,
+        "ls-files", "--cached", "--others", "--exclude-standard" })
+    if vim.v.shell_error ~= 0 then
+        files = {}
+        for _, f in ipairs(vim.fn.globpath(root, "**/*", true, true)) do
+            if vim.fn.isdirectory(f) == 0 then
+                files[#files + 1] = f:sub(#root + 2)
+            end
+        end
+    end
+    local by_ft, sample, ext_cache = {}, {}, {}
+    for _, rel in ipairs(files) do
+        local ext = rel:match("%.([%w_]+)$") or rel
+        local ft = ext_cache[ext]
+        if ft == nil then
+            ft = vim.filetype.match({ filename = rel }) or false
+            ext_cache[ext] = ft
+        end
+        if ft then
+            by_ft[ft] = (by_ft[ft] or 0) + 1
+            sample[ft] = sample[ft] or rel
+        end
+    end
+    local fts = vim.tbl_keys(by_ft)
+    table.sort(fts, function(a, b) return by_ft[a] > by_ft[b] end)
+    local out, blind = {}, {}
+    for i, ft in ipairs(fts) do
+        if i > SUPPORT_MAX_FILETYPES then break end
+        local parser = has_parser(ft)
+        local configs = enabled_lsp_configs_for(ft)
+        local clients = {}
+        if #configs > 0 then
+            local okb, bufnr = pcall(load_buf, root .. "/" .. sample[ft])
+            if okb then
+                local deadline = vim.uv.now() + SUPPORT_ATTACH_MS
+                while vim.uv.now() < deadline do
+                    for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+                        clients[#clients + 1] = c.name
+                    end
+                    if #clients > 0 then break end
+                    sleep(100)
+                end
+            end
+        end
+        local entry = {
+            filetype = ft,
+            files = by_ft[ft],
+            treesitter_parser = parser,
+            lsp = #clients > 0 and table.concat(clients, ",") or "none",
+        }
+        if #clients == 0 and #configs > 0 then
+            entry.lsp = "none (configured: " .. table.concat(configs, ",") .. ", did not attach)"
+        end
+        if not parser and #clients == 0 and not DATA_FILETYPES[ft] then
+            blind[#blind + 1] = ft
+        end
+        out[#out + 1] = entry
+    end
+    local note
+    if #blind > 0 then
+        note = ("no parser and no language server for %s: symbol, navigation and "
+            .. "diagnostic tools will not work on those files; grep and read_file will. "
+            .. "install_language(language) can add both")
+            :format(table.concat(blind, ", "))
+    end
+    return { languages = out, note = note }
+end
+
+-- install_language: add a treesitter parser (nvim-treesitter) and a language
+-- server (Mason) for one filetype to the running instance, so the symbol and
+-- navigation tools start working on files open_workspace flagged as blind.
+-- Both installs are optional pieces of the user's setup; each step reports
+-- what it did or why it could not.
+local INSTALL_PARSER_MS = 5 * 60 * 1000
+local INSTALL_SERVER_MS = 8 * 60 * 1000
+local INSTALL_ATTACH_MS = 8000
+
+-- Preferred language server per filetype where Mason offers several; the
+-- lspconfig name, mapped to a Mason package through mason-lspconfig.
+local PREFERRED_SERVER = {
+    c = "clangd", cpp = "clangd", objc = "clangd", objcpp = "clangd",
+    go = "gopls", gomod = "gopls",
+    python = "pyright",
+    javascript = "ts_ls", javascriptreact = "ts_ls",
+    typescript = "ts_ls", typescriptreact = "ts_ls",
+    lua = "lua_ls",
+    rust = "rust_analyzer",
+    java = "jdtls",
+    kotlin = "kotlin_language_server",
+    ruby = "ruby_lsp",
+    php = "intelephense",
+    cs = "omnisharp",
+    swift = "sourcekit",
+    zig = "zls",
+    sh = "bashls",
+    html = "html", css = "cssls", json = "jsonls", yaml = "yamlls",
+    dockerfile = "dockerls",
+    terraform = "terraformls",
+    elixir = "elixirls",
+    haskell = "hls",
+    scala = "metals",
+    dart = "dartls",
+    ocaml = "ocamllsp",
+    nix = "nil_ls",
+    vim = "vimls",
+}
+
+local function install_parser(ft, lang)
+    if has_parser(ft) then
+        return { language = lang, status = "already installed" }
+    end
+    local okts, ts = pcall(require, "nvim-treesitter")
+    if not okts or type(ts.install) ~= "function" then
+        return { language = lang, status = "skipped",
+            note = "nvim-treesitter is not on the runtimepath; install the parser by hand" }
+    end
+    local available = {}
+    pcall(function()
+        for _, l in ipairs(ts.get_available()) do available[l] = true end
+    end)
+    if next(available) and not available[lang] then
+        return { language = lang, status = "unsupported",
+            note = "nvim-treesitter has no parser named " .. lang }
+    end
+    local task
+    local okstart, start_err = pcall(function() task = ts.install({ lang }) end)
+    if not okstart or type(task) ~= "table" or type(task.await) ~= "function" then
+        return { language = lang, status = "failed",
+            note = "could not start the install: " .. tostring(start_err or task) }
+    end
+    local timer = vim.uv.new_timer()
+    local aerr, done = await(function(resume)
+        timer:start(INSTALL_PARSER_MS, 0, vim.schedule_wrap(function()
+            resume("timed out")
+        end))
+        task:await(function(e, r) resume(e, r) end)
+    end)
+    timer:stop()
+    timer:close()
+    if aerr then
+        return { language = lang, status = "failed", note = tostring(aerr) }
+    end
+    -- Neovim caches "no such parser"; a fresh add() picks the new .so up.
+    pcall(vim.treesitter.language.add, lang)
+    if has_parser(ft) then
+        return { language = lang, status = "installed" }
+    end
+    return { language = lang, status = "failed",
+        note = done == false and "nvim-treesitter reported the install as failed"
+            or "install finished but the parser still does not load" }
+end
+
+local function attached_client(root, ft)
+    local files = vim.fn.systemlist({ "git", "-C", root,
+        "ls-files", "--cached", "--others", "--exclude-standard" })
+    if vim.v.shell_error ~= 0 then
+        files = vim.tbl_map(function(f) return f:sub(#root + 2) end,
+            vim.fn.globpath(root, "**/*", true, true))
+    end
+    local sample
+    for _, rel in ipairs(files) do
+        if vim.filetype.match({ filename = rel }) == ft then
+            sample = rel
+            break
+        end
+    end
+    if not sample then
+        return nil, "no " .. ft .. " file in the workspace to try"
+    end
+    -- Server configs explain a refusal to start through vim.notify
+    -- ("cargo not found"); collect those so the reply says why.
+    local notices, orig_notify, orig_once = {}, vim.notify, vim.notify_once
+    local function collect(msg, level)
+        if type(msg) == "string" and (level or 0) >= vim.log.levels.WARN then
+            notices[#notices + 1] = msg:gsub("%s+", " ")
+        end
+    end
+    vim.notify = function(msg, level, opts)
+        collect(msg, level)
+        return orig_notify(msg, level, opts)
+    end
+    vim.notify_once = function(msg, level, opts)
+        collect(msg, level)
+        return orig_once(msg, level, opts)
+    end
+    local okb, bufnr = pcall(load_buf, root .. "/" .. sample)
+    local client
+    if okb then
+        -- The sample may have been loaded before the server existed (the
+        -- open_workspace probe does that); re-setting the filetype fires
+        -- FileType again so vim.lsp.enable's autocmd gets a second chance.
+        if #vim.lsp.get_clients({ bufnr = bufnr }) == 0 then
+            pcall(function() vim.bo[bufnr].filetype = ft end)
+        end
+        local deadline = vim.uv.now() + INSTALL_ATTACH_MS
+        while vim.uv.now() < deadline do
+            local clients = vim.lsp.get_clients({ bufnr = bufnr })
+            if #clients > 0 then
+                client = clients[1].name
+                break
+            end
+            sleep(200)
+        end
+    end
+    vim.notify, vim.notify_once = orig_notify, orig_once
+    if client then
+        return client
+    end
+    if not okb then
+        return nil, "could not load " .. sample
+    end
+    local why = "no client attached to " .. sample .. " within "
+        .. (INSTALL_ATTACH_MS / 1000) .. "s"
+    if #notices > 0 then
+        why = why .. ": " .. table.concat(notices, "; ")
+    else
+        why = why .. "; the server's config may need a toolchain on PATH "
+            .. "(rust_analyzer wants cargo, jdtls a JDK); see " .. vim.lsp.get_log_path()
+    end
+    return nil, why
+end
+
+local function install_server(ft, wanted, root)
+    local okreg, registry = pcall(require, "mason-registry")
+    local okml, mlsp = pcall(require, "mason-lspconfig")
+    if not okreg or not okml then
+        return { status = "skipped",
+            note = "mason.nvim and mason-lspconfig.nvim are needed to install servers; "
+                .. "install one by hand and enable it with vim.lsp.enable()" }
+    end
+    local maps = mlsp.get_mappings()
+    -- Resolve the wanted server: an explicit name may be a Mason package or
+    -- an lspconfig name; otherwise the preferred server for the filetype,
+    -- else whatever Mason offers for it.
+    local candidates = {}
+    pcall(function()
+        candidates = mlsp.get_available_servers({ filetype = ft })
+    end)
+    table.sort(candidates)
+    local lspname, package
+    if wanted and wanted ~= "" then
+        if maps.package_to_lspconfig[wanted] then
+            package, lspname = wanted, maps.package_to_lspconfig[wanted]
+        elseif maps.lspconfig_to_package[wanted] then
+            lspname, package = wanted, maps.lspconfig_to_package[wanted]
+        else
+            return { status = "unknown",
+                note = ("Mason has no package or server named %s; servers for %s: %s")
+                    :format(wanted, ft, #candidates > 0 and table.concat(candidates, ", ") or "none") }
+        end
+    else
+        lspname = PREFERRED_SERVER[ft]
+        if not lspname or not maps.lspconfig_to_package[lspname] then
+            -- An already enabled config for this filetype wins over a fresh pick.
+            for _, name in ipairs(enabled_lsp_configs_for(ft)) do
+                if maps.lspconfig_to_package[name] then
+                    lspname = name
+                    break
+                end
+            end
+        end
+        if not lspname or not maps.lspconfig_to_package[lspname] then
+            lspname = candidates[1]
+        end
+        if not lspname then
+            return { status = "unsupported",
+                note = "Mason offers no language server for filetype " .. ft }
+        end
+        package = maps.lspconfig_to_package[lspname]
+    end
+    local out = { package = package, lspconfig = lspname }
+    if #candidates > 1 then
+        out.alternatives = vim.tbl_filter(function(c) return c ~= lspname end, candidates)
+    end
+    local pkg
+    local okp = pcall(function() pkg = registry.get_package(package) end)
+    if not okp or not pkg then
+        out.status = "unknown"
+        out.note = "Mason registry has no package " .. package
+        return out
+    end
+    if pkg:is_installed() then
+        out.status = "already installed"
+    else
+        await(function(resume)
+            pcall(registry.refresh, function() resume() end)
+        end)
+        local timer = vim.uv.new_timer()
+        local timed_out = await(function(resume)
+            timer:start(INSTALL_SERVER_MS, 0, vim.schedule_wrap(function()
+                resume(true)
+            end))
+            local okh, herr = pcall(function()
+                pkg:install():once("closed", vim.schedule_wrap(function() resume(false) end))
+            end)
+            if not okh then
+                out.start_error = tostring(herr)
+                resume(false)
+            end
+        end)
+        timer:stop()
+        timer:close()
+        if timed_out then
+            out.status = "failed"
+            out.note = "install did not finish within " .. (INSTALL_SERVER_MS / 60000) .. " minutes"
+            return out
+        end
+        if not pkg:is_installed() then
+            out.status = "failed"
+            out.note = (out.start_error or "Mason reported the install as failed")
+                .. "; see :MasonLog (" .. vim.fn.stdpath("log") .. "/mason.log)"
+            out.start_error = nil
+            return out
+        end
+        out.status = "installed"
+    end
+    -- mason-lspconfig enables freshly installed servers itself when its
+    -- automatic_enable is on; doing it here too is idempotent and covers
+    -- the "already installed but never enabled" case.
+    pcall(vim.lsp.enable, lspname)
+    local cmd = vim.tbl_get(vim.lsp.config, lspname, "cmd")
+    if type(cmd) == "table" and type(cmd[1]) == "string" and vim.fn.executable(cmd[1]) == 0 then
+        out.attached = false
+        out.note = cmd[1] .. " is not executable from this Neovim (Mason's bin dir "
+            .. "is added to PATH by mason.setup(); is that in the config?)"
+        return out
+    end
+    if type(root) == "string" and root ~= "" then
+        local client, why = attached_client(root, ft)
+        if client then
+            out.attached = client
+        else
+            out.attached = false
+            out.note = why
+        end
+    end
+    return out
+end
+
+local function install_language(args)
+    local ft = args.language
+    if type(ft) ~= "string" or ft == "" then
+        err("missing required argument: language")
+    end
+    ft = ft:lower()
+    -- Accept a file extension or a treesitter name too ("ts", "cpp", "c++").
+    ft = vim.filetype.match({ filename = "x." .. ft }) or ft
+    local lang = vim.treesitter.language.get_lang(ft) or ft
+    local result = { language = ft }
+    if args.parser ~= false then
+        result.parser = install_parser(ft, lang)
+    else
+        result.parser = { status = "skipped" }
+    end
+    if args.server ~= "none" then
+        result.server = install_server(ft, args.server, args.root)
+    else
+        result.server = { status = "skipped" }
+    end
+    result.note = "installed pieces live in Neovim's data directory and survive restarts; "
+        .. "add them to the editor config's ensure_installed lists to keep them on a fresh machine"
+    return result
+end
+
 -- Internal (not in the model's tool list): line -> enclosing symbol info
 -- (name path, declaration line = signature, doc comment summary, position,
 -- nesting depth, hit kind, existing diagnostics), used by the bridge to
@@ -1441,9 +2846,34 @@ local dispatch_table = {
     type_definition = location_tool("textDocument/typeDefinition"),
     implementation = location_tool("textDocument/implementation"),
     references = function(args)
-        local result = location_tool("textDocument/references",
-            { context = { includeDeclaration = true } })(args)
+        local tool = location_tool("textDocument/references",
+            { context = { includeDeclaration = true } })
+        local result = tool(args)
+        if (result.count or 0) <= 1 then
+            local okb, bufnr = pcall(load_buf, args.file)
+            if okb and fresh_buf(bufnr) then
+                sleep(FRESH_RETRY_MS)
+                result = tool(args)
+            end
+        end
         annotate_locations(result.locations or {})
+        -- Group by file so the path is written once per file, not per hit.
+        local groups, order = {}, {}
+        for _, loc in ipairs(result.locations or {}) do
+            local file = loc.file
+            if not groups[file] then
+                groups[file] = { file = file, hits = {} }
+                order[#order + 1] = file
+            end
+            loc.file = nil
+            table.insert(groups[file].hits, loc)
+        end
+        local files = {}
+        for _, file in ipairs(order) do
+            files[#files + 1] = groups[file]
+        end
+        result.locations = nil
+        result.files = files
         return result
     end,
     hover = hover,
@@ -1458,12 +2888,17 @@ local dispatch_table = {
     apply_code_action = apply_code_action,
     skim = skim,
     workspace_map = workspace_map,
+    workspace_support = workspace_support,
+    install_language = install_language,
     ts_query = ts_query,
     find_symbol = find_symbol,
     replace_symbol_body = replace_symbol_body,
     replace_symbol_lines = replace_symbol_lines,
     insert_after_symbol = insert_symbol_tool("after"),
     insert_before_symbol = insert_symbol_tool("before"),
+    undo_edit = undo_edit,
+    rename_symbol = rename_symbol,
+    check_project = check_project,
     enclosing_symbols = enclosing_symbols,
     -- Internal: the bridge reports a disk read so the code window can follow.
     ui_follow = function(args)
@@ -1474,12 +2909,34 @@ local dispatch_table = {
     end,
 }
 
+-- Turn absolute "file" fields (and changed_files lists) into paths relative
+-- to the working directory before the result leaves the editor.
+local function relativize(value, key)
+    if type(value) == "string" then
+        if (key == "file" or key == "changed_files") and value:sub(1, 1) == "/" then
+            return rel_path(value)
+        end
+        return value
+    end
+    if type(value) ~= "table" then
+        return value
+    end
+    for k, v in pairs(value) do
+        value[k] = relativize(v, type(k) == "string" and k or key)
+    end
+    return value
+end
+
 function M.dispatch(tool, args)
     local fn = dispatch_table[tool]
     if not fn then
         err("unknown tool: %s", tostring(tool))
     end
-    return fn(args or {})
+    local result = fn(args or {})
+    if tool ~= "ui_follow" and tool ~= "enclosing_symbols" then
+        result = relativize(result)
+    end
+    return result
 end
 
 return M

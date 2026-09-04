@@ -7,7 +7,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -38,6 +37,7 @@ type tool struct {
 // tokens on every round. Restore them with provider.full_tools = true
 // (agent) or AGENT99_FULL_TOOLS=1 (MCP server).
 var extraTools = map[string]bool{
+	"install_language": true, // standalone MCP advertises it regardless
 	"type_definition":  true,
 	"implementation":   true,
 	"incoming_calls":   true,
@@ -63,10 +63,10 @@ func positionSchema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"file":   map[string]any{"type": "string", "description": "Path to the file (absolute, or relative to the project root)."},
+			"file":   map[string]any{"type": "string", "description": "File path (absolute or relative to root)."},
 			"line":   map[string]any{"type": "integer", "description": "1-based line number."},
-			"symbol": map[string]any{"type": "string", "description": "Symbol text on that line; its first occurrence marks the position. Prefer this over col."},
-			"col":    map[string]any{"type": "integer", "description": "Optional 1-based byte column, as an alternative to symbol."},
+			"symbol": map[string]any{"type": "string", "description": "Symbol text on that line, first occurrence. Prefer over col."},
+			"col":    map[string]any{"type": "integer", "description": "1-based byte column, alternative to symbol."},
 		},
 		"required": []string{"file", "line"},
 	}
@@ -80,7 +80,7 @@ func fileOnlySchema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"file": map[string]any{"type": "string", "description": "Path to the file (absolute, or relative to the project root)."},
+			"file": map[string]any{"type": "string", "description": "File path (absolute or relative to root)."},
 		},
 		"required": []string{"file"},
 	}
@@ -89,41 +89,26 @@ func fileOnlySchema() map[string]any {
 // lspTools are executed inside Neovim, against its live LSP clients.
 var lspTools = []tool{
 	positionTool("definition",
-		"Go to the definition of the symbol at a position, via the live LSP client "+
-			"in the user's Neovim. Returns file/line locations with a one-line preview."),
+		"Definition of the symbol at a position, with a line preview."),
 	positionTool("type_definition",
-		"Go to the type definition of the symbol at a position (the type of a "+
-			"variable rather than the variable itself)."),
+		"Type definition of the symbol at a position."),
 	positionTool("implementation",
-		"List implementations of the interface/abstract symbol at a position."),
+		"Implementations of the interface/abstract symbol at a position."),
 	positionTool("references",
-		"List all references to the symbol at a position across the whole project, "+
-			"including the declaration. Use this to see every caller/usage before "+
-			"changing a signature or behavior."),
+		"Every reference to the symbol at a position, project-wide, grouped by file, each tagged with its enclosing symbol. Check before changing a signature."),
 	positionTool("hover",
-		"Hover information for the symbol at a position: resolved type signature "+
-			"and documentation, as the editor would show it. The fastest way to learn "+
-			"a function's exact signature and doc comment."),
+		"Signature and docs of the symbol at a position, as the editor shows them."),
 	positionTool("expand_symbol",
-		"One-call combo: resolve the definition of the symbol at a position, then "+
-			"return the FULL SOURCE of the defining symbol (whole function/class body) "+
-			"plus its hover signature. Prefer this over calling definition and then "+
-			"reading the target file - it saves a round-trip."),
+		"Definition of the symbol at a position plus the full source of the defining symbol and its hover, in one call."),
 	positionTool("incoming_calls",
-		"Call hierarchy: functions that call the function at a position, with the "+
-			"line numbers of each call site."),
+		"Callers of the function at a position (call hierarchy)."),
 	positionTool("outgoing_calls",
-		"Call hierarchy: functions called by the function at a position."),
+		"Functions called by the function at a position (call hierarchy)."),
 	positionTool("code_actions",
-		"List the LSP code actions available at a position (quick fixes, "+
-			"refactorings, imports...). Returns a token and an indexed list of action "+
-			"titles; apply one with apply_code_action."),
+		"LSP code actions at a position (quick fixes, refactors): a token plus indexed titles for apply_code_action."),
 	{
-		Name: "apply_code_action",
-		Description: "Apply one code action from a previous code_actions call, by its " +
-			"token and index. The edit is performed by the editor itself (safe, " +
-			"possibly multi-file); returns the list of changed files. Changes stay " +
-			"unsaved in editor buffers - inspect them with buffer_lines.",
+		Name:        "apply_code_action",
+		Description: "Apply one action from code_actions by token and index. The editor performs the edit (possibly multi-file). Changes stay unsaved in editor buffers - inspect them with buffer_lines.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -134,48 +119,48 @@ var lspTools = []tool{
 		},
 	},
 	{
-		Name: "skim",
-		Description: "Rough structure of up to 20 files in ONE call: every " +
-			"function/class/method declaration line with its line number, nested to " +
-			"show containment (via treesitter, LSP fallback). An order of magnitude " +
-			"cheaper than reading files - use it FIRST to explore unfamiliar files, " +
-			"then read only the regions that matter.",
+		Name:        "skim",
+		Description: "Structure of up to 20 files in one call: every declaration line, nested, with line numbers. Use before reading a file, then read only what matters.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"files": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Paths of the files to skim (1-20), absolute or relative to the project root.",
+					"description": "1-20 file paths.",
 				},
 			},
 			"required": []string{"files"},
 		},
 	},
 	{
-		Name: "workspace_map",
-		Description: "The whole workspace's shape in ONE cheap call: every project file " +
-			"with its line count and TOP-LEVEL declarations only (functions/classes, one " +
-			"line each - no nesting, no annotations). The intended FIRST move in an " +
-			"unfamiliar repo: learn what exists, then skim the few files that matter. " +
-			"Far cheaper than broad greps or reading files.",
+		Name:        "install_language",
+		Description: "Install the treesitter parser (nvim-treesitter) and a language server (Mason) for a filetype into this Neovim. Use when open_workspace reports a language with neither. Slow; once per language.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"path": map[string]any{"type": "string", "description": "Optional subdirectory to map (default: project root)."},
-				"glob": map[string]any{"type": "string", "description": "Optional filename filter, e.g. \"**/*.go\"."},
+				"language": map[string]any{"type": "string", "description": "Filetype (go, python, typescript, cpp) or a file extension."},
+				"server":   map[string]any{"type": "string", "description": "Mason package or lspconfig name instead of the default; none = parser only."},
+				"parser":   map[string]any{"type": "boolean", "description": "false = server only."},
+			},
+			"required": []string{"language"},
+		},
+	},
+	{
+		Name:        "workspace_map",
+		Description: "Every project file with its line count and top-level declarations, in one cheap call. The first move in an unfamiliar repo. Test files are left out unless include_tests.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path": map[string]any{"type": "string", "description": "Subdirectory (default: root)."},
+				"glob": map[string]any{"type": "string", "description": "Filename glob, e.g. **/*.go."},
 			},
 			"required": []string{},
 		},
 	},
 	{
-		Name: "ts_query",
-		Description: "Structural search: run a treesitter s-expression query over many " +
-			"files in one call. Precise where grep is textual - distinguish declarations " +
-			"from usages, match calls by shape, capture sub-nodes with @name. Supports " +
-			"#eq?/#match? predicates. Example (Lua): (function_declaration name: (_) @name). " +
-			"Node type names are grammar-specific; if the query fails to compile, check " +
-			"the constructs with skim first. Returns file:line plus the captured text.",
+		Name:        "ts_query",
+		Description: "Structural search: a treesitter s-expression query with @captures (#eq?/#match? allowed) over many files. Node names are grammar-specific; skim first if unsure.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -185,57 +170,42 @@ var lspTools = []tool{
 					"items":       map[string]any{"type": "string"},
 					"description": "Files to search (optional if glob is given).",
 				},
-				"glob": map[string]any{"type": "string", "description": "Optional glob relative to the project root, e.g. \"**/*.lua\"."},
+				"glob": map[string]any{"type": "string", "description": "Glob relative to root."},
 			},
 			"required": []string{"query"},
 		},
 	},
 	{
-		Name: "find_symbol",
-		Description: "Look up symbols by name path across files and optionally fetch their " +
-			"FULL SOURCE. Name paths use \"/\" for nesting (\"MyClass/method\") or just the " +
-			"name (\"vec2_add\"). With include_body=true this is the cheapest way to read " +
-			"exactly one function/class instead of a whole file. Returns name_path, kind, " +
-			"file, absolute line range, and (optionally) the body numbered RELATIVE to the " +
-			"symbol (declaration = 1) - those numbers feed replace_symbol_lines directly.",
+		Name:        "find_symbol",
+		Description: "Find symbols by name or name path (\"Class/method\"; suffix and substring match) in files/glob, optionally with full source (include_body) numbered relative to the symbol, ready for replace_symbol_lines. Cheapest way to read one function.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"name":         map[string]any{"type": "string", "description": "Symbol name or name path (suffix and substring matching supported)."},
+				"name":         map[string]any{"type": "string", "description": "Name or name path; suffix/substring match."},
 				"file":         map[string]any{"type": "string", "description": "One file to search."},
 				"files":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Several files to search."},
-				"glob":         map[string]any{"type": "string", "description": "Glob relative to the project root, e.g. \"**/*.go\"."},
+				"glob":         map[string]any{"type": "string", "description": "Glob relative to root."},
 				"include_body": map[string]any{"type": "boolean", "description": "Return the full source of well-matching symbols."},
 			},
 			"required": []string{"name"},
 		},
 	},
 	{
-		Name: "replace_symbol_body",
-		Description: "Replace one whole symbol (function/class/method) in a file with new " +
-			"source, addressed by name path instead of line numbers. The edit is applied " +
-			"to the editor buffer immediately and is tracked (the user can revert). Provide " +
-			"the complete new symbol including its declaration line, matching the file's " +
-			"indentation. The symbol's range does NOT include doc comments above the " +
-			"declaration - never repeat them in the body. Do not use this on the user's " +
-			"selected region; that region is changed only via the <replacement> reply.",
+		Name:        "replace_symbol_body",
+		Description: "Replace a whole symbol (function/class/method) by name path with new source, declaration line included, matching the file's indentation; doc comments above it are not part of the symbol. Applied to the editor buffer immediately and tracked; returns fresh diagnostics. The region is formatted and imports organized; the reply lists only new diagnostics. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"file":      map[string]any{"type": "string", "description": "File containing the symbol."},
-				"name_path": map[string]any{"type": "string", "description": "Symbol name path (use the full path if the name is ambiguous)."},
+				"name_path": map[string]any{"type": "string", "description": "Symbol name path (full path if ambiguous)."},
 				"body":      map[string]any{"type": "string", "description": "Complete replacement source for the symbol."},
 			},
 			"required": []string{"file", "name_path", "body"},
 		},
 	},
 	{
-		Name: "replace_symbol_lines",
-		Description: "Replace a SLICE of a symbol, addressed by line numbers RELATIVE to " +
-			"the symbol's first line (declaration = 1) - the same numbering find_symbol " +
-			"bodies use. Prefer this over replace_symbol_body for small changes inside a " +
-			"large function: you only send the changed lines. Applied to the editor " +
-			"buffer immediately and tracked; returns fresh diagnostics.",
+		Name:        "replace_symbol_lines",
+		Description: "Replace lines first_line..last_line of a symbol, numbered relative to its declaration (=1) as find_symbol bodies show; prefer over replace_symbol_body for small changes. Applied to the editor buffer immediately and tracked; returns fresh diagnostics. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -249,47 +219,82 @@ var lspTools = []tool{
 		},
 	},
 	{
-		Name: "insert_after_symbol",
-		Description: "Insert new source immediately after a symbol (e.g. a new function " +
-			"below an existing one), addressed by name path. Applied to the editor buffer " +
-			"immediately and tracked.",
+		Name:        "insert_after_symbol",
+		Description: "Insert source right after a symbol by name path (a blank line is added). Applied to the editor buffer immediately and tracked.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"file":      map[string]any{"type": "string", "description": "File containing the anchor symbol."},
 				"name_path": map[string]any{"type": "string", "description": "Anchor symbol name path."},
-				"text":      map[string]any{"type": "string", "description": "Source to insert (a separating blank line is added automatically)."},
+				"text":      map[string]any{"type": "string", "description": "Source to insert."},
 			},
 			"required": []string{"file", "name_path", "text"},
 		},
 	},
 	{
-		Name: "insert_before_symbol",
-		Description: "Insert new source immediately before a symbol (e.g. an import, a " +
-			"helper, a decorator), addressed by name path. Applied to the editor buffer " +
-			"immediately and tracked.",
+		Name: "check_project",
+		Description: "Run the project's whole-project check (configured, AGENT99_CHECK, or guessed: " +
+			"go vet, tsc --noEmit, cargo check, pyright) from the root. The first call in a " +
+			"root records a baseline; later calls report only new and resolved lines. Use " +
+			"after a refactor or before finishing.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{"type": "string", "description": "Override the check command."},
+				"reset":   map[string]any{"type": "boolean", "description": "Record a fresh baseline from this run."},
+			},
+			"required": []string{},
+		},
+	},
+	{
+		Name:        "rename_symbol",
+		Description: "Rename the symbol at a position project-wide through the language server. dry_run lists affected files first. Undoable with undo_edit.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"file":     map[string]any{"type": "string", "description": "File containing the symbol."},
+				"line":     map[string]any{"type": "integer", "description": "1-based line number."},
+				"symbol":   map[string]any{"type": "string", "description": "Symbol text on that line, first occurrence. Prefer over col."},
+				"col":      map[string]any{"type": "integer", "description": "1-based byte column, alternative to symbol."},
+				"new_name": map[string]any{"type": "string", "description": "The new name."},
+				"dry_run":  map[string]any{"type": "boolean", "description": "Only report what would change."},
+			},
+			"required": []string{"file", "line", "new_name"},
+		},
+	},
+	{
+		Name:        "undo_edit",
+		Description: "Undo the newest symbol edit(s) of this run (count, or all), restoring the previous source. Refuses if the region changed since. Code actions are not covered.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"count": map[string]any{"type": "integer", "description": "How many of the newest edits to undo (default 1)."},
+				"all":   map[string]any{"type": "boolean", "description": "Undo every edit of this run."},
+			},
+			"required": []string{},
+		},
+	},
+	{
+		Name:        "insert_before_symbol",
+		Description: "Insert source right before a symbol by name path (import, helper, decorator). Applied to the editor buffer immediately and tracked.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"file":      map[string]any{"type": "string", "description": "File containing the anchor symbol."},
 				"name_path": map[string]any{"type": "string", "description": "Anchor symbol name path."},
-				"text":      map[string]any{"type": "string", "description": "Source to insert (a separating blank line is added automatically)."},
+				"text":      map[string]any{"type": "string", "description": "Source to insert."},
 			},
 			"required": []string{"file", "name_path", "text"},
 		},
 	},
 	{
-		Name: "document_symbols",
-		Description: "Outline of one file: every function/class/method with its line " +
-			"number, nested to show structure. Cheaper than reading the file when you " +
-			"only need its shape.",
+		Name:        "document_symbols",
+		Description: "Outline of one file from the language server.",
 		InputSchema: fileOnlySchema(),
 	},
 	{
-		Name: "workspace_symbols",
-		Description: "Fuzzy-search symbol names (functions, classes, methods, ...) " +
-			"across the whole project. Use this to locate something by name when you " +
-			"do not know which file it lives in.",
+		Name:        "workspace_symbols",
+		Description: "Fuzzy-search symbol names across the project; use when the file is unknown.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -299,22 +304,17 @@ var lspTools = []tool{
 		},
 	},
 	{
-		Name: "diagnostics",
-		Description: "Current LSP diagnostics (errors, warnings, hints) for one file, " +
-			"as shown in the editor. Diagnostics that the language server can fix itself " +
-			"carry a quick_fixes list of action titles: apply those with " +
-			"code_actions + apply_code_action instead of writing the fix by hand.",
+		Name:        "diagnostics",
+		Description: "Errors/warnings/hints for a file. Entries with quick_fixes are fixable via code_actions + apply_code_action.",
 		InputSchema: fileOnlySchema(),
 	},
 	{
-		Name: "buffer_lines",
-		Description: "Read a file as the editor currently sees it, including UNSAVED " +
-			"changes, with line numbers. Prefer this over reading from disk for any file " +
-			"the user has open: the on-disk content may be stale.",
+		Name:        "buffer_lines",
+		Description: "Read a file as the editor sees it, including unsaved changes. Use buffer_lines instead for files the user has open in the editor (they may have unsaved changes).",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"file":  map[string]any{"type": "string", "description": "Path to the file (absolute, or relative to the project root)."},
+				"file":  map[string]any{"type": "string", "description": "File path (absolute or relative to root)."},
 				"first": map[string]any{"type": "integer", "description": "Optional 1-based first line (default 1)."},
 				"last":  map[string]any{"type": "integer", "description": "Optional 1-based last line (default: end of buffer)."},
 			},
@@ -327,13 +327,12 @@ var lspTools = []tool{
 // (the claude provider has its own Read/Grep/Glob).
 var fileTools = []tool{
 	{
-		Name: "read_file",
-		Description: "Read a file from disk with line numbers. Use buffer_lines instead " +
-			"for files the user has open in the editor (they may have unsaved changes).",
+		Name:        "read_file",
+		Description: "Read a file with line numbers (offset/limit). A large file returns its skim instead.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"path":   map[string]any{"type": "string", "description": "File path, absolute or relative to the project root."},
+				"path":   map[string]any{"type": "string", "description": "File path (absolute or relative to root)."},
 				"offset": map[string]any{"type": "integer", "description": "1-based first line to read (default 1)."},
 				"limit":  map[string]any{"type": "integer", "description": fmt.Sprintf("Maximum number of lines (default %d).", maxReadLines)},
 			},
@@ -341,35 +340,27 @@ var fileTools = []tool{
 		},
 	},
 	{
-		Name: "grep",
-		Description: "Search file contents in the project with a regular expression " +
-			"(ripgrep/grep syntax). Matches come with context lines and a rich tag: " +
-			"path:line [Symbol kind @pos/len dN !SEV ~age - signature - doc-comment]. " +
-			"kind says what the hit IS (def, call, comment, string; plain references " +
-			"are untagged), @pos/len locates it inside the symbol, dN is loop/branch " +
-			"nesting depth, !ERROR/!WARN means the line already has that diagnostic, " +
-			"'test:' prefixes hits in test files, ~age (with blame=true) is when the " +
-			"line last changed. Signature and doc-comment appear on the first hit per " +
-			"symbol. You usually do NOT need a follow-up read to understand a hit.",
+		Name:        "grep",
+		Description: "Regex search (ripgrep syntax) with context. Hits carry a tag: path:line [Symbol kind @pos/len dN !SEV ~age · signature · doc]: kind is def/call/comment/string, dN nesting depth, !ERROR an existing diagnostic, test: a test file, ~age needs blame=true. Usually no follow-up read is needed.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"pattern": map[string]any{"type": "string", "description": "Regular expression to search for."},
-				"path":    map[string]any{"type": "string", "description": "Optional subdirectory or file to search (default: project root)."},
-				"glob":    map[string]any{"type": "string", "description": "Optional filename filter, e.g. \"*.lua\" or \"**/*.go\"."},
+				"path":    map[string]any{"type": "string", "description": "Subdirectory or file (default: root)."},
+				"glob":    map[string]any{"type": "string", "description": "Filename glob."},
 				"context": map[string]any{"type": "integer", "description": "Context lines around each match (default 2, max 10)."},
-				"blame":   map[string]any{"type": "boolean", "description": "Also show when each hit line last changed (git blame; slower)."},
+				"blame":   map[string]any{"type": "boolean", "description": "Add git blame age per hit (slower)."},
 			},
 			"required": []string{"pattern"},
 		},
 	},
 	{
 		Name:        "list_files",
-		Description: "List files in the project (respects .gitignore in git repos).",
+		Description: "List project files (respects .gitignore).",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"path": map[string]any{"type": "string", "description": "Optional subdirectory (default: project root)."},
+				"path": map[string]any{"type": "string", "description": "Subdirectory (default: root)."},
 			},
 			"required": []string{},
 		},
@@ -455,7 +446,7 @@ func runReadFile(root string, args map[string]any) (string, error) {
 	if !explicit && os.Getenv("AGENT99_NO_LSP") == "" {
 		if n := countLines(path); n > autoSkimThreshold {
 			if res, err := nvimCall("skim", map[string]any{"files": []any{path}}); err == nil {
-				pretty, merr := json.MarshalIndent(res, "", "  ")
+				pretty, merr := renderJSON(res)
 				if merr == nil {
 					return fmt.Sprintf(
 						"%s has %d lines - returning its structure instead of the full "+
@@ -527,14 +518,16 @@ func runGrep(root string, args map[string]any) (string, error) {
 		// --sort path costs rg its parallelism but makes the output
 		// deterministic; without it two identical greps are not
 		// byte-identical, which defeats the duplicate-result guard.
-		cargs := []string{"-n", "--column", "--no-heading", "-S", "--sort", "path", ctxArg}
+		// -H keeps the filename even for a single-file target, which the
+		// annotator's path:line:col parsing depends on.
+		cargs := []string{"-H", "-n", "--column", "--no-heading", "-S", "--sort", "path", ctxArg}
 		if glob != "" {
 			cargs = append(cargs, "-g", glob)
 		}
 		cargs = append(cargs, "-e", pattern, target)
 		cmd = exec.Command("rg", cargs...)
 	} else {
-		cargs := []string{"-rnIE", ctxArg}
+		cargs := []string{"-rnHIE", ctxArg}
 		if glob != "" {
 			cargs = append(cargs, "--include="+glob)
 		}
@@ -791,7 +784,9 @@ func callTool(name string, args map[string]any, root string) (string, error) {
 			resolved["file"] = resolveInRoot(root, args["file"])
 			args = resolved
 		}
-		if name == "ts_query" || name == "find_symbol" || name == "workspace_map" {
+		switch name {
+		case "ts_query", "find_symbol", "workspace_map", "workspace_symbols", "install_language",
+			"replace_symbol_body", "replace_symbol_lines", "insert_after_symbol", "insert_before_symbol", "undo_edit", "rename_symbol", "check_project":
 			resolved := map[string]any{}
 			for k, v := range args {
 				resolved[k] = v
@@ -811,11 +806,20 @@ func callTool(name string, args map[string]any, root string) (string, error) {
 			resolved["files"] = resolvedList
 			args = resolved
 		}
+		if headlessRoot() != "" {
+			// The server autosaves after edits; tools word their notes accordingly.
+			resolved := map[string]any{}
+			for k, v := range args {
+				resolved[k] = v
+			}
+			resolved["headless"] = true
+			args = resolved
+		}
 		result, err := nvimCall(name, args)
 		if err != nil {
 			return "", err
 		}
-		text, err := json.MarshalIndent(result, "", "  ")
+		text, err := renderJSON(result)
 		if err != nil {
 			return "", err
 		}

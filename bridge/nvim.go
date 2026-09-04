@@ -23,6 +23,12 @@ const (
 	pollInterval = 150 * time.Millisecond
 )
 
+// Tools allowed to run longer than nvimTimeout: installs download and compile.
+var toolTimeouts = map[string]time.Duration{
+	"install_language": 15 * time.Minute,
+	"check_project":    10 * time.Minute,
+}
+
 func remoteExpr(sock, expr string) (string, error) {
 	cmd := exec.Command("nvim", "--server", sock, "--remote-expr", expr)
 	var out, errb strings.Builder
@@ -41,14 +47,25 @@ func remoteExpr(sock, expr string) (string, error) {
 	return out.String(), nil
 }
 
-func nvimCall(tool string, args map[string]any) (any, error) {
-	sock := os.Getenv("AGENT99_NVIM")
-	if sock == "" {
-		sock = os.Getenv("NVIM")
+// nvimSocket resolves the Neovim instance tools are routed to: an explicit
+// $AGENT99_NVIM wins (the plugin sets it when it spawns the bridge), then
+// a headless workspace opened through the MCP server, then the $NVIM of an
+// enclosing :terminal.
+func nvimSocket() string {
+	if sock := os.Getenv("AGENT99_NVIM"); sock != "" {
+		return sock
 	}
+	if sock := headlessSocket(); sock != "" {
+		return sock
+	}
+	return os.Getenv("NVIM")
+}
+
+func nvimCall(tool string, args map[string]any) (any, error) {
+	sock := nvimSocket()
 	if sock == "" {
-		return nil, errors.New("no Neovim socket: neither $AGENT99_NVIM nor $NVIM is set. " +
-			"The bridge must be launched from (or pointed at) a running Neovim.")
+		return nil, errors.New("no Neovim to talk to: call open_workspace(root) first, " +
+			"or launch the bridge with $AGENT99_NVIM (or $NVIM) pointing at a running Neovim")
 	}
 	if args == nil {
 		args = map[string]any{}
@@ -63,7 +80,11 @@ func nvimCall(tool string, args map[string]any) (any, error) {
 		return nil, err
 	}
 	id = strings.TrimSpace(id)
-	deadline := time.Now().Add(nvimTimeout)
+	timeout := nvimTimeout
+	if t, ok := toolTimeouts[tool]; ok {
+		timeout = t
+	}
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		out, err := remoteExpr(sock, fmt.Sprintf("v:lua.Agent99RpcPoll('%s')", id))
 		if err != nil {
@@ -87,5 +108,5 @@ func nvimCall(tool string, args map[string]any) (any, error) {
 		}
 		return resp.Result, nil
 	}
-	return nil, fmt.Errorf("timed out after %s waiting for the Neovim tool result", nvimTimeout)
+	return nil, fmt.Errorf("timed out after %s waiting for the Neovim tool result", timeout)
 }

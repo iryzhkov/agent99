@@ -33,4 +33,6 @@ done
 
 # Full roster for coverage; drive_mcp separately checks the slim default.
 AGENT99_NVIM="$SOCK" AGENT99_FULL_TOOLS=1 python3 "$REPO/tests/drive_mcp.py"
+# Standalone mode: the bridge starts its own headless Neovim.
+python3 "$REPO/tests/drive_headless.py"
 echo "smoke: OK"

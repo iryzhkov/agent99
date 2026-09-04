@@ -140,6 +140,65 @@ local function error_multiset(buf)
     return counts
 end
 
+-- Same multiset over every loaded buffer, keyed by buffer as well, for
+-- runs that edit through the symbol tools (any file, not just the one
+-- with the selection).
+local function error_multiset_all()
+    local counts = {}
+    for _, d in ipairs(vim.diagnostic.get(nil, { severity = vim.diagnostic.severity.ERROR })) do
+        local sig = d.bufnr .. "|" .. d.message
+        counts[sig] = (counts[sig] or 0) + 1
+    end
+    return counts
+end
+
+-- Safety net for runs that ended with symbol-tool edits: the tools report
+-- new diagnostics to the model as it works, but if it stopped with errors
+-- outstanding in any edited buffer, ask once for a fix (same guard and
+-- one-round rule as the replacement path).
+local function schedule_auto_fix_tools(bufs, pre_errors, record)
+    local opts = config.options
+    if not opts.auto_fix or record.autofix
+        or opts.provider.kind ~= "openai" or not record.transcript then
+        return
+    end
+    vim.defer_fn(function()
+        if state.job or state.preview then
+            return
+        end
+        if not (state.last and state.last.record and state.last.record.id == record.id) then
+            return
+        end
+        local new_errors, seen = {}, {}
+        for _, buf in ipairs(bufs) do
+            if vim.api.nvim_buf_is_valid(buf) then
+                for _, d in ipairs(vim.diagnostic.get(buf, { severity = vim.diagnostic.severity.ERROR })) do
+                    local sig = buf .. "|" .. d.message
+                    seen[sig] = (seen[sig] or 0) + 1
+                    if seen[sig] > (pre_errors[sig] or 0) then
+                        new_errors[#new_errors + 1] = ("%s:%d: %s"):format(
+                            vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ":."),
+                            d.lnum + 1, d.message)
+                    end
+                end
+            end
+        end
+        if #new_errors == 0 then
+            return
+        end
+        log({ "auto-fix (tool edits) triggered for " .. record.id, unpack(new_errors) })
+        vim.notify(("agent99: the symbol edits left %d new error(s); asking the agent to fix them")
+            :format(#new_errors), vim.log.levels.WARN)
+        M.followup(
+            "Your symbol edits left new LSP error diagnostics:\n"
+            .. table.concat(new_errors, "\n")
+            .. "\nFix them with the symbol edit tools. When the diagnostics tool offers "
+            .. "quick_fixes, apply the server's own fix via code_actions + apply_code_action "
+            .. "instead of rewriting the code.",
+            { autofix = true })
+    end, opts.auto_fix_delay_ms)
+end
+
 -- After an apply, wait for the LSP to re-publish, then fire one automatic
 -- follow-up round if the edit introduced errors that were not there before.
 local function schedule_auto_fix(buf, pre_errors, record)
@@ -617,9 +676,18 @@ local function on_exit(result)
                 history.write(record)
                 -- Keep the selection reachable for a follow-up.
                 keep_last_region()
+                local pre_errors = state.pre_errors_all or {}
                 clear_request(false)
                 vim.notify(("agent99: %d symbol edit(s) applied - %s (:Agent99Revert to undo)")
                     :format(#tool_edits, summary:sub(1, 120)))
+                local bufs, seen_buf = {}, {}
+                for _, e in ipairs(tool_edits) do
+                    if e.bufnr and not seen_buf[e.bufnr] then
+                        seen_buf[e.bufnr] = true
+                        bufs[#bufs + 1] = e.bufnr
+                    end
+                end
+                schedule_auto_fix_tools(bufs, pre_errors, record)
                 return
             end
             if not out then
@@ -675,6 +743,9 @@ function M.start(buf, first, last, instruction, opts)
     end
     -- Drop any stale ledger entries from a crashed or cancelled run.
     require("agent99.edits").take()
+    -- Errors present before the run, so tool edits can be judged by what
+    -- they added (see schedule_auto_fix_tools).
+    state.pre_errors_all = error_multiset_all()
     local root = file ~= "" and project_root(file) or vim.uv.cwd()
     local id, transcript = history.new_id()
 

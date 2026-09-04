@@ -30,6 +30,39 @@ function M.take()
     return out
 end
 
+--- Undo the newest `n` recorded edits (all of them when n is nil), newest
+--- first, and drop them from the ledger. Each edit is checked against the
+--- buffer first: the lines it wrote must still be there, or something else
+--- has changed that region since and blindly restoring would clobber it.
+--- Returns the list of undone entries and the list of refusals.
+function M.undo_last(n)
+    local undone, refused = {}, {}
+    local todo = n or #current
+    while todo > 0 and #current > 0 do
+        local e = current[#current]
+        local why
+        if not (e.bufnr and vim.api.nvim_buf_is_valid(e.bufnr)) then
+            why = "its buffer is gone"
+        else
+            local now = vim.api.nvim_buf_get_lines(e.bufnr,
+                e.first - 1, e.first - 1 + e.new_count, false)
+            if not vim.deep_equal(now, e.new_lines or {}) then
+                why = "the region changed since the edit; fix it by hand"
+            end
+        end
+        if why then
+            refused[#refused + 1] = { file = e.file, name_path = e.name_path, why = why }
+            break -- older edits below it would be off too
+        end
+        vim.api.nvim_buf_set_lines(e.bufnr, e.first - 1, e.first - 1 + e.new_count,
+            false, e.old_lines)
+        undone[#undone + 1] = e
+        current[#current] = nil
+        todo = todo - 1
+    end
+    return undone, refused
+end
+
 --- Undo a list of edits (as returned by take), newest first. Each entry's
 --- coordinates were valid when it was applied, so reverse order restores
 --- the original state as long as the user has not edited in between.

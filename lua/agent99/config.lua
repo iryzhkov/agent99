@@ -94,6 +94,33 @@ M.defaults = {
         -- Request records kept on disk under stdpath("state")/agent99.
         keep = 100,
     },
+    -- What a symbol edit tool reports back after applying: it waits for the
+    -- language servers to re-publish (up to post_edit.wait_ms, returning as
+    -- soon as they settle) and lists only the errors/warnings the edit
+    -- introduced, with counts for what was already there and what it fixed.
+    post_edit = {
+        wait_ms = 4000,
+        -- After a symbol edit, format the edited region through the server
+        -- ("range"; servers without range formatting, gopls among them,
+        -- format the whole file only when it is a Go file) and run the
+        -- server's organize-imports action, so a new call to a package the
+        -- file does not import yet costs the agent no extra round.
+        format = "range",
+        organize_imports = true,
+        -- Run a linter as well and include its output. Commands per
+        -- filetype, with {file}, {dir} and {root} expanded, e.g.
+        --   commands = { python = "ruff check {file}", go = "go vet {dir}" }
+        commands = {},
+        -- With nvim-lint installed and configured for the filetype, run its
+        -- linters too; their findings land in the same diagnostics report.
+        nvim_lint = true,
+        lint_timeout_ms = 30000,
+        -- Project-wide check run by the check_project tool (cwd = root),
+        -- e.g. "go vet ./..." or "npx tsc --noEmit". nil: guessed from the
+        -- project's marker files (go.mod, Cargo.toml, tsconfig.json, ...).
+        check = nil,
+        check_timeout_ms = 5 * 60 * 1000,
+    },
 
     ui = {
         width = 0.4,      -- fraction of columns for the agent panel
