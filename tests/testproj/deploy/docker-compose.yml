@@ -1,0 +1,11 @@
+services:
+  web:
+    image: nginx:1.27
+    ports:
+      - "8080:80"
+  api:
+    build: ./api
+    environment:
+      LOG_LEVEL: info
+volumes:
+  pgdata: {}

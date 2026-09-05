@@ -123,6 +123,43 @@ def main():
             check("replace_symbol_body rewrites a markdown section",
                   "One, now." in f.read() and "None yet." not in open(notes).read(), res)
 
+        # Data files index by key: a compose service is a name path, a TOML
+        # table too, and a long data file with one top-level key is read as
+        # text rather than answered with a one-line outline.
+        compose = os.path.join(root, "deploy", "docker-compose.yml")
+        res = b.call("skim", {"files": [compose]})
+        outline = res["files"][0].get("outline", [])
+        yaml_parser = "no treesitter parser" not in (res["files"][0].get("note") or "")
+        if not yaml_parser:
+            print("SKIP data-file checks: no yaml parser under the test config")
+        check("skim outlines yaml keys", not yaml_parser or (
+              any(l.strip().startswith("1-") and "services:" in l for l in outline)
+              and any("api:" in l for l in outline)), res)
+        if yaml_parser:
+            res = b.call("find_symbol", {"file": compose, "name": "services/api/environment", "include_body": True})
+            body = res.get("matches", [{}])[0].get("body", [])
+            check("find_symbol reads a yaml key by path",
+                  res.get("count") == 1 and body and "LOG_LEVEL: info" in body[-1], res)
+            res = b.call("replace_symbol_lines", {
+                "file": compose, "name_path": "services/api/environment",
+                "match": "      LOG_LEVEL: info", "text": "      LOG_LEVEL: debug",
+            })
+            check("edit a yaml key by path", "LOG_LEVEL: debug" in open(compose).read(), res)
+            toml = os.path.join(root, "config.toml")
+            res = b.call("find_symbol", {"file": toml, "name": "server", "include_body": True})
+            body = res.get("matches", [{}])[0].get("body", [])
+            check("find_symbol reads a toml table",
+                  res.get("count") == 1 and body and body[0].endswith("[server]")
+                  and any("port = 8080" in l for l in body), res)
+            big = os.path.join(root, "big.yml")
+            with open(big, "w") as f:
+                f.write("items:\n" + "".join("  - name: item%d\n    value: %d\n" % (i, i) for i in range(300)))
+            r = b.rpc("tools/call", {"name": "read_file", "arguments": {"path": big}})
+            text = r["result"]["content"][0]["text"]
+            check("read_file returns text when the outline is trivial",
+                  text.startswith("1: items:") and "600: " in text, text[:120])
+            os.remove(big)
+
         # A stale offset with the right expect is refused, and the refusal
         # carries a code action that applies the edit where the text is.
         try:

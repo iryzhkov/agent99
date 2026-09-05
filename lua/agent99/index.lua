@@ -111,7 +111,44 @@ local TS_CONTAINER = {
     section = true,
 }
 
-local function ts_container(node_type)
+-- Data files have no declarations, but they have keys: a compose file's
+-- services, a TOML table, a JSON object's members, a Dockerfile's build
+-- stages. Indexed per filetype, never by segment, because `pair` in a
+-- JavaScript grammar is every object-literal member and would swamp the
+-- index of real code.
+local DATA_NODES = {
+    yaml = { block_mapping_pair = true },
+    json = { pair = true },
+    jsonc = { pair = true },
+    json5 = { pair = true },
+    toml = { table = true, table_array_element = true, pair = true },
+    dockerfile = { from_instruction = true },
+}
+
+-- Lists are not descended into: 450 items of "name/value" would be the
+-- whole index, and a list item has no name to address it by anyway.
+local DATA_OPAQUE = {
+    yaml = { block_sequence = true, flow_sequence = true },
+    json = { array = true },
+    jsonc = { array = true },
+    json5 = { array = true },
+    toml = { array = true },
+}
+
+local function data_nodes(ft)
+    return ft and DATA_NODES[ft] or nil
+end
+
+local function data_opaque(node_type, ft)
+    local set = ft and DATA_OPAQUE[ft]
+    return set ~= nil and set[node_type] == true
+end
+
+local function ts_container(node_type, ft)
+    local data = data_nodes(ft)
+    if data then
+        return data[node_type] == true
+    end
     local container = false
     for segment in node_type:gmatch("[^_]+") do
         if segment == "function" or segment == "method" then
@@ -123,8 +160,11 @@ local function ts_container(node_type)
     end
     return container
 end
-
-local function ts_wanted(node_type)
+local function ts_wanted(node_type, ft)
+    local data = data_nodes(ft)
+    if data then
+        return data[node_type] == true
+    end
     if TS_WANTED_EXACT[node_type] then
         return true
     end
@@ -139,7 +179,6 @@ local function ts_wanted(node_type)
     end
     return wanted
 end
-
 local function ts_outline(bufnr)
     local ok, parser = pcall(vim.treesitter.get_parser, bufnr)
     if not ok or parser == nil then
@@ -151,14 +190,18 @@ local function ts_outline(bufnr)
     if not okp or not trees or not trees[1] then
         return nil
     end
+    local ft = vim.bo[bufnr].filetype
     local out = {}
     local last_row = -1
     local extra, extra_last_row = 0, -1
     local function walk(node, depth)
         for child in node:iter_children() do
             if child:named() then
-                if ts_wanted(child:type()) then
-                    local srow, _, erow = child:range()
+                if ts_wanted(child:type(), ft) then
+                    local srow, _, erow, ecol = child:range()
+                    if ecol == 0 and erow > srow then
+                        erow = erow - 1
+                    end
                     -- A wrapper and its inner node often start on the same
                     -- row (e.g. declaration + definition); emit it once.
                     if #out >= MAX_SKIM_ENTRIES then
@@ -179,7 +222,7 @@ local function ts_outline(bufnr)
                     if #out < MAX_SKIM_ENTRIES or depth < 1 then
                         walk(child, depth + 1)
                     end
-                else
+                elseif not data_opaque(child:type(), ft) then
                     walk(child, depth)
                 end
             end
@@ -411,6 +454,7 @@ local function top_level_outline(path, budget, missing)
         return nil, #lines
     end
     local out, extra = {}, 0
+    local last_row = -1
     -- Emit declaration-shaped nodes, descending one level into the ones that
     -- hold other declarations. Stopping at the top level suits Go, where
     -- methods are top-level anyway, but it reduces a 1600-line Python module
@@ -421,21 +465,25 @@ local function top_level_outline(path, budget, missing)
         for child in node:iter_children() do
             if child:named() then
                 local ctype = child:type()
-                if ts_wanted(ctype) then
-                    if #out >= budget then
+                if ts_wanted(ctype, ft) then
+                    local srow = child:range()
+                    if srow == last_row then
+                        -- Several declarations on one line (a one-line JSON
+                        -- object) are one line of the map.
+                    elseif #out >= budget then
                         extra = extra + 1
                     else
-                        local srow = child:range()
+                        last_row = srow
                         local text = (lines[srow + 1] or ""):gsub("^%s+", "")
                         if #text > MAP_TEXT_MAX then
                             text = text:sub(1, MAP_TEXT_MAX) .. "…"
                         end
                         out[#out + 1] = ("%s%d: %s"):format(("  "):rep(depth), srow + 1, text)
                     end
-                    if depth < MAP_MAX_DEPTH and ts_container(ctype) then
+                    if depth < MAP_MAX_DEPTH and ts_container(ctype, ft) then
                         walk(child, depth + 1)
                     end
-                elseif not ts_opaque(ctype) then
+                elseif not ts_opaque(ctype) and not data_opaque(ctype, ft) then
                     walk(child, depth)
                 end
             end
@@ -805,9 +853,35 @@ local function section_name(node, bufnr)
 end
 
 local function ts_node_name(node, bufnr)
-    if node:type() == "section" then
+    local ntype = node:type()
+    if ntype == "section" then
         local heading = section_name(node, bufnr)
         if heading then return heading end
+    end
+    -- Data files: a YAML or JSON pair is named by its key, a TOML table or
+    -- pair by its first child (the key), a Dockerfile stage by its alias.
+    local key = node:field("key")
+    if key and key[1] then
+        local text = vim.treesitter.get_node_text(key[1], bufnr)
+        return (text:gsub('^"(.*)"$', "%1"):gsub("^'(.*)'$", "%1"))
+    end
+    if ntype == "table" or ntype == "table_array_element" or (ntype == "pair" and not node:field("name")[1]) then
+        for child in node:iter_children() do
+            if child:named() then
+                return (vim.treesitter.get_node_text(child, bufnr):gsub('^"(.*)"$', "%1"))
+            end
+        end
+    end
+    if ntype == "from_instruction" then
+        local image
+        for child in node:iter_children() do
+            if child:type() == "image_alias" then
+                return vim.treesitter.get_node_text(child, bufnr)
+            elseif child:type() == "image_spec" then
+                image = vim.treesitter.get_node_text(child, bufnr)
+            end
+        end
+        if image then return image end
     end
     local name_field = node:field("name")
     if name_field and name_field[1] then
@@ -871,11 +945,12 @@ local function ts_index(bufnr)
     if not okp or not trees or not trees[1] then
         return nil
     end
+    local ft = vim.bo[bufnr].filetype
     local entries = {}
     local function walk(node, prefix)
         for child in node:iter_children() do
             if child:named() then
-                if ts_wanted(child:type()) then
+                if ts_wanted(child:type(), ft) then
                     local srow, _, erow, ecol = child:range()
                     -- A node ending at column 0 stopped at the previous
                     -- line's newline (a Markdown section runs up to the
@@ -886,20 +961,45 @@ local function ts_index(bufnr)
                     local name = ts_node_name(child, bufnr)
                     local path = prefix == "" and name or (prefix .. "/" .. name)
                     entries[#entries + 1] = {
-                        path = path, name = name, kind = child:type(),
-                        first = srow + 1, last = erow + 1,
+                        path = path,
+                        name = name,
+                        kind = child:type(),
+                        first = srow + 1,
+                        last = erow + 1,
                     }
                     walk(child, path)
-                else
+                elseif not data_opaque(child:type(), ft) then
                     walk(child, prefix)
                 end
             end
         end
     end
     walk(trees[1]:root(), "")
+    -- A Dockerfile stage is FROM up to the next FROM, but the grammar only
+    -- has the one line; widen each stage to what it actually owns so a
+    -- stage can be read and edited as a unit.
+    if ft == "dockerfile" then
+        local total = vim.api.nvim_buf_line_count(bufnr)
+        for i, e in ipairs(entries) do
+            if e.kind == "from_instruction" then
+                local stop = total
+                for j = i + 1, #entries do
+                    if entries[j].kind == "from_instruction" then
+                        stop = entries[j].first - 1
+                        break
+                    end
+                end
+                while stop > e.first do
+                    local text = vim.api.nvim_buf_get_lines(bufnr, stop - 1, stop, false)[1] or ""
+                    if text:match("%S") then break end
+                    stop = stop - 1
+                end
+                e.last = stop
+            end
+        end
+    end
     return entries
 end
-
 local function lsp_index(bufnr)
     local okc, client = pcall(get_client, bufnr, "textDocument/documentSymbol", 2000)
     if not okc then

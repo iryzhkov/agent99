@@ -108,12 +108,37 @@ func readContext(file string, line int) string {
 	return "context: this region starts inside " + path
 }
 
+// skimHasOutline reports whether a skim reply carries at least one outline
+// entry for its first file.
+func skimHasOutline(res any) bool {
+	m, ok := res.(map[string]any)
+	if !ok {
+		return false
+	}
+	files, ok := m["files"].([]any)
+	if !ok || len(files) == 0 {
+		return false
+	}
+	first, ok := files[0].(map[string]any)
+	if !ok {
+		return false
+	}
+	// One or two entries (a data file with a single top-level key) do not
+	// stand in for the content the way a real outline does.
+	outline, ok := first["outline"].([]any)
+	return ok && len(outline) >= 3
+}
+
 func runReadFile(root string, args map[string]any) (string, error) {
 	path := resolveInRoot(root, args["path"])
 	explicit := args["offset"] != nil || args["limit"] != nil
 	if !explicit && os.Getenv("AGENT99_NO_LSP") == "" {
 		if n := countLines(path); n > autoSkimThreshold {
-			if res, err := nvimCall("skim", map[string]any{"files": []any{path}}); err == nil {
+			// A skim only replaces the content when it has an outline. A
+			// file nothing can outline (a log, a data dump, a grammar
+			// without declarations) would otherwise come back as "no
+			// outline; read it instead" from the read itself.
+			if res, err := nvimCall("skim", map[string]any{"files": []any{path}}); err == nil && skimHasOutline(res) {
 				pretty, merr := renderJSON(res)
 				if merr == nil {
 					return fmt.Sprintf(

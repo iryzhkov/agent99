@@ -17,6 +17,14 @@ if vim.fn.isdirectory(dap_dir) == 1 then
     vim.opt.rtp:prepend(dap_dir)
 end
 
+-- --clean drops the data site directory, where nvim-treesitter installs its
+-- parsers; put it back so the data-file tests see the machine's yaml and
+-- toml parsers (they skip cleanly when the directory has none).
+local site = vim.fn.stdpath("data") .. "/site"
+if vim.fn.isdirectory(site .. "/parser") == 1 then
+    vim.opt.rtp:append(site)
+end
+
 -- Headless test instances must never fight over swap files or shada.
 vim.opt.swapfile = false
 vim.opt.shadafile = "NONE"
