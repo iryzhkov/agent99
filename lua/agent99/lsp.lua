@@ -1640,7 +1640,6 @@ local function polish_after_edit(bufnr, first, count, opts)
     if not client_for(bufnr, "textDocument/didOpen") then
         return first, count, done
     end
-    local total = vim.api.nvim_buf_line_count(bufnr)
     local start_row = first - 1
     -- The region's start is tracked by an extmark (imports added above it
     -- move it down); its end is anchored by the untouched tail of the file,

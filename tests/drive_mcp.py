@@ -36,6 +36,7 @@ class Bridge:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
             env=env,
         )
+        assert self.proc.stdin is not None and self.proc.stdout is not None
         self.next_id = 0
 
     def rpc(self, method, params=None):
@@ -63,7 +64,7 @@ class Bridge:
         self.proc.wait(timeout=10)
 
 
-def check(label, cond, detail=""):
+def check(label, cond, detail: object = ""):
     if not cond:
         print("FAIL %s %s" % (label, detail))
         sys.exit(1)

@@ -1734,7 +1734,7 @@ local function start_session(dap, adapter_name, adapter, config, args, root, req
     return reply
 end
 
-local function pick_adapter(dap, args, root, request_kind)
+local function pick_adapter(_, args, root, _)
     local ft = args.adapter and BY_FILETYPE[args.adapter] and args.adapter or nil
     ft = ft or filetype_of(args.file) or filetype_of(args.program)
     if args.adapter and BUILTIN[args.adapter] then
