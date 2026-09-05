@@ -187,8 +187,8 @@ var lspTools = []tool{
 				"file":      map[string]any{"type": "string", "description": "File containing the symbol."},
 				"name_path": map[string]any{"type": "string", "description": "Symbol name path (full path if ambiguous)."},
 				"body":      map[string]any{"type": "string", "description": "Complete replacement source for the symbol."},
+				"dry_run":   map[string]any{"type": "boolean", "description": "Show a unified diff of the change without applying it."},
 			},
-			"dry_run":  map[string]any{"type": "boolean", "description": "Show a unified diff of the change without applying it."},
 			"required": []string{"file", "name_path", "body"},
 		},
 	},
@@ -667,22 +667,38 @@ var debugToolNames = func() map[string]bool {
 	return set
 }()
 
-// Every edit tool reports diagnostics the same way, so the switch that
-// asks for the unabridged pre-existing list is added to all of them here
-// rather than repeated in each schema.
+// The edit tools that write text a caller composed, as opposed to moving
+// or undoing what is already there. Only these can mangle an escape on the
+// way in, so only these take verify.
+var writingTools = map[string]bool{
+	"replace_symbol_body":  true,
+	"replace_symbol_lines": true,
+	"insert_after_symbol":  true,
+	"insert_before_symbol": true,
+}
+
+// Every edit tool reports diagnostics the same way, and every tool that
+// writes new text can echo the bytes it wrote, so both switches are added
+// to their schemas here rather than repeated in each one.
 func init() {
 	for i := range lspTools {
-		if !editTools[lspTools[i].Name] {
-			continue
-		}
 		props, ok := lspTools[i].InputSchema["properties"].(map[string]any)
 		if !ok {
 			continue
 		}
-		if _, has := props["full_diagnostics"]; !has {
-			props["full_diagnostics"] = map[string]any{
-				"type":        "boolean",
-				"description": "List the pre-existing diagnostics again even when they have not changed since the last reply.",
+		if editTools[lspTools[i].Name] {
+			if _, has := props["full_diagnostics"]; !has {
+				props["full_diagnostics"] = map[string]any{
+					"type":        "boolean",
+					"description": "List the pre-existing diagnostics again even when they have not changed since the last reply.",
+				}
+			}
+		}
+		if writingTools[lspTools[i].Name] {
+			props["verify"] = map[string]any{
+				"type": "boolean",
+				"description": "Echo the bytes that landed, as the file now holds them. Use when the text " +
+					"carries escapes or whitespace that must survive the JSON round trip exactly.",
 			}
 		}
 	}

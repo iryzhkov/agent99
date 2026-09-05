@@ -509,6 +509,71 @@ local function attached_client(root, ft)
     return nil, why
 end
 
+-- A language server Mason does not package can still be on the machine:
+-- Qt ships qmlls with the distro, and some toolchains carry their own. Look
+-- through the lspconfig configs on the runtimepath for one that covers the
+-- filetype and whose command is executable here, including the versioned
+-- name a distro may install it under (qmlls6 for qmlls, clangd-19 for
+-- clangd), so a language is called unsupported only when nothing can run it.
+local function system_server(ft, wanted)
+    local seen, versioned = {}, nil
+    for _, path in ipairs(vim.api.nvim_get_runtime_file("lsp/*.lua", true)) do
+        local name = vim.fn.fnamemodify(path, ":t:r")
+        if not seen[name] and (not wanted or wanted == "" or name == wanted) then
+            seen[name] = true
+            local okc, cfg = pcall(function() return vim.lsp.config[name] end)
+            if okc and type(cfg) == "table" and vim.tbl_contains(cfg.filetypes or {}, ft)
+                and type(cfg.cmd) == "table" and type(cfg.cmd[1]) == "string" then
+                local cmd = cfg.cmd[1]
+                if vim.fn.executable(cmd) == 1 then
+                    return name, cmd
+                end
+                if not versioned then
+                    local variants = vim.fn.getcompletion(cmd, "shellcmd")
+                    table.sort(variants, function(a, b) return #a < #b end)
+                    for _, v in ipairs(variants) do
+                        if v:sub(1, #cmd) == cmd and vim.fn.executable(v) == 1 then
+                            versioned = { name = name, cmd = v }
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if versioned then
+        return versioned.name, versioned.cmd
+    end
+end
+
+-- Enable a server that is already on the machine, pointing its config at
+-- the command that actually exists, and report whether it attached.
+local function enable_system_server(ft, name, cmd, root, why)
+    local out = { lspconfig = name, cmd = cmd, status = "on the system" }
+    local okcfg = pcall(function()
+        local current = (vim.lsp.config[name] or {}).cmd
+        if type(current) ~= "table" or current[1] ~= cmd then
+            vim.lsp.config(name, { cmd = { cmd } })
+        end
+    end)
+    if not okcfg then
+        out.note = "could not set the command of " .. name .. " to " .. cmd
+        return out
+    end
+    pcall(vim.lsp.enable, name)
+    out.note = ("%s; %s is installed on this machine and was enabled")
+        :format(why or ("Mason has no server for " .. ft), cmd)
+    if type(root) == "string" and root ~= "" then
+        local client, cwhy = attached_client(root, ft)
+        if client then
+            out.attached = client
+        else
+            out.attached = false
+            out.note = out.note .. ", but " .. cwhy
+        end
+    end
+    return out
+end
 local function install_server(ft, wanted, root)
     local okreg, registry = pcall(require, "mason-registry")
     local okml, mlsp = pcall(require, "mason-lspconfig")
@@ -533,9 +598,15 @@ local function install_server(ft, wanted, root)
         elseif maps.lspconfig_to_package[wanted] then
             lspname, package = wanted, maps.lspconfig_to_package[wanted]
         else
-            return { status = "unknown",
+            local sysname, syscmd = system_server(ft, wanted)
+            if sysname then
+                return enable_system_server(ft, sysname, syscmd, root)
+            end
+            return {
+                status = "unknown",
                 note = ("Mason has no package or server named %s; servers for %s: %s")
-                    :format(wanted, ft, #candidates > 0 and table.concat(candidates, ", ") or "none") }
+                    :format(wanted, ft, #candidates > 0 and table.concat(candidates, ", ") or "none")
+            }
         end
     else
         lspname = PREFERRED_SERVER[ft]
@@ -552,8 +623,14 @@ local function install_server(ft, wanted, root)
             lspname = candidates[1]
         end
         if not lspname then
-            return { status = "unsupported",
-                note = "Mason offers no language server for filetype " .. ft }
+            local sysname, syscmd = system_server(ft)
+            if sysname then
+                return enable_system_server(ft, sysname, syscmd, root)
+            end
+            return {
+                status = "unsupported",
+                note = "Mason offers no language server for filetype " .. ft
+            }
         end
         package = maps.lspconfig_to_package[lspname]
     end
@@ -561,12 +638,29 @@ local function install_server(ft, wanted, root)
     if #candidates > 1 then
         out.alternatives = vim.tbl_filter(function(c) return c ~= lspname end, candidates)
     end
+    -- Mason lists a package it cannot always supply: qmlls has no build for
+    -- every platform, and an install that fails leaves the language with no
+    -- server at all. When the machine already carries one, enabling it is a
+    -- better answer than reporting the failure and stopping there.
+    local function or_system(failed)
+        local sysname, syscmd = system_server(ft, lspname)
+        if not sysname then
+            sysname, syscmd = system_server(ft)
+        end
+        if not sysname then
+            return failed
+        end
+        local res = enable_system_server(ft, sysname, syscmd, root,
+            ("Mason could not install a server for %s (%s)"):format(ft, failed.note))
+        res.mason_package = failed.package
+        return res
+    end
     local pkg
     local okp = pcall(function() pkg = registry.get_package(package) end)
     if not okp or not pkg then
         out.status = "unknown"
         out.note = "Mason registry has no package " .. package
-        return out
+        return or_system(out)
     end
     if pkg:is_installed() then
         out.status = "already installed"
@@ -592,14 +686,14 @@ local function install_server(ft, wanted, root)
         if timed_out then
             out.status = "failed"
             out.note = "install did not finish within " .. (INSTALL_SERVER_MS / 60000) .. " minutes"
-            return out
+            return or_system(out)
         end
         if not pkg:is_installed() then
             out.status = "failed"
             out.note = (out.start_error or "Mason reported the install as failed")
                 .. "; see :MasonLog (" .. vim.fn.stdpath("log") .. "/mason.log)"
             out.start_error = nil
-            return out
+            return or_system(out)
         end
         out.status = "installed"
     end

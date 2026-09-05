@@ -329,6 +329,41 @@ def main():
             check("symbol-less needs absolute or match", False, "call succeeded")
         except RuntimeError as e:
             check("symbol-less needs absolute or match", "absolute=true" in str(e), e)
+        # A stale symbol-less chunk relocates too. Its code action has to
+        # address the buffer's own lines: with no name_path there is no
+        # declaration to be relative to, and relative numbers are refused.
+        try:
+            b.call("replace_symbol_lines", {
+                "file": util, "absolute": True, "first_line": 3, "last_line": 3,
+                "expect": "local M = {}", "text": "local M = {} -- barrel"})
+            check("stale symbol-less expect is refused", False, "call succeeded")
+        except RuntimeError as e:
+            m = re.search(r"token=(\d+)", str(e))
+            check("stale symbol-less expect is refused with a relocation", m is not None, e)
+            assert m is not None
+            res = b.call("apply_code_action", {"token": m.group(1), "index": 1})
+            check("relocated symbol-less edit applies",
+                  open(util).read().startswith("local M = {} -- barrel\n"), res)
+        b.call("replace_symbol_lines", {
+            "file": util, "match": "local M = {} -- barrel", "text": "local M = {}"})
+
+        # The bytes that landed are echoed on request, and a control
+        # character among them is reported without being asked for: text
+        # that came through a JSON round trip can carry an escape the
+        # caller never meant.
+        res = b.call("replace_symbol_lines", {
+            "file": util, "match": "local M = {}", "text": "local M = {}", "verify": True})
+        check("verify echoes the written bytes", res.get("new_text") == ["local M = {}"], res)
+        scratch = os.path.join(root, "bytes.txt")
+        with open(scratch, "w") as f:
+            f.write("clean\n")
+        res = b.call("replace_symbol_lines", {
+            "file": scratch, "absolute": True, "first_line": 1, "last_line": 1,
+            "text": "a" + chr(0) + "b"})
+        check("a control character in the written text is reported",
+              "NUL" in (res.get("control_characters") or "")
+              and res.get("new_text") == ["a" + chr(0) + "b"], res)
+        os.remove(scratch)
 
         # insert_before lands above the doc comment, not between it and the
         # declaration, so the new sibling is not orphaned under the comment.

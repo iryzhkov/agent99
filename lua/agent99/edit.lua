@@ -690,6 +690,30 @@ local function record_edit(bufnr, entry_path, kind, first, last, old_lines, new_
     })
 end
 
+-- Text reaches an edit tool through a JSON round trip, and an escape can
+-- arrive as bytes the caller never meant: an escaped NUL as one real NUL
+-- byte, a doubled backslash where one was intended. The tools carry those
+-- bytes faithfully into the file, and the reply otherwise echoes only the
+-- text that was replaced, so the damage stays invisible until something
+-- trips over it at runtime. Control characters in what was just written
+-- are reported without being asked for; verify=true echoes the landed
+-- bytes whether or not they look odd.
+local function odd_bytes(lines)
+    local names, seen = {}, {}
+    for _, l in ipairs(lines) do
+        -- Tab is ordinary in source; every other control character in a
+        -- line, NUL included, is a byte nobody types on purpose.
+        for c in l:gmatch("[%z\1-\8\10-\31\127]") do
+            local b = c:byte()
+            local name = b == 0 and "\\x00 (NUL)" or ("\\x%02X"):format(b)
+            if not seen[name] then
+                seen[name] = true
+                names[#names + 1] = name
+            end
+        end
+    end
+    return names
+end
 -- Shared tail of every edit tool: the lines are already in the buffer;
 -- polish (format, imports), record the final region in the ledger, and
 -- build the reply with the post-edit report.
@@ -747,6 +771,14 @@ local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_o
     fields.note = edit_note(args)
     if #done > 0 then
         fields.polished = table.concat(done, ", ")
+    end
+    local odd = odd_bytes(new_lines)
+    if args.verify or #odd > 0 then
+        fields.new_text = new_lines
+    end
+    if #odd > 0 then
+        fields.control_characters = ("the written text holds %s; if that came from an escape "
+            .. "in the request, the escape did not survive the round trip"):format(table.concat(odd, ", "))
     end
     return vim.tbl_extend("error", fields,
         post_edit_report(bufnr, before, args.root, args.headless, opts, args.full_diagnostics))
@@ -986,14 +1018,17 @@ local function replace_symbol_lines(args)
             local moved = {}
             for _, c in ipairs(chunks) do
                 local r = relocated[c]
+                -- Buffer line numbers, whatever the refused call used to
+                -- address its chunks: a chunk that names no symbol has no
+                -- declaration to be relative to, and relative numbers there
+                -- are refused outright.
                 moved[#moved + 1] = {
-                    first_line = r and r.first_line or c.first,
-                    last_line = r and r.last_line or c.last,
+                    first_line = r and (c.entry.first + r.first_line - 1) or c.abs_first,
+                    last_line = r and (c.entry.first + r.last_line - 1) or c.abs_last,
                     text = c.text,
                     expect = c.expect,
                     name_path = c.name_path,
-                    -- Relocated lines are symbol-relative whatever the call used.
-                    absolute = false,
+                    absolute = true,
                 }
             end
             actions[#actions + 1] = {
