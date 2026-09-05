@@ -209,7 +209,7 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "replace_symbol_lines",
-		Description: "Replace part of a symbol: either the lines holding `match` (text that occurs once in the symbol - no line arithmetic, prefer this), or lines first_line..last_line, relative to the symbol's declaration (=1) as find_symbol bodies show, or absolute with absolute=true as read_file and grep report them. Several places in one file go in chunks, each naming its own symbol. Applied to the editor buffer immediately and tracked; returns fresh diagnostics and the text it replaced. Line numbers go stale the moment anything above the symbol changes - pass expect= with the current text of those lines: a stale offset is refused and the refusal offers the relocated edit as a code action, so apply_code_action(token, 1) finishes it without a re-read. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
+		Description: "Replace part of a symbol: either the lines holding `match` (text that occurs once in the symbol - no line arithmetic, prefer this), or lines first_line..last_line, relative to the symbol's declaration (=1) as find_symbol bodies show, or absolute with absolute=true as read_file and grep report them. With match or absolute the doc comment above the symbol is reachable too. For a region with no symbol - a barrel/index file, an import block, an export list - omit name_path and give absolute=true line numbers or a match. Several places in one file go in chunks, each naming its own symbol (or none). Applied to the editor buffer immediately and tracked; returns fresh diagnostics and the text it replaced. Line numbers go stale the moment anything above the symbol changes - pass expect= with the current text of those lines: a stale offset is refused and the refusal offers the relocated edit as a code action, so apply_code_action(token, 1) finishes it without a re-read. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -314,7 +314,7 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "insert_before_symbol",
-		Description: "Insert source right before a symbol by name path (import, helper, decorator). Applied to the editor buffer immediately and tracked.",
+		Description: "Insert source right before a symbol by name path (import, helper, sibling declaration). Lands above the symbol's decorators, attributes and doc comment, not between them and the declaration. Applied to the editor buffer immediately and tracked.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

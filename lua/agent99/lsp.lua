@@ -1460,7 +1460,19 @@ local function organize_imports(bufnr)
         context = { diagnostics = {}, only = { "source.organizeImports" }, triggerKind = 1 },
     })
     if not ok or type(actions) ~= "table" or #actions == 0 then return false end
-    local action = actions[1]
+    -- Take only an action that is what was asked for. A server that ignores
+    -- `only` (or adds its fix-all) would otherwise have its first action
+    -- applied blind, and tsserver's fixes include "add missing function
+    -- declaration", which appends a throwing stub for an unresolved name:
+    -- code nobody wrote, added silently after an edit.
+    local action
+    for _, a in ipairs(actions) do
+        if type(a.kind) == "string" and a.kind:find("^source%.organizeImports") then
+            action = a
+            break
+        end
+    end
+    if not action then return false end
     if not action.edit and not action.command and client:supports_method("codeAction/resolve") then
         local okr, resolved = pcall(request, client, bufnr, "codeAction/resolve", action)
         if okr and resolved then action = resolved end
@@ -1482,30 +1494,52 @@ end
 -- and the smallest space step), so formatting matches the code around the
 -- edit rather than the headless instance's buffer defaults.
 local function detect_indent(bufnr)
+    -- An .editorconfig that actually declares an indent style is the
+    -- project's own answer. The `vim.b.editorconfig` table is present even
+    -- when nothing matched, so trust it only when it names indent_style;
+    -- otherwise sniff the file, because shiftwidth is Neovim's default, not
+    -- the project's.
+    local ec = vim.b[bufnr].editorconfig
+    if type(ec) == "table" and ec.indent_style then
+        if ec.indent_style == "tab" then
+            return {
+                insertSpaces = false,
+                tabSize = tonumber(ec.tab_width or ec.indent_size) or vim.bo[bufnr].tabstop
+            }
+        end
+        return {
+            insertSpaces = true,
+            tabSize = tonumber(ec.indent_size) or vim.bo[bufnr].shiftwidth
+        }
+    end
     local tabs, spaces, step = 0, 0, nil
     for _, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, 2000, false)) do
-        local ws = line:match("^(%s+)%S")
-        if ws then
+        local ws, first = line:match("^(%s+)(%S)")
+        -- A comment continuation line (" * ..." in JSDoc and Javadoc) sits
+        -- one column in; counting it makes the unit look like one space, the
+        -- "one space per level" bug. Skip it and the odd lone-space line.
+        if ws and first ~= "*" then
             if ws:sub(1, 1) == "\t" then
                 tabs = tabs + 1
             else
                 spaces = spaces + 1
                 local n = #ws
-                if n > 0 and (not step or n < step) then step = n end
+                if n > 1 and (not step or n < step) then step = n end
             end
         end
     end
     if tabs == 0 and spaces == 0 then
         local sw = vim.bo[bufnr].shiftwidth
-        return { insertSpaces = vim.bo[bufnr].expandtab,
-            tabSize = sw > 0 and sw or vim.bo[bufnr].tabstop }
+        return {
+            insertSpaces = vim.bo[bufnr].expandtab,
+            tabSize = sw > 0 and sw or vim.bo[bufnr].tabstop
+        }
     end
     if tabs > spaces then
         return { insertSpaces = false, tabSize = vim.bo[bufnr].tabstop }
     end
     return { insertSpaces = true, tabSize = step or 4 }
 end
-
 -- Format lines first..last (1-based, inclusive) through the server: range
 -- formatting when offered, else whole-file formatting for filetypes where
 -- that is canonical. Returns true when edits were applied.
@@ -2861,14 +2895,29 @@ local function replace_symbol_lines(args)
     local entries = {}
     for _, c in ipairs(chunks) do
         if not c.name_path then
-            err("chunk %d: missing name_path (none on the call either)", c.index)
+            -- No symbol named: edit the file's own lines. Only meaningful
+            -- with absolute numbers or a match, since there is no
+            -- declaration to number relative to. This is the barrel file,
+            -- the import block, the export list: regions with no symbol to
+            -- name, which used to force a fall back to Write.
+            if not c.absolute and c.match == nil then
+                err("chunk %d: give name_path, or absolute=true with buffer line numbers, "
+                    .. "or match with the text to replace", c.index)
+            end
+            bufnr = bufnr or load_buf(args.file)
+            if not entries[false] then
+                entries[false] = { first = 1, last = vim.api.nvim_buf_line_count(bufnr),
+                    path = rel_path(vim.api.nvim_buf_get_name(bufnr)), whole = true }
+            end
+            c.entry = entries[false]
+        else
+            if not entries[c.name_path] then
+                local b, entry = resolve_symbol(args.file, c.name_path)
+                bufnr = bufnr or b
+                entries[c.name_path] = entry
+            end
+            c.entry = entries[c.name_path]
         end
-        if not entries[c.name_path] then
-            local b, entry = resolve_symbol(args.file, c.name_path)
-            bufnr = bufnr or b
-            entries[c.name_path] = entry
-        end
-        c.entry = entries[c.name_path]
         local span = c.entry.last - c.entry.first + 1
         -- The doc comment above the declaration is reachable too, by
         -- match or by absolute number: editing a function's comment along
@@ -3071,6 +3120,28 @@ local function replace_symbol_lines(args)
     end
     return result
 end
+-- The top line of the block a declaration belongs to: its decorators or
+-- attributes and the doc comment above them. A symbol's index range starts
+-- at the declaration keyword, so without this an "insert before" lands
+-- between a decorator and the class it annotates.
+local function decl_block_top(bufnr, lnum)
+    local first = lnum
+    for l = lnum - 1, 1, -1 do
+        local text = vim.api.nvim_buf_get_lines(bufnr, l - 1, l, false)[1] or ""
+        local s = text:gsub("^%s+", "")
+        if s:match("^@")       -- TS/JS/Java/Python decorator
+            or s:match("^#%[") -- Rust attribute
+            or s:match("^%-%-") or s:match("^//") or s:match("^#")
+            or s:match("^/%*") or s:match("^%*") or s:match("^%*/")
+            or s:match([[^"""]]) then
+            first = l
+        else
+            break
+        end
+    end
+    return first
+end
+
 local function insert_symbol_tool(where)
     return function(args)
         local bufnr, entry = resolve_symbol(args.file, args.name_path)
@@ -3088,7 +3159,11 @@ local function insert_symbol_tool(where)
             row = entry.last
             if spaced then table.insert(lines, 1, "") end
         else
-            row = entry.first - 1
+            -- Above the whole declaration, its decorators and doc comment
+            -- included, so a new sibling never lands between @Decorator (or
+            -- a Rust #[attr], or a Python decorator) and the thing it
+            -- annotates, which is a syntax error.
+            row = decl_block_top(bufnr, entry.first) - 1
             if spaced then table.insert(lines, "") end
         end
         settle_before_edit(bufnr)
@@ -3098,11 +3173,6 @@ local function insert_symbol_tool(where)
             {}, #lines, { inserted = ("%s %s"):format(where, entry.path) })
     end
 end
-
--- undo_edit: take back the newest symbol edits of this run (this server
--- session, headless), restoring the recorded lines. Code actions applied
--- through apply_code_action are the editor's own edits and are not in the
--- ledger; the reply says so when nothing is left to undo.
 local function undo_edit(args)
     local edits = require("agent99.edits")
     local count = tonumber(args.count) or 1
@@ -3960,6 +4030,37 @@ local SUPPORT_MAX_FILETYPES = 6
 local SUPPORT_ATTACH_MS = 2500
 
 
+-- A warning when a JavaScript or TypeScript project's dependencies are not
+-- where the language server will look, or are a symlink escaping the root:
+-- the two ways its diagnostics turn authoritative and wrong.
+local function node_modules_note(root, by_ft)
+    local js = (by_ft.typescript or 0) + (by_ft.typescriptreact or 0)
+        + (by_ft.javascript or 0) + (by_ft.javascriptreact or 0)
+    if js == 0 then return nil end
+    local nm = root .. "/node_modules"
+    local lstat = vim.uv.fs_lstat(nm)
+    if not lstat then
+        -- A pnpm/yarn workspace keeps packages in the repo root, not the
+        -- package dir, so only warn when there is a manifest here to install.
+        if vim.uv.fs_stat(root .. "/package.json") then
+            return "node_modules is absent under this root: the language server will report "
+                .. "unresolved-import errors that are about the missing install, not the code. "
+                .. "Install dependencies (npm/pnpm/yarn install) before trusting diagnostics."
+        end
+        return nil
+    end
+    if lstat.type == "link" then
+        local target = vim.uv.fs_realpath(nm)
+        local real_root = vim.uv.fs_realpath(root) or root
+        if target and target:sub(1, #real_root + 1) ~= real_root .. "/" then
+            return ("node_modules is a symlink to %s, outside this root: a package may resolve "
+                .. "into a different checkout and produce a plausible but wrong type error. "
+                .. "Verify a suspicious import diagnostic against the real dependency."):format(target)
+        end
+    end
+    return nil
+end
+
 local function workspace_support(args)
     local root = args.root
     if type(root) ~= "string" or root == "" then
@@ -4029,14 +4130,23 @@ local function workspace_support(args)
         end
         out[#out + 1] = entry
     end
-    local note
+    local notes = {}
     if #blind > 0 then
-        note = ("no parser and no language server for %s: symbol, navigation and "
-            .. "diagnostic tools will not work on those files; grep and read_file will. "
-            .. "install_language(language) can add both")
+        notes[#notes + 1] = ("no parser and no language server for %s: symbol, navigation and "
+                .. "diagnostic tools will not work on those files; grep and read_file will. "
+                .. "install_language(language) can add both")
             :format(table.concat(blind, ", "))
     end
-    return { languages = out, note = note }
+    -- A JS/TS project whose dependencies are not installed makes the language
+    -- server report a wall of unresolved-import errors that say nothing about
+    -- the code, and the failure looks authoritative. Worse, a node_modules
+    -- symlink escaping the root can resolve a package into another checkout,
+    -- producing one plausible-but-wrong type error. Say so up front.
+    local ok_dep, dep_note = pcall(node_modules_note, root, by_ft)
+    if ok_dep and dep_note then
+        notes[#notes + 1] = dep_note
+    end
+    return { languages = out, note = #notes > 0 and table.concat(notes, " ") or nil }
 end
 
 -- install_language: add a treesitter parser (nvim-treesitter) and a language

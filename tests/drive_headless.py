@@ -274,6 +274,36 @@ def main():
         res = b.call("workspace_map", {"glob": "lua/**/*.lua"})
         check("workspace_map glob spans zero directories",
               any(f["file"] == "lua/testproj/util.lua" for f in res.get("files", [])), res)
+        # A symbol-less region (the top-of-file `local M = {}`, which is no
+        # declaration) is editable by match with no name_path, the barrel /
+        # export-list case that used to force a fall back to Write.
+        res = b.call("replace_symbol_lines", {
+            "file": util, "match": "local M = {}", "text": "local M = {} -- module table"})
+        check("symbol-less edit by match",
+              "-- module table" in open(util).read()
+              and res.get("replaced_text") == ["local M = {}"], res)
+        res = b.call("replace_symbol_lines", {
+            "file": util, "absolute": True, "first_line": 1, "last_line": 1,
+            "expect": "local M = {} -- module table", "text": "local M = {}"})
+        check("symbol-less edit by absolute line",
+              open(util).read().startswith("local M = {}\n"), res)
+        try:
+            b.call("replace_symbol_lines", {"file": util, "first_line": 1, "last_line": 1, "text": "x"})
+            check("symbol-less needs absolute or match", False, "call succeeded")
+        except RuntimeError as e:
+            check("symbol-less needs absolute or match", "absolute=true" in str(e), e)
+
+        # insert_before lands above the doc comment, not between it and the
+        # declaration, so the new sibling is not orphaned under the comment.
+        res = b.call("insert_before_symbol", {
+            "file": util, "name_path": "M.greet", "text": "local GREETING = \"hello\""})
+        lines = open(util).read().splitlines()
+        gi = lines.index("local GREETING = \"hello\"")
+        check("insert_before clears the doc comment",
+              lines[gi + 1] == "" and lines[gi + 2].startswith("--- Greet"), res)
+        b.call("replace_symbol_lines", {
+            "file": util, "match": 'local GREETING = "hello"\n\n', "text": ""})
+
         # Put M.greet back the way the checks below expect it.
         b.call("replace_symbol_body", {
             "file": util, "name_path": "M.greet",
