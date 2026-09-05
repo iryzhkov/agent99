@@ -221,6 +221,20 @@ line](doc/panel-chat.png)
   aggregates outcome rates, cost, and tool usage; the records are plain
   JSON, so deeper analysis is a `jq` away. `<leader>9l` opens the log with
   a per-request trace.
+- **Off by default**, the MCP server can spool one JSON line per tool call to
+  `~/.local/share/toolfeedback/agent99/<host>-<date>.jsonl`: the tool, which
+  argument *names* were present, whether it failed, a class of the error, how
+  long it took, the commit the workspace was on, and which build of the bridge
+  answered. It never records argument values or replies, because those carry
+  the code being worked on, and error messages are folded into a class — paths,
+  quoted text and numbers replaced by placeholders — before they are written.
+  The point is to find out which tools agents actually struggle with instead of
+  asking one afterwards, which produces a fluent but partly invented answer.
+
+  Nothing is written until you ask for it, and nothing is ever transmitted
+  anywhere: turn it on with `AGENT99_FRICTION=1`, or by creating the file
+  `enabled` in the spool directory. `AGENT99_FRICTION=0` forces it off,
+  `AGENT99_FRICTION_DIR` moves the spool.
 
 ## Options
 

@@ -21,9 +21,13 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 )
 
-const fallbackProtocolVersion = "2025-06-18"
+const (
+	fallbackProtocolVersion = "2025-06-18"
+	serverVersion           = "0.4.0"
+)
 
 var workspaceTools = []tool{
 	{
@@ -249,30 +253,40 @@ func jsonResult(v any) map[string]any {
 }
 
 func callMCPTool(name string, arguments map[string]any) map[string]any {
+	started := time.Now()
+	res, root := dispatchMCPTool(name, arguments)
+	logFriction(name, root, arguments, res, started)
+	return res
+}
+
+// dispatchMCPTool runs one tool call and reports which workspace answered it,
+// empty when the call failed before it was routed anywhere. The second return
+// exists for the friction spool: where a call ran is part of reading it later.
+func dispatchMCPTool(name string, arguments map[string]any) (map[string]any, string) {
 	if arguments == nil {
 		arguments = map[string]any{}
 	}
 	switch name {
 	case "open_workspace":
 		if embeddedMode() {
-			return textResult("Error: open_workspace is not available while embedded in Neovim", true)
+			return textResult("Error: open_workspace is not available while embedded in Neovim", true), ""
 		}
 		root, _ := arguments["root"].(string)
 		ws, err := openWorkspace(root)
 		if err != nil {
-			return textResult("Error: "+err.Error(), true)
+			return textResult("Error: "+err.Error(), true), ""
 		}
-		return jsonResult(openWorkspaceResult(ws))
+		return jsonResult(openWorkspaceResult(ws)), ws.Root
 	case "close_workspace":
 		roots, err := closeTargets(arguments)
 		if err != nil {
-			return textResult("Error: "+err.Error(), true)
+			return textResult("Error: "+err.Error(), true), ""
 		}
 		result := map[string]any{"closed": closeWorkspaces(roots)}
 		if open := openRoots(); len(open) > 0 {
 			result["workspaces"] = open
 		}
-		return jsonResult(result)
+		return jsonResult(result), ""
 	}
 	served := false
 	for _, t := range servedTools() {
@@ -283,19 +297,19 @@ func callMCPTool(name string, arguments map[string]any) map[string]any {
 	}
 	// The slim roster hides some LSP tools from the schema but keeps them callable.
 	if !served && !lspToolNames[name] {
-		return textResult("Error: unknown tool: "+name, true)
+		return textResult("Error: unknown tool: "+name, true), ""
 	}
 	if debugToolNames[name] && !debugEnabled() {
 		return textResult("Error: the debugger tools are off; start the server with AGENT99_DEBUG=1 "+
-			"(or setup({ debug = { enabled = true } }) in the plugin)", true)
+			"(or setup({ debug = { enabled = true } }) in the plugin)", true), ""
 	}
 	ses, err := resolveSession(name, arguments)
 	if err != nil {
-		return textResult("Error: "+err.Error(), true)
+		return textResult("Error: "+err.Error(), true), ""
 	}
 	out, err := callTool(name, arguments, ses)
 	if err != nil {
-		return textResult("Error: "+err.Error(), true)
+		return textResult("Error: "+err.Error(), true), ses.Root
 	}
 	if editTools[name] && ses.Headless {
 		if err := headlessSaveAll(ses); err != nil {
@@ -304,7 +318,7 @@ func callMCPTool(name string, arguments map[string]any) map[string]any {
 			// to come back as a failure rather than a footnote under a
 			// success: nothing reached the disk.
 			return textResult("Error: the edit was applied in the editor but not saved: "+
-				err.Error()+"\n\nThe reply below describes an edit that is not on disk.\n\n"+out, true)
+				err.Error()+"\n\nThe reply below describes an edit that is not on disk.\n\n"+out, true), ses.Root
 		}
 	}
 	noteCall(name, ses)
@@ -313,12 +327,13 @@ func callMCPTool(name string, arguments map[string]any) map[string]any {
 	if len(openRoots()) > 1 {
 		out = "workspace: " + ses.Root + "\n" + out
 	}
-	return textResult(out, false)
+	return textResult(out, false), ses.Root
 }
 
 func mcpHandle(method string, params map[string]any) (map[string]any, bool) {
 	switch method {
 	case "initialize":
+		noteFrictionClient(params)
 		version := fallbackProtocolVersion
 		if v, ok := params["protocolVersion"].(string); ok && v != "" {
 			version = v
@@ -326,7 +341,7 @@ func mcpHandle(method string, params map[string]any) (map[string]any, bool) {
 		return map[string]any{
 			"protocolVersion": version,
 			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]any{"name": "agent99-lsp", "version": "0.4.0"},
+			"serverInfo":      map[string]any{"name": "agent99-lsp", "version": serverVersion},
 		}, true
 	case "ping":
 		return map[string]any{}, true
