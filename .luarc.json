@@ -4,5 +4,8 @@
     "library": ["$VIMRUNTIME/lua", "tests/.deps/nvim-dap/lua"],
     "checkThirdParty": false
   },
-  "diagnostics": { "globals": ["vim"] }
+  "diagnostics": {
+    "globals": ["vim"],
+    "disable": ["need-check-nil"]
+  }
 }

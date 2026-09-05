@@ -50,9 +50,40 @@ end
 -- for the rest of the session. The guess cannot know that a project needs its
 -- tests run, or needs checking under a second set of build tags; whoever is
 -- working in the repository does, and should not have to repeat it on every
--- call. Keyed by root, and lives as long as the workspace does.
+-- call. Keyed by root, and persisted under Neovim's state directory: a
+-- workspace is replaced whenever a session moves to another repository,
+-- and a command remembered last week should not have to be given again.
 local check_override = {}
 
+local function check_store_path()
+    local dir = vim.fn.stdpath("state") .. "/agent99"
+    vim.fn.mkdir(dir, "p")
+    return dir .. "/check_commands.json"
+end
+
+local function load_check_overrides()
+    local ok, lines = pcall(vim.fn.readfile, check_store_path())
+    if not ok or #lines == 0 then return end
+    local okd, data = pcall(vim.json.decode, table.concat(lines, "\n"))
+    if okd and type(data) == "table" then
+        for root, cmds in pairs(data) do
+            -- Roots that are gone (scratch checkouts, test copies) are
+            -- dropped here, so the file never grows without bound.
+            if type(cmds) == "table" and vim.fn.isdirectory(root) == 1 then
+                check_override[root] = cmds
+            end
+        end
+    end
+end
+
+local function save_check_overrides()
+    local okj, text = pcall(vim.json.encode, check_override)
+    if okj then
+        pcall(vim.fn.writefile, { text }, check_store_path())
+    end
+end
+
+load_check_overrides()
 local function check_project(args)
     local root = args.root
     if type(root) ~= "string" or root == "" then
@@ -96,6 +127,7 @@ local function check_project(args)
     end
     if explicit and args.remember then
         check_override[root] = cmds
+        save_check_overrides()
     end
     -- Only for the baseline key and the reply; the commands are run one at a
     -- time below, not handed to a shell as one line.
@@ -145,7 +177,8 @@ local function check_project(args)
         unsaved = unsaved,
     }
     if explicit and args.remember then
-        out.remembered = "later check_project calls in this root use this without arguments"
+        out.remembered = "later check_project calls in this root use this without arguments, "
+            .. "in this workspace and in later ones"
     elseif not explicit and check_override[root] then
         out.remembered = "using the command remembered for this root"
     end

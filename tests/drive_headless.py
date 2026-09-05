@@ -408,6 +408,17 @@ def main():
         check("check_project diff", res.get("new") == ["three"] and res.get("resolved") == 1, res)
         res = b.call("check_project", {"command": cmd, "reset": True})
         check("check_project reset", "recorded" in res.get("baseline", ""), res)
+        # A remembered command outlives the workspace: close it, reopen the
+        # same root, and a bare check_project still runs it.
+        res = b.call("check_project", {"command": cmd, "remember": True})
+        check("check_project remember", "later ones" in res.get("remembered", ""), res)
+        b.call("close_workspace", {})
+        res = b.call("open_workspace", {"root": root})
+        pid = res["pid"]
+        res = b.call("check_project", {})
+        check("remembered command survives a workspace restart",
+              res.get("remembered", "").startswith("using the command remembered")
+              and res.get("output") == ["one", "three"], res)
 
         # References come grouped by file with paths relative to the root.
         res = b.call("references", {"file": util, "line": 6, "symbol": "greet"})

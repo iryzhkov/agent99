@@ -299,4 +299,12 @@ func runMCP() {
 		}
 		writeMsg(out, reply)
 	}
+	// A request over the buffer cap ends Scan without an error on stdout;
+	// the client would wait forever for a reply that never comes. Say so on
+	// stderr, where the client shows it, and exit non-zero.
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "agent99 mcp: reading stdin: %v\n", err)
+		closeWorkspace()
+		os.Exit(1)
+	}
 }

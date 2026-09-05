@@ -595,7 +595,9 @@ a skip line, which `AGENT99_TEST_REQUIRE_DEBUG=1` turns into a failure.
 - The reply replaces the selection; agent-driven multi-file editing goes
   through the symbol tools and `apply_code_action`.
 - One workspace at a time; opening another root replaces the instance and
-  its state (loaded buffers, the `check_project` baseline).
+  its loaded buffers and `check_project` baseline. A check command
+  remembered with `remember=true` survives, per root, under Neovim's state
+  directory.
 - Auto-fix compares diagnostics by severity+message, so a pre-existing
   error the edit duplicates on another line still counts as new.
 - A language server analyzes one build configuration, so a file excluded by a
