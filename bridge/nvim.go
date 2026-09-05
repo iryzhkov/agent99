@@ -56,22 +56,20 @@ func remoteExpr(sock, expr string) (string, error) {
 	return out.String(), nil
 }
 
-// nvimSocket resolves the Neovim instance tools are routed to: an explicit
+// envSocket is the Neovim named by the environment: an explicit
 // $AGENT99_NVIM wins (the plugin sets it when it spawns the bridge), then
-// a headless workspace opened through the MCP server, then the $NVIM of an
-// enclosing :terminal.
-func nvimSocket() string {
+// the $NVIM of an enclosing :terminal. A headless workspace opened through
+// the MCP server takes precedence over both, and is picked per call by
+// resolveSession (routing.go).
+func envSocket() string {
 	if sock := os.Getenv("AGENT99_NVIM"); sock != "" {
-		return sock
-	}
-	if sock := headlessSocket(); sock != "" {
 		return sock
 	}
 	return os.Getenv("NVIM")
 }
 
-func nvimCall(tool string, args map[string]any) (any, error) {
-	sock := nvimSocket()
+// nvimCall runs one tool in the instance listening on sock.
+func nvimCall(sock, tool string, args map[string]any) (any, error) {
 	if sock == "" {
 		return nil, errors.New("no Neovim to talk to: call open_workspace(root) first, " +
 			"or launch the bridge with $AGENT99_NVIM (or $NVIM) pointing at a running Neovim")

@@ -67,6 +67,8 @@ done
 AGENT99_NVIM="$SOCK" AGENT99_FULL_TOOLS=1 python3 "$REPO/tests/drive_mcp.py"
 # Standalone mode: the bridge starts its own headless Neovim.
 python3 "$REPO/tests/drive_headless.py"
+# Several workspaces open at once, and the routing between them.
+python3 "$REPO/tests/drive_multi.py"
 # Debugger tools, standalone, against Delve.
 if [ -n "$debug_skip" ]; then
     echo "debug: SKIPPED ($debug_skip)"

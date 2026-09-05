@@ -28,11 +28,13 @@ const fallbackProtocolVersion = "2025-06-18"
 var workspaceTools = []tool{
 	{
 		Name: "open_workspace",
-		Description: "Start a headless Neovim in the given project root and route every " +
-			"other tool to it: its language servers back definition/references/hover/" +
-			"diagnostics/symbol edits and the rest. Call this once before any LSP tool. " +
-			"Reopening the same root is a no-op; a different root replaces the instance. " +
-			"Symbol edits made through this server are saved to disk at once.",
+		Description: "Start a headless Neovim in the given project root and route tool calls " +
+			"in that tree to it: its language servers back definition/references/hover/" +
+			"diagnostics/symbol edits and the rest. Call this once per project before any " +
+			"LSP tool. Reopening the same root is a no-op. Several projects can be open at " +
+			"once, as long as no root contains another; each call is routed to the workspace " +
+			"owning the path it names, so pass absolute paths (or workspace=<root>) once more " +
+			"than one is open. Symbol edits made through this server are saved to disk at once.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -42,11 +44,15 @@ var workspaceTools = []tool{
 		},
 	},
 	{
-		Name:        "close_workspace",
-		Description: "Stop the headless Neovim started by open_workspace.",
+		Name: "close_workspace",
+		Description: "Stop a headless Neovim started by open_workspace, freeing its language " +
+			"servers. With one workspace open the root is optional.",
 		InputSchema: map[string]any{
-			"type":       "object",
-			"properties": map[string]any{},
+			"type": "object",
+			"properties": map[string]any{
+				"root": map[string]any{"type": "string", "description": "Root of the workspace to close."},
+				"all":  map[string]any{"type": "boolean", "description": "Close every open workspace."},
+			},
 		},
 	},
 }
@@ -55,17 +61,34 @@ func embeddedMode() bool {
 	return os.Getenv("AGENT99_NVIM") != ""
 }
 
-// toolRoot is the project root file paths are resolved against: the open
-// headless workspace, else the server's working directory (the plugin runs
-// the embedded server in the project).
-func toolRoot() string {
-	if root := headlessRoot(); root != "" {
-		return root
+// openWorkspaceResult is what a client gets back for an opened workspace:
+// where it is, and what its Neovim can actually serve.
+func openWorkspaceResult(ws *headlessWorkspace) map[string]any {
+	result := map[string]any{
+		"root":   ws.Root,
+		"socket": ws.Socket,
+		"pid":    ws.cmd.Process.Pid,
 	}
-	if cwd, err := os.Getwd(); err == nil {
-		return cwd
+	// Tell the client up front which languages the instance can actually
+	// serve, instead of letting symbol tools come back quietly empty.
+	if support, err := nvimCall(ws.Socket, "workspace_support", map[string]any{"root": ws.Root}); err == nil {
+		if m, ok := support.(map[string]any); ok {
+			result["languages"] = m["languages"]
+			if note, ok := m["note"].(string); ok && note != "" {
+				result["note"] = note
+			}
+		}
+	} else {
+		result["note"] = "could not probe language support: " + err.Error()
 	}
-	return "."
+	// With more than one open, the roster is what the model needs in order
+	// to address them; with one it would be noise.
+	if roots := openRoots(); len(roots) > 1 {
+		result["workspaces"] = roots
+		result["routing"] = "calls are routed by the path they name; pass an absolute path, " +
+			"or workspace=<root>, when a call names none"
+	}
+	return result
 }
 
 // Wording that is true inside a live editor but misleading for a headless
@@ -92,8 +115,65 @@ func standaloneTools(tools []tool) []tool {
 			d = strings.ReplaceAll(d, f.from, f.to)
 		}
 		t.Description = d
+		if needsWorkspaceArg(t) {
+			t.InputSchema = withWorkspaceArg(t.InputSchema)
+		}
 		out = append(out, t)
 	}
+	return out
+}
+
+// Argument keys that name a path and so route the call by themselves.
+var requiredPathKeys = map[string]bool{
+	"file": true, "files": true, "from": true, "to": true, "path": true, "program": true,
+}
+
+// needsWorkspaceArg reports whether a tool can be called without naming any
+// path - check_project, undo_edit, a glob-only find_symbol, the debugger.
+// Those have nothing to route on once more than one workspace is open, so
+// they take the workspace explicitly.
+func needsWorkspaceArg(t tool) bool {
+	if t.Name == "open_workspace" || t.Name == "close_workspace" {
+		return false
+	}
+	switch req := t.InputSchema["required"].(type) {
+	case []string:
+		for _, r := range req {
+			if requiredPathKeys[r] {
+				return false
+			}
+		}
+	case []any:
+		for _, r := range req {
+			if s, ok := r.(string); ok && requiredPathKeys[s] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// withWorkspaceArg returns the schema with a "workspace" property added. The
+// tool literals are shared with the embedded server, which has no workspaces
+// to speak of, so nothing is modified in place.
+func withWorkspaceArg(schema map[string]any) map[string]any {
+	props := map[string]any{
+		"workspace": map[string]any{
+			"type": "string",
+			"description": "Root of the open workspace to run in. Only needed when several " +
+				"are open and this call names no path inside one of them.",
+		},
+	}
+	if existing, ok := schema["properties"].(map[string]any); ok {
+		for k, v := range existing {
+			props[k] = v
+		}
+	}
+	out := map[string]any{}
+	for k, v := range schema {
+		out[k] = v
+	}
+	out["properties"] = props
 	return out
 }
 
@@ -182,26 +262,17 @@ func callMCPTool(name string, arguments map[string]any) map[string]any {
 		if err != nil {
 			return textResult("Error: "+err.Error(), true)
 		}
-		result := map[string]any{
-			"root":   ws.Root,
-			"socket": ws.Socket,
-			"pid":    ws.cmd.Process.Pid,
+		return jsonResult(openWorkspaceResult(ws))
+	case "close_workspace":
+		roots, err := closeTargets(arguments)
+		if err != nil {
+			return textResult("Error: "+err.Error(), true)
 		}
-		// Tell the client up front which languages the instance can actually
-		// serve, instead of letting symbol tools come back quietly empty.
-		if support, err := nvimCall("workspace_support", map[string]any{"root": ws.Root}); err == nil {
-			if m, ok := support.(map[string]any); ok {
-				result["languages"] = m["languages"]
-				if note, ok := m["note"].(string); ok && note != "" {
-					result["note"] = note
-				}
-			}
-		} else {
-			result["note"] = "could not probe language support: " + err.Error()
+		result := map[string]any{"closed": closeWorkspaces(roots)}
+		if open := openRoots(); len(open) > 0 {
+			result["workspaces"] = open
 		}
 		return jsonResult(result)
-	case "close_workspace":
-		return jsonResult(map[string]any{"closed": closeWorkspace()})
 	}
 	served := false
 	for _, t := range servedTools() {
@@ -218,12 +289,16 @@ func callMCPTool(name string, arguments map[string]any) map[string]any {
 		return textResult("Error: the debugger tools are off; start the server with AGENT99_DEBUG=1 "+
 			"(or setup({ debug = { enabled = true } }) in the plugin)", true)
 	}
-	out, err := callTool(name, arguments, toolRoot())
+	ses, err := resolveSession(name, arguments)
 	if err != nil {
 		return textResult("Error: "+err.Error(), true)
 	}
-	if editTools[name] && !embeddedMode() {
-		if err := headlessSaveAll(); err != nil {
+	out, err := callTool(name, arguments, ses)
+	if err != nil {
+		return textResult("Error: "+err.Error(), true)
+	}
+	if editTools[name] && ses.Headless {
+		if err := headlessSaveAll(ses); err != nil {
 			// The tool's own reply says the edit was saved, because in a
 			// headless workspace it normally is. It was not, so this has
 			// to come back as a failure rather than a footnote under a
@@ -231,6 +306,12 @@ func callMCPTool(name string, arguments map[string]any) map[string]any {
 			return textResult("Error: the edit was applied in the editor but not saved: "+
 				err.Error()+"\n\nThe reply below describes an edit that is not on disk.\n\n"+out, true)
 		}
+	}
+	noteCall(name, ses)
+	// Which workspace answered is only in question when several are open,
+	// and then it is worth a line: a misrouted call is otherwise invisible.
+	if len(openRoots()) > 1 {
+		out = "workspace: " + ses.Root + "\n" + out
 	}
 	return textResult(out, false)
 }
@@ -260,14 +341,14 @@ func mcpHandle(method string, params map[string]any) (map[string]any, bool) {
 }
 
 func runMCP() {
-	defer closeWorkspace()
+	defer closeAllWorkspaces()
 	// A client that terminates the server instead of closing stdin must not
-	// leave the headless Neovim behind.
+	// leave a headless Neovim behind.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	go func() {
 		<-sigs
-		closeWorkspace()
+		closeAllWorkspaces()
 		os.Exit(0)
 	}()
 	scanner := bufio.NewScanner(os.Stdin)
@@ -304,7 +385,7 @@ func runMCP() {
 	// stderr, where the client shows it, and exit non-zero.
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "agent99 mcp: reading stdin: %v\n", err)
-		closeWorkspace()
+		closeAllWorkspaces()
 		os.Exit(1)
 	}
 }

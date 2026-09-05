@@ -504,7 +504,7 @@ func runAgent() {
 					seenCalls[key] = 1
 				}
 				freshCalls++
-				out, err := callTool(name, args, p.Root)
+				out, err := callTool(name, args, session{Root: p.Root, Socket: envSocket()})
 				if err == nil && stateChangingTools[name] {
 					// Buffers changed: older results are stale, so both
 					// repeat guards must forget their history.

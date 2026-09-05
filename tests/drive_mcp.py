@@ -57,6 +57,10 @@ class Bridge:
         text = result["content"][0]["text"]
         if result.get("isError"):
             raise RuntimeError("%s failed: %s" % (name, text))
+        # With more than one workspace open every reply says which one
+        # answered, on a line of its own above the result.
+        if text.startswith("workspace: "):
+            text = text.split("\n", 1)[1]
         return json.loads(text)
 
     def close(self):

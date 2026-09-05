@@ -347,17 +347,44 @@ imports and references that have to move with a change actually move.
 Without `$AGENT99_NVIM` the server runs in **standalone mode**: it serves
 `open_workspace(root)`, which starts a headless Neovim in that project with
 your normal configuration (so the same language servers attach), and
-routes every later tool call to it. Its reply lists the languages found
-in the root with the parser and language server each one got, and warns
-about languages the instance cannot serve (`workspace_map` and `skim` say
-the same when they meet such files). LSP tools return an error until a
-workspace is open; `close_workspace` stops the instance, and it is also
-stopped when the server exits. Standalone mode additionally serves the
+routes the calls naming a path in that tree to it. Its reply lists the
+languages found in the root with the parser and language server each one
+got, and warns about languages the instance cannot serve (`workspace_map`
+and `skim` say the same when they meet such files). LSP tools return an
+error until a workspace is open; `close_workspace` stops an instance, and
+every one of them is stopped when the server exits. Standalone mode
+additionally serves the
 file tools (`read_file`, annotated `grep`, `list_files`), with relative paths resolved against the
 workspace, and symbol edits are saved to disk right after they are
-applied since nobody is at the keyboard to `:w`. One workspace at a time;
-opening a different root replaces the instance, and its state (loaded
-buffers, the `check_project` baseline) goes with it.
+applied since nobody is at the keyboard to `:w`.
+
+Several projects can be open at once (four by default,
+`AGENT99_MAX_WORKSPACES` to change it — each workspace is a Neovim with its
+own language servers). A root that contains, or is contained by, an open
+workspace is refused: two instances over one file tree would each hold
+their own buffers for the same files, and an edit made in one would be lost
+the moment the other wrote. Sibling projects and separate worktrees of the
+same repository are fine.
+
+Each call is routed to the workspace that owns the path it names, so an
+absolute path is enough to address a project. A call whose paths are all
+relative, or which names no path at all (`check_project`, `undo_edit`,
+`workspace_symbols`, the debugger), goes to the *active* workspace — the
+one the last call was routed to — unless it passes `workspace=<root>`,
+which those tools take for exactly this reason. Two sticky exceptions keep
+the common sequences right: `undo_edit` follows the workspace that was last
+edited even if a read of another one came in between, and
+`apply_code_action` follows the one that issued the token. A single call
+cannot span two workspaces (`move_file` from one to another is refused),
+and a path in no workspace at all — a dependency under `~/go/pkg/mod`, a
+header in `/usr/include` — is read in the active one rather than rejected.
+
+While more than one workspace is open, every reply starts with a
+`workspace: <root>` line, so a misrouted call is visible instead of silent.
+`close_workspace` stops one instance (by `root`, or the only one, or `all`)
+along with its state: loaded buffers and the `check_project` baseline go
+with it, though a check command remembered with `remember=true` is stored
+per root under Neovim's state directory and survives.
 
 If the server inherits `$NVIM` (Claude Code launched from a `:terminal`
 inside Neovim), that live instance is used instead and `open_workspace` is
@@ -584,6 +611,13 @@ on the bundled `tests/testproj`, then asserts on real lua_ls results
 through the MCP bridge. lua-language-server must be on PATH or in mason's
 bin directory.
 
+`tests/drive_multi.py` opens two copies of `tests/testproj` side by side
+and checks the routing between them: the overlap and limit refusals, an
+absolute path reaching its own workspace, `workspace=<root>`, a relative
+path following the active one, a refused cross-workspace `move_file`, an
+`undo_edit` that follows the edited workspace rather than the last read,
+and closing one instance without disturbing the other.
+
 The debugger tools are exercised by `tests/drive_debug.py` against a real
 Delve session on `tests/debugproj`: breakpoints by name path, launch, step,
 variables, evaluate, run to exit, stale-source detection, relaunch, attach
@@ -599,10 +633,11 @@ a skip line, which `AGENT99_TEST_REQUIRE_DEBUG=1` turns into a failure.
 - One request at a time.
 - The reply replaces the selection; agent-driven multi-file editing goes
   through the symbol tools and `apply_code_action`.
-- One workspace at a time; opening another root replaces the instance and
-  its loaded buffers and `check_project` baseline. A check command
-  remembered with `remember=true` survives, per root, under Neovim's state
-  directory.
+- Workspaces may not overlap: a root inside (or around) an open one is
+  refused, so a monorepo is opened once, at one level. Closing a workspace
+  takes its loaded buffers and `check_project` baseline with it; a check
+  command remembered with `remember=true` survives, per root, under
+  Neovim's state directory.
 - Auto-fix compares diagnostics by severity+message, so a pre-existing
   error the edit duplicates on another line still counts as new.
 - A language server analyzes one build configuration, so a file excluded by a

@@ -84,11 +84,11 @@ func countLines(path string) int {
 }
 
 // Breadcrumb for a partial read: which symbol the region starts inside.
-func readContext(file string, line int) string {
+func readContext(ses session, file string, line int) string {
 	if os.Getenv("AGENT99_NO_LSP") != "" || line <= 1 {
 		return ""
 	}
-	res, err := nvimCall("enclosing_symbols",
+	res, err := nvimCall(ses.Socket, "enclosing_symbols",
 		map[string]any{"file": file, "lines": []any{line}})
 	if err != nil {
 		return ""
@@ -129,8 +129,8 @@ func skimHasOutline(res any) bool {
 	return ok && len(outline) >= 3
 }
 
-func runReadFile(root string, args map[string]any) (string, error) {
-	path := resolveInRoot(root, args["path"])
+func runReadFile(ses session, args map[string]any) (string, error) {
+	path := resolveInRoot(ses.Root, args["path"])
 	explicit := args["offset"] != nil || args["limit"] != nil
 	if !explicit && os.Getenv("AGENT99_NO_LSP") == "" {
 		if n := countLines(path); n > autoSkimThreshold {
@@ -138,7 +138,7 @@ func runReadFile(root string, args map[string]any) (string, error) {
 			// file nothing can outline (a log, a data dump, a grammar
 			// without declarations) would otherwise come back as "no
 			// outline; read it instead" from the read itself.
-			if res, err := nvimCall("skim", map[string]any{"files": []any{path}}); err == nil && skimHasOutline(res) {
+			if res, err := nvimCall(ses.Socket, "skim", map[string]any{"files": []any{path}}); err == nil && skimHasOutline(res) {
 				pretty, merr := renderJSON(res)
 				if merr == nil {
 					return fmt.Sprintf(
@@ -183,14 +183,15 @@ func runReadFile(root string, args map[string]any) (string, error) {
 		return "(empty range)", nil
 	}
 	if explicit {
-		if crumb := readContext(path, offset); crumb != "" {
+		if crumb := readContext(ses, path, offset); crumb != "" {
 			out = append([]string{crumb}, out...)
 		}
 	}
 	return strings.Join(out, "\n"), nil
 }
 
-func runGrep(root string, args map[string]any) (string, error) {
+func runGrep(ses session, args map[string]any) (string, error) {
+	root := ses.Root
 	pattern, _ := args["pattern"].(string)
 	if pattern == "" {
 		return "", errors.New("missing required argument: pattern")
@@ -287,7 +288,7 @@ func runGrep(root string, args map[string]any) (string, error) {
 		truncated = len(lines) - maxGrepLines
 		lines = lines[:maxGrepLines]
 	}
-	drop, unclassified := annotateGrepHits(lines, blame, kind)
+	drop, unclassified := annotateGrepHits(ses, lines, blame, kind)
 	if len(drop) > 0 {
 		kept := lines[:0]
 		for i, l := range lines {
@@ -428,7 +429,7 @@ func kindMatches(filter, kind string) bool {
 // comes from the editor, so it is bounded (see the caps below); a filter whose
 // answer depends on hits past that bound would be a lie, so the count of
 // unclassified hits is returned for the caller to disclose.
-func annotateGrepHits(lines []string, blame bool, kindFilter string) (drop map[int]bool, unclassified int) {
+func annotateGrepHits(ses session, lines []string, blame bool, kindFilter string) (drop map[int]bool, unclassified int) {
 	drop = map[int]bool{}
 	if os.Getenv("AGENT99_NO_LSP") != "" {
 		return drop, 0
@@ -493,7 +494,7 @@ func annotateGrepHits(lines []string, blame bool, kindFilter string) (drop map[i
 			cols = append(cols, h.col)
 			lineNos = append(lineNos, h.line)
 		}
-		res, err := nvimCall("enclosing_symbols",
+		res, err := nvimCall(ses.Socket, "enclosing_symbols",
 			map[string]any{"file": file, "lines": want, "cols": cols})
 		if err != nil {
 			// Editor unreachable; leave the rest plain too.
@@ -605,7 +606,8 @@ var listFilesSkipExt = map[string]bool{
 	".pyc": true, ".wasm": true, ".bin": true, ".db": true, ".sqlite": true,
 }
 
-func runListFiles(root string, args map[string]any) (string, error) {
+func runListFiles(ses session, args map[string]any) (string, error) {
+	root := ses.Root
 	target := resolveInRoot(root, args["path"])
 	glob, _ := args["glob"].(string)
 	var files []string
@@ -702,7 +704,19 @@ func matchSegments(pattern, parts []string) bool {
 }
 
 // callTool executes one tool and returns its text result.
-func callTool(name string, args map[string]any, root string) (string, error) {
+func callTool(name string, args map[string]any, ses session) (string, error) {
+	root := ses.Root
+	// "workspace" is a routing argument (see routing.go); the tool itself
+	// has no use for it and the Lua side would only have to ignore it.
+	if _, ok := args["workspace"]; ok {
+		stripped := map[string]any{}
+		for k, v := range args {
+			if k != "workspace" {
+				stripped[k] = v
+			}
+		}
+		args = stripped
+	}
 	if lspToolNames[name] {
 		// "from" and "to" belong to move_file; they name paths exactly as
 		// "file" does and have to be rooted the same way. The debugger's
@@ -769,7 +783,7 @@ func callTool(name string, args map[string]any, root string) (string, error) {
 			resolved["files"] = resolvedList
 			args = resolved
 		}
-		if headlessRoot() != "" {
+		if ses.Headless {
 			// The server autosaves after edits; tools word their notes accordingly.
 			resolved := map[string]any{}
 			for k, v := range args {
@@ -778,7 +792,7 @@ func callTool(name string, args map[string]any, root string) (string, error) {
 			resolved["headless"] = true
 			args = resolved
 		}
-		result, err := nvimCall(name, args)
+		result, err := nvimCall(ses.Socket, name, args)
 		if err != nil {
 			return "", err
 		}
@@ -791,7 +805,7 @@ func callTool(name string, args map[string]any, root string) (string, error) {
 		if name == "buffer_lines" {
 			if first, ok := args["first"].(float64); ok {
 				if file, ok := args["file"].(string); ok {
-					if crumb := readContext(file, int(first)); crumb != "" {
+					if crumb := readContext(ses, file, int(first)); crumb != "" {
 						out = crumb + "\n" + out
 					}
 				}
@@ -801,19 +815,19 @@ func callTool(name string, args map[string]any, root string) (string, error) {
 	}
 	switch name {
 	case "read_file":
-		out, err := runReadFile(root, args)
+		out, err := runReadFile(ses, args)
 		if err == nil && os.Getenv("AGENT99_NO_LSP") == "" {
 			// Let the editor's code window follow the read (best-effort).
-			nvimCall("ui_follow", map[string]any{
+			nvimCall(ses.Socket, "ui_follow", map[string]any{
 				"file": resolveInRoot(root, args["path"]),
 				"line": argInt(args, "offset", 1),
 			})
 		}
 		return out, err
 	case "grep":
-		return runGrep(root, args)
+		return runGrep(ses, args)
 	case "list_files":
-		return runListFiles(root, args)
+		return runListFiles(ses, args)
 	}
 	return "", fmt.Errorf("unknown tool: %s", name)
 }

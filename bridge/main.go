@@ -44,7 +44,7 @@ func main() {
 			os.Exit(2)
 		}
 		cwd, _ := os.Getwd()
-		out, err := callTool(os.Args[2], args, cwd)
+		out, err := callTool(os.Args[2], args, session{Root: cwd, Socket: envSocket()})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)

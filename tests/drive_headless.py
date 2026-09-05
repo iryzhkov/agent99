@@ -781,7 +781,7 @@ def main():
         check("undo_edit removes a created file", not os.path.exists(added), res)
 
         res = b.call("close_workspace", {})
-        check("close_workspace", res.get("closed") is True, res)
+        check("close_workspace", res.get("closed") == [os.path.realpath(root)], res)
         for _ in range(30):
             if not os.path.exists("/proc/%d" % pid):
                 break

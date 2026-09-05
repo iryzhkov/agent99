@@ -1,12 +1,18 @@
 package main
 
-// Headless workspace for the standalone MCP server. When the bridge is not
+// Headless workspaces for the standalone MCP server. When the bridge is not
 // launched from inside Neovim (no $AGENT99_NVIM), a client such as Claude
 // Code first calls open_workspace(root): the bridge spawns
 // `nvim --headless --listen <socket>` in that root with the user's normal
 // configuration, so the same LSP servers attach as in an interactive
-// session, and every later tool call is routed to that instance. The
-// instance is killed when the workspace is closed or the server exits.
+// session. Several roots can be open at once, and each tool call is routed
+// to the instance that owns the path it names (see routing.go). An instance
+// is killed when its workspace is closed or the server exits.
+//
+// Open workspaces never overlap: a root that contains, or is contained by,
+// an open one is refused. Two instances over one file tree would each hold
+// their own buffers for the same files, and an edit made in one would be
+// lost the moment the other wrote.
 
 import (
 	"crypto/sha1"
@@ -16,6 +22,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +32,10 @@ import (
 const (
 	headlessStartTimeout = 20 * time.Second
 	headlessStopTimeout  = 3 * time.Second
+	// Each workspace is a Neovim with a full set of language servers - a
+	// gopls over a large repository is a gigabyte by itself - so how many
+	// run at once is capped rather than left to the agent.
+	defaultMaxWorkspaces = 4
 )
 
 type headlessWorkspace struct {
@@ -34,10 +46,23 @@ type headlessWorkspace struct {
 	done   chan struct{}
 }
 
+func (w *headlessWorkspace) session() session {
+	return session{Root: w.Root, Socket: w.Socket, Headless: true}
+}
+
 var (
 	headlessMu sync.Mutex
-	headless   *headlessWorkspace
+	workspaces = map[string]*headlessWorkspace{}
 )
+
+func maxWorkspaces() int {
+	if v := os.Getenv("AGENT99_MAX_WORKSPACES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxWorkspaces
+}
 
 // tailBuffer keeps the last few kilobytes written to it, for error reports.
 type tailBuffer struct {
@@ -61,29 +86,71 @@ func (t *tailBuffer) String() string {
 	return strings.TrimSpace(string(t.buf))
 }
 
-// headlessSocket returns the socket of the open headless workspace, or "".
-func headlessSocket() string {
-	headlessMu.Lock()
-	defer headlessMu.Unlock()
-	if headless == nil {
-		return ""
+// liveLocked drops the workspaces whose Neovim has exited and returns the
+// rest. An instance can die underneath the server (a crash, an OOM kill),
+// and a stale entry would route calls to a socket nobody answers on.
+func liveLocked() map[string]*headlessWorkspace {
+	for root, ws := range workspaces {
+		select {
+		case <-ws.done:
+			os.Remove(ws.Socket)
+			delete(workspaces, root)
+			forgetRoot(root)
+		default:
+		}
 	}
-	select {
-	case <-headless.done:
-		return "" // the instance died underneath us
-	default:
-		return headless.Socket
-	}
+	return workspaces
 }
 
-// headlessRoot returns the root of the open headless workspace, or "".
-func headlessRoot() string {
+func rootsLocked() []string {
+	live := liveLocked()
+	out := make([]string, 0, len(live))
+	for root := range live {
+		out = append(out, root)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// openRoots lists the roots of the open workspaces, sorted.
+func openRoots() []string {
 	headlessMu.Lock()
 	defer headlessMu.Unlock()
-	if headless == nil {
-		return ""
+	return rootsLocked()
+}
+
+// workspaceAt returns the open workspace whose root is exactly this path.
+func workspaceAt(root string) *headlessWorkspace {
+	if root == "" {
+		return nil
 	}
-	return headless.Root
+	headlessMu.Lock()
+	defer headlessMu.Unlock()
+	return liveLocked()[root]
+}
+
+// workspaceFor returns the open workspace whose root contains path (or is
+// path). Roots never overlap, so at most one can match.
+func workspaceFor(path string) *headlessWorkspace {
+	if path == "" {
+		return nil
+	}
+	headlessMu.Lock()
+	defer headlessMu.Unlock()
+	for root, ws := range liveLocked() {
+		if underRoot(root, path) {
+			return ws
+		}
+	}
+	return nil
+}
+
+// underRoot reports whether path is root or lies inside it.
+func underRoot(root, path string) bool {
+	if root == path {
+		return true
+	}
+	return strings.HasPrefix(path, strings.TrimSuffix(root, string(os.PathSeparator))+string(os.PathSeparator))
 }
 
 func socketDir() (string, error) {
@@ -107,9 +174,10 @@ func nvimAlive(sock string) bool {
 	return err == nil && strings.TrimSpace(out) == "function"
 }
 
-// openWorkspace starts (or reuses) a headless Neovim rooted at root. Opening
-// a different root replaces the previous instance: the server drives one
-// workspace at a time.
+// openWorkspace starts (or reuses) a headless Neovim rooted at root, and
+// makes it the active workspace. Reopening the same root is a no-op; a root
+// that shares a file tree with an open workspace is refused, and so is one
+// past the workspace limit.
 func openWorkspace(root string) (*headlessWorkspace, error) {
 	if root == "" {
 		return nil, errors.New("open_workspace needs a root directory")
@@ -131,17 +199,31 @@ func openWorkspace(root string) (*headlessWorkspace, error) {
 
 	headlessMu.Lock()
 	defer headlessMu.Unlock()
-	if headless != nil && headless.Root == abs {
-		select {
-		case <-headless.done:
-			// died; fall through and restart
-		default:
-			if nvimAlive(headless.Socket) {
-				return headless, nil
-			}
+	live := liveLocked()
+	if ws := live[abs]; ws != nil {
+		if nvimAlive(ws.Socket) {
+			noteRouted(stickyActive, abs)
+			return ws, nil
+		}
+		// Listening on the socket but not answering: replace it.
+		delete(workspaces, abs)
+		stopWorkspace(ws)
+		forgetRoot(abs)
+	}
+	for _, other := range rootsLocked() {
+		if underRoot(other, abs) || underRoot(abs, other) {
+			return nil, fmt.Errorf("%s shares a file tree with the open workspace %s. "+
+				"One Neovim per tree: two instances would hold their own buffers for the "+
+				"same files, and an edit made in one is lost when the other writes. Close "+
+				"%s first, or open a root beside it rather than inside or around it",
+				abs, other, other)
 		}
 	}
-	stopLocked()
+	if max := maxWorkspaces(); len(workspaces) >= max {
+		return nil, fmt.Errorf("%d workspaces are already open (%s) and the limit is %d; "+
+			"close one first (each is a Neovim with its own language servers)",
+			len(workspaces), strings.Join(rootsLocked(), ", "), max)
+	}
 
 	dir, err := socketDir()
 	if err != nil {
@@ -183,7 +265,8 @@ func openWorkspace(root string) (*headlessWorkspace, error) {
 		default:
 		}
 		if nvimAlive(sock) {
-			headless = ws
+			workspaces[abs] = ws
+			noteRouted(stickyActive, abs)
 			return ws, nil
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -198,24 +281,53 @@ func openWorkspace(root string) (*headlessWorkspace, error) {
 	return nil, fmt.Errorf("nvim did not come up within %s: %s", headlessStartTimeout, detail)
 }
 
-// closeWorkspace stops the headless instance, if any. Returns whether one
-// was running.
-func closeWorkspace() bool {
+// closeWorkspaces stops the workspaces with these roots and returns the ones
+// it actually stopped. The entries leave the map before the instances are
+// told to quit, so a stop that takes its full timeout does not hold the lock
+// against the rest of the server.
+func closeWorkspaces(roots []string) []string {
 	headlessMu.Lock()
-	defer headlessMu.Unlock()
-	return stopLocked()
+	live := liveLocked()
+	var targets []*headlessWorkspace
+	for _, root := range roots {
+		if ws := live[root]; ws != nil {
+			targets = append(targets, ws)
+		}
+	}
+	for _, ws := range targets {
+		delete(workspaces, ws.Root)
+		forgetRoot(ws.Root)
+	}
+	headlessMu.Unlock()
+
+	var wg sync.WaitGroup
+	closed := make([]string, 0, len(targets))
+	for _, ws := range targets {
+		closed = append(closed, ws.Root)
+		wg.Add(1)
+		go func(ws *headlessWorkspace) {
+			defer wg.Done()
+			stopWorkspace(ws)
+		}(ws)
+	}
+	wg.Wait()
+	sort.Strings(closed)
+	return closed
 }
 
-func stopLocked() bool {
-	ws := headless
-	headless = nil
-	if ws == nil {
-		return false
-	}
+// closeAllWorkspaces stops every open workspace. Called on the way out, so
+// the server never leaves a headless Neovim behind.
+func closeAllWorkspaces() []string {
+	return closeWorkspaces(openRoots())
+}
+
+// stopWorkspace ends one instance. The caller has already taken it out of
+// the map.
+func stopWorkspace(ws *headlessWorkspace) {
 	select {
 	case <-ws.done:
 		os.Remove(ws.Socket)
-		return true
+		return
 	default:
 	}
 	// A debug session's adapter and debuggee are grandchildren of this
@@ -233,7 +345,6 @@ func stopLocked() bool {
 		<-ws.done
 	}
 	os.Remove(ws.Socket)
-	return true
 }
 
 // Lua expression that ends the agent's debug session, if any; errors are
@@ -266,12 +377,11 @@ var editTools = map[string]bool{
 
 // headlessSaveAll writes every modified file buffer of the headless
 // instance and reports the first failures.
-func headlessSaveAll() error {
-	sock := headlessSocket()
-	if sock == "" {
+func headlessSaveAll(ses session) error {
+	if ses.Socket == "" {
 		return nil
 	}
-	out, err := remoteExpr(sock, "luaeval('"+headlessSaveLua+"')")
+	out, err := remoteExpr(ses.Socket, "luaeval('"+headlessSaveLua+"')")
 	if err != nil {
 		return err
 	}
