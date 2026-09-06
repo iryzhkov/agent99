@@ -135,6 +135,18 @@ local DATA_OPAQUE = {
     toml = { array = true },
 }
 
+-- Two kinds of file whose declarations are not functions. A Makefile is
+-- rules and the variables above them, and both are addressable: `smoke` is
+-- the target and its recipe. A shell script is functions and the variables
+-- it sets at the top, which is where its knobs live - "top" because an
+-- assignment further in is a statement, not a declaration, and a variable
+-- set again inside a loop must not index as another symbol of the file.
+local FT_NODES = {
+    make = { rule = true, variable_assignment = true },
+    sh = { variable_assignment = "top" },
+    bash = { variable_assignment = "top" },
+}
+
 local function data_nodes(ft)
     return ft and DATA_NODES[ft] or nil
 end
@@ -165,6 +177,9 @@ local function ts_wanted(node_type, ft)
     if data then
         return data[node_type] == true
     end
+    if (FT_NODES[ft or ""] or {})[node_type] then
+        return true
+    end
     if TS_WANTED_EXACT[node_type] then
         return true
     end
@@ -179,6 +194,31 @@ local function ts_wanted(node_type, ft)
     end
     return wanted
 end
+
+-- ts_wanted on a node rather than a type, so the filetypes whose extra
+-- nodes only count at the top of the file can be told where they are.
+local function wanted_node(node, ft)
+    local rule = (FT_NODES[ft or ""] or {})[node:type()]
+    if rule == "top" then
+        local parent = node:parent()
+        return parent ~= nil and parent:parent() == nil
+    end
+    return ts_wanted(node:type(), ft)
+end
+-- The last line of a node that is actually part of it. A grammar whose
+-- declarations run to the start of the next one - make rules and variables,
+-- shell assignments, markdown sections - hands back the blank lines in
+-- between as well, and they belong to the file's spacing rather than to the
+-- declaration: an edit that replaced them would close the gap.
+local function last_written_line(bufnr, first, last)
+    while last > first do
+        local text = vim.api.nvim_buf_get_lines(bufnr, last - 1, last, false)[1] or ""
+        if text:match("%S") then break end
+        last = last - 1
+    end
+    return last
+end
+
 local function ts_outline(bufnr)
     local ok, parser = pcall(vim.treesitter.get_parser, bufnr)
     if not ok or parser == nil then
@@ -197,11 +237,12 @@ local function ts_outline(bufnr)
     local function walk(node, depth)
         for child in node:iter_children() do
             if child:named() then
-                if ts_wanted(child:type(), ft) then
+                if wanted_node(child, ft) then
                     local srow, _, erow, ecol = child:range()
                     if ecol == 0 and erow > srow then
                         erow = erow - 1
                     end
+                    erow = last_written_line(bufnr, srow + 1, erow + 1) - 1
                     -- A wrapper and its inner node often start on the same
                     -- row (e.g. declaration + definition); emit it once.
                     if #out >= MAX_SKIM_ENTRIES then
@@ -465,7 +506,7 @@ local function top_level_outline(path, budget, missing)
         for child in node:iter_children() do
             if child:named() then
                 local ctype = child:type()
-                if ts_wanted(ctype, ft) then
+                if wanted_node(child, ft) then
                     local srow = child:range()
                     if srow == last_row then
                         -- Several declarations on one line (a one-line JSON
@@ -950,7 +991,7 @@ local function ts_index(bufnr)
     local function walk(node, prefix)
         for child in node:iter_children() do
             if child:named() then
-                if ts_wanted(child:type(), ft) then
+                if wanted_node(child, ft) then
                     local srow, _, erow, ecol = child:range()
                     -- A node ending at column 0 stopped at the previous
                     -- line's newline (a Markdown section runs up to the
@@ -958,6 +999,7 @@ local function ts_index(bufnr)
                     if ecol == 0 and erow > srow then
                         erow = erow - 1
                     end
+                    erow = last_written_line(bufnr, srow + 1, erow + 1) - 1
                     local name = ts_node_name(child, bufnr)
                     local path = prefix == "" and name or (prefix .. "/" .. name)
                     entries[#entries + 1] = {

@@ -438,6 +438,28 @@ local DATA_FILETYPES = {
     ["" ] = true,
 }
 
+-- Filetypes whose treesitter language goes by another name. Neovim learns
+-- these from nvim-treesitter, so an editor without it has no parser for a
+-- shell script even though the parser ships with Neovim itself: the lookup
+-- asks for "sh" and the language is called "bash". Registering the ones
+-- worth having costs nothing, and register() is happy to be told twice.
+local FT_LANGUAGE = {
+    sh = "bash",
+    zsh = "bash",
+    ksh = "bash",
+    javascriptreact = "javascript",
+    typescriptreact = "tsx",
+}
+
+for ft, lang in pairs(FT_LANGUAGE) do
+    -- get_lang answers with the filetype itself when nothing is registered
+    -- for it, so that - not nil - is what "no mapping yet" looks like. A
+    -- mapping someone else made is left alone.
+    if vim.treesitter.language.get_lang(ft) == ft then
+        pcall(vim.treesitter.language.register, lang, ft)
+    end
+end
+
 local function has_parser(ft)
     local lang = vim.treesitter.language.get_lang(ft) or ft
     -- add() returns nil (no error) for a missing parser on recent Neovim;
