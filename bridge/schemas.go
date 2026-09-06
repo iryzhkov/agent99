@@ -165,12 +165,12 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "find_symbol",
-		Description: "Find symbols by name or name path (\"Class/method\"; suffix and substring match) in files/glob, optionally with full source (include_body) numbered relative to the symbol, ready for replace_symbol_lines. Cheapest way to read one function.",
+		Description: "Find symbols by name or name path (\"Class/method\"; suffix and substring match), across the whole workspace or narrowed to files/glob, optionally with full source (include_body) numbered relative to the symbol, ready for replace_symbol_lines. Cheapest way to read one function.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"name":         map[string]any{"type": "string", "description": "Name or name path; suffix/substring match."},
-				"file":         map[string]any{"type": "string", "description": "One file to search."},
+				"file":         map[string]any{"type": "string", "description": "One file to search (default: the whole workspace)."},
 				"files":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Several files to search."},
 				"glob":         map[string]any{"type": "string", "description": "Path glob relative to root, e.g. **/*.go; subdirectories need a **/ prefix."},
 				"include_body": map[string]any{"type": "boolean", "description": "Return the full source of well-matching symbols."},

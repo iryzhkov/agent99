@@ -87,12 +87,11 @@ def restore(c):
     shutil.copytree(PROJ, c.root, dirs_exist_ok=True)
     seed(c.root)
     # A read through agent99, so the editor's buffers follow the restore
-    # before anything is judged against them.
-    try:
+    # before anything is judged against them. Only once there is an editor:
+    # a read before that would have the server open a workspace for it.
+    if c.opened:
         c.b.call("find_symbol", {"file": c.util, "name": "M.greet"})
         c.b.call("find_symbol", {"file": c.main_lua, "name": "run"})
-    except RuntimeError:
-        pass                      # no workspace open yet
 
 
 def restart(c):
@@ -103,6 +102,7 @@ def restart(c):
         c.b.call("close_workspace", {})
     except RuntimeError:
         pass
+    c.opened = False
     restore(c)
     res = c.b.call("open_workspace", {"root": c.root})
     c.pid = res["pid"]
@@ -131,6 +131,29 @@ def group_workspace(c):
         check("bad root -> error", False, "call succeeded")
     except RuntimeError as e:
         check("bad root -> error", "workspace root" in str(e), e)
+
+    # The home directory and a filesystem root are not projects: opening
+    # one points every language server at the whole machine, and the
+    # friction spool measured what that costs in a real session.
+    for wide, word in ((os.path.expanduser("~"), "home directory"), ("/", "filesystem root")):
+        try:
+            b.call("open_workspace", {"root": wide})
+            check("a root that is not a project is refused (%s)" % word, False, "call succeeded")
+        except RuntimeError as e:
+            check("a root that is not a project is refused (%s)" % word,
+                  word in str(e) and "AGENT99_ALLOW_WIDE_ROOT" in str(e), e)
+
+    # A call that needs Neovim opens the project the path it names belongs
+    # to, instead of the "call open_workspace first" round trip: the file
+    # is inside a project once the project has a marker at its top.
+    os.mkdir(os.path.join(root, ".git"))
+    res = b.call("find_symbol", {"file": main_lua, "name": "run"})
+    check("a call with no workspace opens the project around its file",
+          res.get("count") == 1, res)
+    res = b.call("close_workspace", {})
+    check("the auto-opened workspace is the project root",
+          res.get("closed") == [os.path.realpath(root)], res)
+    shutil.rmtree(os.path.join(root, ".git"))
 
     # A root-level file of a language nothing in the minimal config can
     # serve, and a binary blob: the map must flag both instead of
@@ -361,6 +384,19 @@ def group_index(c):
     # A bare filename reads as "wherever it lives", not "in the root".
     res = b.call("find_symbol", {"name": "M.greet", "glob": "util.lua"})
     check("bare filename glob searches subdirectories", res.get("count") == 1, res)
+    # With no file, files or glob at all the search is the whole workspace,
+    # rather than an error asking for a scope the caller does not have yet.
+    res = b.call("find_symbol", {"name": "M.greet"})
+    files = [m["file"] for m in res.get("matches", [])]
+    check("no scope searches the whole workspace",
+          res.get("count", 0) >= 1 and any(f.endswith("util.lua") for f in files), res)
+    # A name nothing spells is still an error, and says where it looked.
+    try:
+        b.call("find_symbol", {"name": "no_such_symbol_anywhere"})
+        check("whole-workspace miss explains itself", False, "call succeeded")
+    except RuntimeError as e:
+        check("whole-workspace miss explains itself",
+              "mentions" in str(e) and "glob" in str(e), e)
 
     reset(c)
     # Build files are structure too, and they are everywhere: a make target
@@ -526,6 +562,16 @@ def group_edit(c):
         check("match refuses absent text", False, "call succeeded")
     except RuntimeError as e:
         check("match refuses absent text", "nowhere in M.greet" in str(e), e)
+    # A name_path the file does not have names what it does have, so the
+    # caller can fix the name from the refusal instead of going back to
+    # find_symbol for it.
+    try:
+        b.call("replace_symbol_lines", {"file": util, "name_path": "M.greeting",
+                                        "match": "name = tostring(name)", "text": "x"})
+        check("an unknown name_path names the near misses", False, "call succeeded")
+    except RuntimeError as e:
+        check("an unknown name_path names the near misses",
+              "no symbol named" in str(e) and "M.greet" in str(e), e)
     # Absolute numbers, as read_file reports them: M.greet starts at 6.
     res = b.call("replace_symbol_lines", {
         "file": util, "name_path": "M.greet", "absolute": True,
@@ -1231,7 +1277,10 @@ def run_group(name):
     shutil.copytree(PROJ, root)
     seed(root)
 
-    b = Bridge(env=env)
+    # Started in the scratch tree: nothing above it is a project, so the
+    # server has no working directory to auto-open, and a group controls
+    # its own workspace.
+    b = Bridge(env=env, cwd=work)
     c = Context(b, work, root)
     try:
         b.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},

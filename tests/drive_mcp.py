@@ -30,11 +30,14 @@ MESSY = os.path.join(PROJ, "lua", "testproj", "messy.lua")
 
 
 class Bridge:
-    def __init__(self, env=None):
+    # cwd matters to the server: with no workspace open it will open the
+    # project around its working directory, the way a client started in a
+    # repository means that repository.
+    def __init__(self, env=None, cwd=None):
         self.proc = subprocess.Popen(
             [BRIDGE, "mcp"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-            env=env,
+            env=env, cwd=cwd,
         )
         assert self.proc.stdin is not None and self.proc.stdout is not None
         self.next_id = 0

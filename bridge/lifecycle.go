@@ -3,7 +3,7 @@ package main
 // Workspace lifecycle: what happens to a headless Neovim between the call
 // that opened it and the one that closes it.
 //
-// Three things live here, and they are one design rather than three fixes.
+// Four things live here, and they are one design rather than four fixes.
 //
 // A workspace can go away without anybody closing it - the Neovim crashes, or
 // the OOM killer takes it, or the idle sweep below collects it. Until now that
@@ -18,6 +18,12 @@ package main
 // 923 MB - and it stays up for the whole session even when nothing has touched
 // it for hours. Collecting an idle one gives that memory back, and because the
 // next call reopens it, the agent sees a slow call rather than a failure.
+//
+// The same reasoning covers the workspace that was never opened at all.
+// autoOpenFor takes the root a call already names - the file in its
+// arguments, or the project around the working directory - and opens it,
+// because "call open_workspace first" is a round trip spent restating what
+// the arguments said.
 //
 // Finally, an instance that is killed outright cannot remove its own socket,
 // so the runtime directory collects dead entries. Every socket carries the pid
@@ -137,6 +143,88 @@ func reviveIfNeeded(args map[string]any) {
 			reviveFor(roots[0])
 		}
 	}
+}
+
+// projectMarkers are the files that say "this directory is a project". The
+// list is deliberately short: a marker that is common inside a project as
+// well as at its top (a Makefile, a README) would root a workspace at a
+// subdirectory and hide the rest of the tree from every symbol tool.
+var projectMarkers = []string{
+	".git", ".hg", "go.mod", "package.json", "Cargo.toml",
+	"pyproject.toml", "setup.py", "pom.xml", "build.gradle", "flake.nix",
+}
+
+// projectRootFor walks up from path to the nearest directory holding a
+// project marker, and returns "" when there is none below the home
+// directory. Stopping at home is what keeps the walk from answering with the
+// home directory itself, which openWorkspace refuses anyway (usableRoot).
+func projectRootFor(path string) string {
+	if path == "" {
+		return ""
+	}
+	dir := path
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		dir = filepath.Dir(dir)
+	}
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		if resolved, err := filepath.EvalSymlinks(home); err == nil {
+			home = resolved
+		}
+		home = filepath.Clean(home)
+	}
+	for dir != "" && dir != home && dir != filepath.Dir(dir) {
+		for _, marker := range projectMarkers {
+			if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+				return dir
+			}
+		}
+		dir = filepath.Dir(dir)
+	}
+	return ""
+}
+
+// autoOpenFor opens the workspace a call is already talking about, when the
+// call needs Neovim and none is open.
+//
+// The friction spool is what asked for this. "no Neovim to talk to: call
+// open_workspace(root) first" was one of the most common failures in real
+// sessions, and every one of them recovered the same way: the agent read the
+// error, called open_workspace with the root it had just named in the failed
+// call, and carried on. That is a round trip spent restating something the
+// arguments already said, so the server does it instead. It stays a failure
+// when there is nothing to infer from - no path in the arguments and no
+// project around the working directory - because guessing a root wrongly is
+// worse than asking for one.
+func autoOpenFor(name string, args map[string]any) *headlessWorkspace {
+	// Embedded in an editor, or pointed at a running Neovim: there is a
+	// session already and workspaces are not this bridge's to open.
+	if !lspToolNames[name] || os.Getenv("NVIM") != "" {
+		return nil
+	}
+	candidates := []string{}
+	if want, ok := args["workspace"].(string); ok && strings.TrimSpace(want) != "" {
+		candidates = append(candidates, absPath(want))
+	}
+	candidates = append(candidates, argPaths(args)...)
+	candidates = append(candidates, cwd())
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		root := projectRootFor(realPath(candidate))
+		if root == "" || seen[root] {
+			continue
+		}
+		seen[root] = true
+		ws, err := openWorkspace(root)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "agent99: %s needed a workspace and %s would not open: %v\n",
+				name, root, err)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "agent99: opened %s for %s (nothing was open)\n", root, name)
+		return ws
+	}
+	return nil
 }
 
 // workspaceIdleTimeout is how long a workspace may go untouched.

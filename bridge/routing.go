@@ -173,8 +173,16 @@ func resolveSession(name string, args map[string]any) (session, error) {
 	reviveIfNeeded(args)
 	roots := openRoots()
 	if len(roots) == 0 {
-		// No workspace: the file tools still work against the working
-		// directory, and the LSP tools report that there is no Neovim.
+		// Nothing is open. A call that needs Neovim can usually say which
+		// project it means - the file it names, or the working directory -
+		// so open that rather than making the agent read an error and call
+		// open_workspace with a root it has already given us.
+		if ws := autoOpenFor(name, args); ws != nil {
+			return ws.session(), nil
+		}
+		// No workspace and nothing to infer one from: the file tools still
+		// work against the working directory, and the LSP tools report that
+		// there is no Neovim.
 		return session{Root: cwd(), Socket: os.Getenv("NVIM")}, nil
 	}
 

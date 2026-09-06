@@ -181,10 +181,50 @@ func nvimAlive(sock string) bool {
 	return err == nil && strings.TrimSpace(out) == "function"
 }
 
+// usableRoot refuses the two directories that are not a project tree: the
+// home directory, which holds every project on the machine plus its caches
+// and dotfiles, and a filesystem root, which holds the machine. The refusal
+// is not about taste. Everything that walks a workspace walks all of it -
+// project_files behind find_symbol and workspace_map, and the language
+// servers doing their own indexing - and the friction spool measured what
+// that costs: single edits in a workspace rooted at the home directory took
+// 244s, 255s and 476s, against a median of 1.4s for the same tool elsewhere.
+//
+// AGENT99_ALLOW_WIDE_ROOT=1 lifts the refusal, for a session that means it.
+func usableRoot(abs string) error {
+	if os.Getenv("AGENT99_ALLOW_WIDE_ROOT") != "" {
+		return nil
+	}
+	if abs == filepath.Dir(abs) {
+		return fmt.Errorf("%s is a filesystem root, not a project: opening it would "+
+			"point the language servers at the whole machine. Open the project "+
+			"directory instead, or set AGENT99_ALLOW_WIDE_ROOT=1 if that is really "+
+			"what you want", abs)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil
+	}
+	if resolved, err := filepath.EvalSymlinks(home); err == nil {
+		home = resolved
+	}
+	if abs == filepath.Clean(home) {
+		return fmt.Errorf("%s is the home directory, not a project root: every tool "+
+			"that walks the tree would walk every project, cache and dotfile under it "+
+			"(measured here: single edits in a workspace rooted at the home directory "+
+			"took 4 to 8 minutes, against a median of 1.4s elsewhere). Open the "+
+			"repository or config directory the work is in - ~/Work/<project>, "+
+			"~/.config/hypr - or set AGENT99_ALLOW_WIDE_ROOT=1 to open the home "+
+			"directory anyway", abs)
+	}
+	return nil
+}
+
 // openWorkspace starts (or reuses) a headless Neovim rooted at root, and
 // makes it the active workspace. Reopening the same root is a no-op; a root
 // that shares a file tree with an open workspace is refused, and so is one
-// past the workspace limit.
+// past the workspace limit and one that is not a project tree at all
+// (usableRoot).
 func openWorkspace(root string) (*headlessWorkspace, error) {
 	if root == "" {
 		return nil, errors.New("open_workspace needs a root directory")
@@ -202,6 +242,9 @@ func openWorkspace(root string) (*headlessWorkspace, error) {
 	}
 	if !info.IsDir() {
 		return nil, fmt.Errorf("workspace root is not a directory: %s", abs)
+	}
+	if err := usableRoot(abs); err != nil {
+		return nil, err
 	}
 
 	headlessMu.Lock()

@@ -1184,6 +1184,31 @@ local MAX_BODY_LINES = 200
 -- Body lines are numbered RELATIVE to the symbol (declaration = 1), matching
 -- the addressing of replace_symbol_lines; the absolute file range is in the
 -- accompanying `lines` field.
+
+-- The files whose text mentions `text` at all, as ripgrep sees them, and
+-- whether ripgrep was there to ask. Reading a file's symbol index means
+-- loading its buffer and parsing it, which is far too much work to do for
+-- every file in a project when a symbol can only be declared in a file that
+-- spells its name somewhere.
+local function files_mentioning(root, text, cap)
+    if vim.fn.executable("rg") == 0 or type(root) ~= "string" or root == ""
+        or type(text) ~= "string" or text == "" then
+        return {}, false
+    end
+    local files = vim.fn.systemlist({
+        "rg", "--files-with-matches", "--fixed-strings", "--max-count", "1",
+        "--sort", "path", "--", text, root,
+    })
+    -- 1 is "no matches", which is an answer; anything above it is a failure.
+    if vim.v.shell_error > 1 then
+        return {}, false
+    end
+    if cap and #files > cap then
+        files = vim.list_slice(files, 1, cap)
+    end
+    return files, true
+end
+
 -- Search the project's own files for a symbol, without asking a server.
 --
 -- Some servers only index the files they have been handed - tsserver builds
@@ -1195,19 +1220,8 @@ local MAX_BODY_LINES = 200
 local FALLBACK_MAX_FILES = 25
 
 function fallback_symbol_search(root, query)
-    if vim.fn.executable("rg") == 0 then
-        return {}
-    end
-    local files = vim.fn.systemlist({
-        "rg", "--files-with-matches", "--fixed-strings", "--max-count", "1",
-        "--sort", "path", "--", query, root,
-    })
-    if vim.v.shell_error > 1 then
-        return {}
-    end
     local found = {}
-    for i, path in ipairs(files) do
-        if i > FALLBACK_MAX_FILES then break end
+    for _, path in ipairs(files_mentioning(root, query, FALLBACK_MAX_FILES)) do
         local okb, bufnr = pcall(load_buf, path)
         if okb then
             for _, entry in ipairs(symbol_index(bufnr)) do
@@ -1265,8 +1279,29 @@ local function find_symbol(args)
         glob_note = why
         vim.list_extend(files, paths)
     end
+    -- Nothing said where to look. Refusing was measured as one of the
+    -- commonest failures in real sessions, and the recovery was always the
+    -- same call again with a glob around the whole project, so do that here
+    -- instead: ripgrep narrows the workspace to the files that spell the
+    -- name at all, which is every file that could declare it.
+    local scanned_project = false
+    if #files == 0 and not glob_note then
+        local hits, asked = files_mentioning(args.root, name:match("([^/]+)$") or name,
+            MAX_QUERY_FILES)
+        if asked then
+            files, scanned_project = hits, true
+        end
+    end
     if #files == 0 then
-        err("%s", glob_note or "no files to search: pass file, files, or glob")
+        if glob_note then
+            err("%s", glob_note)
+        elseif scanned_project then
+            err("no file under %s mentions %q; check the spelling, or pass file, "
+                .. "files or glob to search somewhere else",
+                rel_path(args.root or "."), name)
+        end
+        err("no files to search: pass file, files, or glob (searching the whole "
+            .. "workspace needs ripgrep, which is not installed here)")
     end
     if #files > MAX_QUERY_FILES then
         files = vim.list_slice(files, 1, MAX_QUERY_FILES)
@@ -1354,11 +1389,45 @@ local function find_symbol(args)
         note = ("showing the best %d of %d matches; use a longer name or a name "
             .. "path (\"Type/method\") or narrow with file/glob"):format(MAX_FIND_RESULTS, #found)
     end
+    -- The whole-workspace search is capped, and a cap that is silently hit
+    -- reads as "the symbol is not there" when it means "we stopped looking".
+    if scanned_project and #files >= MAX_QUERY_FILES then
+        note = ("searched the first %d files mentioning the name; pass file or glob "
+            .. "if it is declared elsewhere"):format(MAX_QUERY_FILES)
+            .. (note and ("; " .. note) or "")
+    end
     return {
         count = #found,
         matches = out,
         note = note,
     }
+end
+
+local MAX_NEAR_NAMES = 6
+
+-- The names worth showing someone who asked for one this file does not
+-- have: the ones that look like what was asked first, and failing that the
+-- first few the file declares, which is enough to see whether the name path
+-- was wrong or the file was.
+local function near_names(index, name_path)
+    local leaf = name_path:match("([^/]+)$") or name_path
+    local lower = leaf:lower()
+    local near, rest = {}, {}
+    for _, entry in ipairs(index) do
+        local name = entry.name or ""
+        local close = match_rank(entry, leaf) ~= nil
+            or (#name > 0 and lower:find(name:lower(), 1, true) ~= nil)
+            or (#name >= 4 and #leaf >= 4 and name:sub(1, 4):lower() == lower:sub(1, 4))
+        local into = close and near or rest
+        if #into < MAX_NEAR_NAMES then
+            into[#into + 1] = entry.path
+        end
+    end
+    if #near > 0 then
+        return "the closest names in it are " .. table.concat(near, ", ")
+    end
+    local more = #index > #rest and (" and %d more"):format(#index - #rest) or ""
+    return ("it declares %s%s"):format(table.concat(rest, ", "), more)
 end
 
 -- Resolve one unambiguous symbol for an edit.
@@ -1376,8 +1445,21 @@ local function resolve_symbol(file, name_path)
     end
     table.sort(candidates, function(a, b) return a.rank < b.rank end)
     if #candidates == 0 then
-        err("no symbol named %q in %s; use find_symbol or skim to locate it",
-            name_path, file)
+        -- A name that resolves to nothing is either a typo or a file whose
+        -- declarations the editor cannot see at all, and the two need
+        -- different answers. Naming what the file does declare settles it
+        -- in one reply rather than in a find_symbol round trip.
+        local index = symbol_index(bufnr)
+        if #index == 0 then
+            err("no symbols are indexed in %s, so no name_path can resolve there: "
+                .. "nothing in the file parses as a declaration (no treesitter parser "
+                .. "or language server for its filetype). Address the lines instead - "
+                .. "absolute=true line numbers, or match with the text to replace",
+                file)
+        end
+        err("no symbol named %q in %s; %s (skim lists the file's declarations, "
+            .. "find_symbol searches for the name elsewhere)",
+            name_path, file, near_names(index, name_path))
     end
     if #candidates > 1 and candidates[1].rank == candidates[2].rank then
         local names = {}
