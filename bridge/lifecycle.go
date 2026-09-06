@@ -1,0 +1,265 @@
+package main
+
+// Workspace lifecycle: what happens to a headless Neovim between the call
+// that opened it and the one that closes it.
+//
+// Three things live here, and they are one design rather than three fixes.
+//
+// A workspace can go away without anybody closing it - the Neovim crashes, or
+// the OOM killer takes it, or the idle sweep below collects it. Until now that
+// turned the next call into "no Neovim to talk to: call open_workspace first",
+// an error the agent has to notice, understand and recover from in the middle
+// of doing something else. reviveFor starts the instance again instead, so a
+// workspace dying underneath the server costs a pause.
+//
+// That is what makes an idle timeout safe to have. A workspace is a Neovim
+// with a full set of language servers behind it - measured on this machine, a
+// lua-language-server is 175-450 MB and a session holding two workspaces was
+// 923 MB - and it stays up for the whole session even when nothing has touched
+// it for hours. Collecting an idle one gives that memory back, and because the
+// next call reopens it, the agent sees a slow call rather than a failure.
+//
+// Finally, an instance that is killed outright cannot remove its own socket,
+// so the runtime directory collects dead entries. Every socket carries the pid
+// of the bridge that made it, which is enough to tell on startup which ones
+// belong to nobody.
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+)
+
+// defaultWorkspaceIdle is how long a workspace may sit untouched before it is
+// closed. Long enough not to fire between two steps of the same piece of work,
+// short enough that a session left open over lunch is not holding a gigabyte.
+const defaultWorkspaceIdle = 30 * time.Minute
+
+// reopenable remembers the roots of workspaces that went away without the
+// agent closing them, against why. Guarded by headlessMu, like the workspaces
+// map it shadows.
+var reopenable = map[string]string{}
+
+// noteReopenableLocked records that a root's instance is gone but its work is
+// probably not. reason is what to tell the log when it comes back. The caller
+// holds headlessMu.
+func noteReopenableLocked(root, reason string) {
+	if root != "" {
+		reopenable[root] = reason
+	}
+}
+
+// forgetReopenableLocked drops a root that is open again, or that the user
+// closed deliberately. The caller holds headlessMu.
+func forgetReopenableLocked(root string) {
+	delete(reopenable, root)
+}
+
+func reopenableRoots() []string {
+	headlessMu.Lock()
+	defer headlessMu.Unlock()
+	roots := make([]string, 0, len(reopenable))
+	for root := range reopenable {
+		roots = append(roots, root)
+	}
+	return roots
+}
+
+// reviveFor restarts the workspace that owned path, when one was open there
+// and went away by itself. It returns nil when there is nothing to revive,
+// and when the restart fails - a failure here has to look like "no workspace",
+// not like a new kind of error, because the caller is in the middle of an
+// ordinary call that never asked for any of this.
+func reviveFor(path string) *headlessWorkspace {
+	if path == "" {
+		return nil
+	}
+	headlessMu.Lock()
+	target, reason := "", ""
+	for root, why := range reopenable {
+		if underRoot(root, path) {
+			target, reason = root, why
+			break
+		}
+	}
+	headlessMu.Unlock()
+	if target == "" {
+		return nil
+	}
+	ws, err := openWorkspace(target)
+	if err != nil {
+		// Do not try again on every call: whatever stopped it starting is
+		// unlikely to clear up between one tool call and the next, and the
+		// agent is better off being told to open a workspace itself.
+		headlessMu.Lock()
+		forgetReopenableLocked(target)
+		headlessMu.Unlock()
+		fmt.Fprintf(os.Stderr, "agent99: could not reopen %s: %v\n", target, err)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "agent99: reopened %s (%s)\n", target, reason)
+	return ws
+}
+
+// reviveIfNeeded gives a call that names a path in a vanished workspace its
+// workspace back, before the routing tries to pick one.
+func reviveIfNeeded(args map[string]any) {
+	// A workspace is only known to be gone once something has looked, and
+	// what looks is liveLocked. Without this the first call after an instance
+	// dies still sees an empty reopenable map and fails the way it used to.
+	headlessMu.Lock()
+	liveLocked()
+	waiting := len(reopenable)
+	headlessMu.Unlock()
+	if waiting == 0 {
+		return
+	}
+	if want, ok := args["workspace"].(string); ok && strings.TrimSpace(want) != "" {
+		reviveFor(realPath(absPath(want)))
+		return
+	}
+	for _, path := range argPaths(args) {
+		if resolved := realPath(path); workspaceFor(resolved) == nil {
+			if reviveFor(resolved) != nil {
+				return
+			}
+		}
+	}
+	// A call with no paths - check_project, undo_edit, a debugger step - can
+	// still be revived when there is only one candidate and nothing is open,
+	// because then there is nothing to be ambiguous about.
+	if len(openRoots()) == 0 {
+		if roots := reopenableRoots(); len(roots) == 1 {
+			reviveFor(roots[0])
+		}
+	}
+}
+
+// workspaceIdleTimeout is how long a workspace may go untouched.
+// AGENT99_WORKSPACE_IDLE takes a duration ("45m", "2h"); "0" or "off" leaves
+// workspaces up for the whole session, the way they used to be.
+func workspaceIdleTimeout() time.Duration {
+	value := strings.TrimSpace(os.Getenv("AGENT99_WORKSPACE_IDLE"))
+	if value == "" {
+		return defaultWorkspaceIdle
+	}
+	if value == "0" || strings.EqualFold(value, "off") {
+		return 0
+	}
+	idle, err := time.ParseDuration(value)
+	if err != nil || idle <= 0 {
+		return defaultWorkspaceIdle
+	}
+	return idle
+}
+
+// touchWorkspace marks a workspace as still in use. Called for every routed
+// call, so "idle" means what it says rather than "opened a while ago".
+func touchWorkspace(root string) {
+	if root == "" {
+		return
+	}
+	headlessMu.Lock()
+	if ws := workspaces[root]; ws != nil {
+		ws.lastUsed = time.Now()
+	}
+	headlessMu.Unlock()
+}
+
+// reapIdleWorkspaces closes the workspaces nothing has used for idle, and
+// returns their roots. They stay reopenable, so the next call that needs one
+// gets it back.
+func reapIdleWorkspaces(idle time.Duration) []string {
+	headlessMu.Lock()
+	var stale []string
+	for root, ws := range liveLocked() {
+		if time.Since(ws.lastUsed) >= idle {
+			stale = append(stale, root)
+		}
+	}
+	headlessMu.Unlock()
+	if len(stale) == 0 {
+		return nil
+	}
+	closed := closeWorkspaces(stale)
+	headlessMu.Lock()
+	for _, root := range closed {
+		noteReopenableLocked(root, "closed as idle")
+	}
+	headlessMu.Unlock()
+	return closed
+}
+
+func startIdleReaper() {
+	idle := workspaceIdleTimeout()
+	if idle <= 0 {
+		return
+	}
+	// Check twice per idle period, but never more than once a minute: the
+	// sweep costs nothing, and a short timeout set for a test should not have
+	// to wait a whole minute to be observed.
+	interval := idle / 2
+	if interval > time.Minute {
+		interval = time.Minute
+	}
+	if interval < time.Second {
+		interval = time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			for _, root := range reapIdleWorkspaces(idle) {
+				fmt.Fprintf(os.Stderr,
+					"agent99: closed %s, idle for %s (it reopens on the next call)\n",
+					root, idle)
+			}
+		}
+	}()
+}
+
+// sweepStaleSockets removes socket files left by bridges that are no longer
+// running. A Neovim that exits normally removes its own; one that is killed
+// outright cannot, and nothing else ever cleans up after it.
+func sweepStaleSockets() {
+	dir, err := socketDir()
+	if err != nil {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	self := os.Getpid()
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".sock") {
+			continue
+		}
+		// The name is <hash of root>-<pid of the bridge that made it>.sock,
+		// so the owner is knowable without talking to the socket - which
+		// matters, because another live bridge's socket must not be touched.
+		base := strings.TrimSuffix(name, ".sock")
+		dash := strings.LastIndexByte(base, '-')
+		if dash < 0 {
+			continue
+		}
+		pid, err := strconv.Atoi(base[dash+1:])
+		if err != nil || pid == self || processAlive(pid) {
+			continue
+		}
+		os.Remove(filepath.Join(dir, name))
+	}
+}
+
+func processAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
+}

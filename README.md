@@ -400,6 +400,26 @@ along with its state: loaded buffers and the `check_project` baseline go
 with it, though a check command remembered with `remember=true` is stored
 per root under Neovim's state directory and survives.
 
+A workspace also goes away on its own in two cases, and comes back by
+itself in both. If its Neovim dies — a crash, the OOM killer — the next
+call that names a path in that tree starts it again rather than answering
+"no Neovim to talk to: call open_workspace first", which is an error the
+agent has to notice and recover from in the middle of doing something
+else. And a workspace nothing has touched for 30 minutes is closed, since
+each one is a Neovim with a full set of language servers behind it: a
+`lua-language-server` alone runs a few hundred megabytes, and a session
+holding two workspaces was measured at 923 MB. `AGENT99_WORKSPACE_IDLE`
+takes a duration (`45m`, `2h`); `0` or `off` keeps them up for the whole
+session, the way they used to be. Because the next call reopens it, an
+idle close costs a slow call rather than a failure — that is what makes
+the timeout safe to have at all. Both events are noted on stderr, where
+the MCP client logs them.
+
+A Neovim killed outright cannot remove its own socket, so the server
+sweeps the runtime directory at startup for sockets whose owning bridge is
+no longer running. It knows which are which because the pid is in the
+name, and it never touches one belonging to another live server.
+
 If the server inherits `$NVIM` (Claude Code launched from a `:terminal`
 inside Neovim), that live instance is used instead and `open_workspace` is
 unnecessary — and the tools then see your unsaved buffers.

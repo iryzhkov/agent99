@@ -44,6 +44,9 @@ type headlessWorkspace struct {
 	cmd    *exec.Cmd
 	stderr *tailBuffer
 	done   chan struct{}
+	// lastUsed is when a call was last routed here, which is what the idle
+	// sweep in lifecycle.go measures. Guarded by headlessMu.
+	lastUsed time.Time
 }
 
 func (w *headlessWorkspace) session() session {
@@ -96,6 +99,10 @@ func liveLocked() map[string]*headlessWorkspace {
 			os.Remove(ws.Socket)
 			delete(workspaces, root)
 			forgetRoot(root)
+			// Nobody asked for this one to go, so the work that was being
+			// done in it probably is not finished. lifecycle.go starts it
+			// again on the next call that needs it.
+			noteReopenableLocked(root, "its Neovim went away")
 		default:
 		}
 	}
@@ -203,6 +210,8 @@ func openWorkspace(root string) (*headlessWorkspace, error) {
 	if ws := live[abs]; ws != nil {
 		if nvimAlive(ws.Socket) {
 			noteRouted(stickyActive, abs)
+			forgetReopenableLocked(abs)
+			ws.lastUsed = time.Now()
 			return ws, nil
 		}
 		// Listening on the socket but not answering: replace it.
@@ -250,7 +259,8 @@ func openWorkspace(root string) (*headlessWorkspace, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting nvim: %v", err)
 	}
-	ws := &headlessWorkspace{Root: abs, Socket: sock, cmd: cmd, stderr: tail, done: make(chan struct{})}
+	ws := &headlessWorkspace{Root: abs, Socket: sock, cmd: cmd, stderr: tail,
+		done: make(chan struct{}), lastUsed: time.Now()}
 	go func() {
 		cmd.Wait()
 		close(ws.done)
@@ -267,6 +277,8 @@ func openWorkspace(root string) (*headlessWorkspace, error) {
 		if nvimAlive(sock) {
 			workspaces[abs] = ws
 			noteRouted(stickyActive, abs)
+			forgetReopenableLocked(abs)
+			ws.lastUsed = time.Now()
 			return ws, nil
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -297,6 +309,10 @@ func closeWorkspaces(roots []string) []string {
 	for _, ws := range targets {
 		delete(workspaces, ws.Root)
 		forgetRoot(ws.Root)
+		// An explicit close means it. The idle sweep marks its own roots
+		// reopenable after calling this, because that close is the server's
+		// decision rather than the agent's.
+		forgetReopenableLocked(ws.Root)
 	}
 	headlessMu.Unlock()
 

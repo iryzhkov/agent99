@@ -168,6 +168,9 @@ func resolveSession(name string, args map[string]any) (session, error) {
 	if sock := os.Getenv("AGENT99_NVIM"); sock != "" {
 		return session{Root: cwd(), Socket: sock}, nil
 	}
+	// A workspace that died, or that the idle sweep collected, comes back
+	// here rather than turning this call into an error about open_workspace.
+	reviveIfNeeded(args)
 	roots := openRoots()
 	if len(roots) == 0 {
 		// No workspace: the file tools still work against the working

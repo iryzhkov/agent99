@@ -322,6 +322,7 @@ func dispatchMCPTool(name string, arguments map[string]any) (map[string]any, str
 		}
 	}
 	noteCall(name, ses)
+	touchWorkspace(ses.Root)
 	// Which workspace answered is only in question when several are open,
 	// and then it is worth a line: a misrouted call is otherwise invisible.
 	if len(openRoots()) > 1 {
@@ -357,6 +358,10 @@ func mcpHandle(method string, params map[string]any) (map[string]any, bool) {
 
 func runMCP() {
 	defer closeAllWorkspaces()
+	// Sockets left by bridges that are gone, and a sweep that gives back the
+	// memory of a workspace nothing has touched for a while.
+	sweepStaleSockets()
+	startIdleReaper()
 	// A client that terminates the server instead of closing stdin must not
 	// leave a headless Neovim behind.
 	sigs := make(chan os.Signal, 1)
