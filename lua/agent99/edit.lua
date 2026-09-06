@@ -18,6 +18,19 @@ local resolve_symbol, symbol_index, doc_block_start, decl_block_top =
     index.resolve_symbol, index.symbol_index, index.doc_block_start, index.decl_block_top
 
 
+-- The format switch as setup(), AGENT99_FORMAT or a tool call may spell it,
+-- reduced to false, "range" or "file". Anything unrecognized is off, so a
+-- typo cannot turn formatting on.
+local function normalize_format(value)
+    if value == true or value == "range" or value == "on" or value == "true" then
+        return "range"
+    end
+    if value == "file" then
+        return "file"
+    end
+    return false
+end
+
 -- Fresh diagnostics right after an edit, returned inside the edit tool's
 -- own result so problems surface without an extra round.
 -- Post-edit report. Before the edit, diag_snapshot() records every error
@@ -26,17 +39,29 @@ local resolve_symbol, symbol_index, doc_block_start, decl_block_top =
 -- After the edit, post_edit_report() waits for the servers to re-publish,
 -- optionally runs linters, then splits what it sees into new, fixed and
 -- pre-existing, so the model reads what its edit caused and nothing else.
-local function post_edit_options()
+local function post_edit_options(args)
     local ok, config = pcall(require, "agent99.config")
     local opts = ok and config.options and config.options.post_edit
-    return vim.tbl_deep_extend("force", {
+    local merged = vim.tbl_deep_extend("force", {
         wait_ms = 4000,
         commands = {},
         nvim_lint = true,
         lint_timeout_ms = 30000,
-        format = "range",
+        -- Off by default: a server's formatter rewrites whitespace the caller
+        -- chose on purpose often enough that formatting is opt-in, through
+        -- setup(), AGENT99_FORMAT, or the tool call's own `format`.
+        format = false,
         organize_imports = true,
     }, opts or {})
+    local env = os.getenv("AGENT99_FORMAT")
+    if env and env ~= "" then
+        merged.format = env
+    end
+    if type(args) == "table" and args.format ~= nil then
+        merged.format = args.format
+    end
+    merged.format = normalize_format(merged.format)
+    return merged
 end
 
 -- Servers whose only formatting is whole-file and canonical (gofmt), so
@@ -718,7 +743,7 @@ end
 -- polish (format, imports), record the final region in the ledger, and
 -- build the reply with the post-edit report.
 local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_old, old_lines, count, fields, regions)
-    local opts = post_edit_options()
+    local opts = post_edit_options(args)
     local pfirst, pcount, done, extra_old
     if regions and #regions > 1 then
         -- Several edited regions far apart (chunks in different symbols):
@@ -1396,7 +1421,7 @@ local function create_file(args)
     local before = diag_snapshot()
     local bufnr = load_buf(path)
     settle_before_edit(bufnr)
-    local opts = post_edit_options()
+    local opts = post_edit_options(args)
     local _, _, done = polish_after_edit(bufnr, 1, #lines, opts)
     if args.headless then
         write_buf(bufnr)
@@ -1648,7 +1673,7 @@ local function move_symbols(args)
         vim.api.nvim_buf_set_lines(from_buf, moving[i].first - 1, moving[i].last, false, {})
     end
 
-    local opts = post_edit_options()
+    local opts = post_edit_options(args)
     local _, _, polished = polish_after_edit(to_buf, at + 1, #appended, opts)
     if opts.organize_imports then
         organize_imports(from_buf)

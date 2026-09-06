@@ -110,12 +110,18 @@ M.defaults = {
     -- introduced, with counts for what was already there and what it fixed.
     post_edit = {
         wait_ms = 4000,
-        -- After a symbol edit, format the edited region through the server
-        -- ("range"; servers without range formatting, gopls among them,
-        -- format the whole file only when it is a Go file) and run the
-        -- server's organize-imports action, so a new call to a package the
-        -- file does not import yet costs the agent no extra round.
-        format = "range",
+        -- After a symbol edit, optionally format the edited region through
+        -- the server: "range" (servers without range formatting, gopls among
+        -- them, format the whole file only when it is a Go file, confined to
+        -- the edited lines), "file", or false. Off by default, because a
+        -- formatter rewrites whitespace the agent chose on purpose and the
+        -- agent then reads back text it did not write. AGENT99_FORMAT in the
+        -- server's environment overrides this, and a tool call's own
+        -- `format` argument overrides both.
+        format = false,
+        -- Run the server's organize-imports action after an edit, so a new
+        -- call to a package the file does not import yet costs the agent no
+        -- extra round. Touches the import block only.
         organize_imports = true,
         -- Run a linter as well and include its output. Commands per
         -- filetype, with {file}, {dir} and {root} expanded, e.g.

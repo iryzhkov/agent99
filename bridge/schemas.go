@@ -180,7 +180,7 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "replace_symbol_body",
-		Description: "Replace a whole symbol (function/class/method) by name path with new source, declaration line included, matching the file's indentation; doc comments above it are not part of the symbol. Applied to the editor buffer immediately and tracked; returns fresh diagnostics. The region is formatted and imports organized; the reply lists only new diagnostics. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
+		Description: "Replace a whole symbol (function/class/method) by name path with new source, declaration line included, matching the file's indentation; doc comments above it are not part of the symbol. Applied to the editor buffer immediately and tracked; returns fresh diagnostics. Imports are organized, and the text lands as given unless format= asks for the server's formatter; the reply lists only new diagnostics. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -346,7 +346,7 @@ var lspTools = []tool{
 	},
 	{
 		Name: "create_file",
-		Description: "Create a new file with its contents, formatted and with imports organized, " +
+		Description: "Create a new file with its contents, with imports organized (and formatted when format= asks for it), " +
 			"and tell the language servers about it. Missing parent directories are created. Undoable with undo_edit.",
 		InputSchema: map[string]any{
 			"type": "object",
@@ -677,6 +677,18 @@ var writingTools = map[string]bool{
 	"insert_before_symbol": true,
 }
 
+// The edit tools that run the server's formatter over what they wrote when
+// asked to. Formatting is off unless setup(), AGENT99_FORMAT or the call
+// itself turns it on, so each of these takes a format switch.
+var formattingTools = map[string]bool{
+	"replace_symbol_body":  true,
+	"replace_symbol_lines": true,
+	"insert_after_symbol":  true,
+	"insert_before_symbol": true,
+	"create_file":          true,
+	"move_symbols":         true,
+}
+
 // Every edit tool reports diagnostics the same way, and every tool that
 // writes new text can echo the bytes it wrote, so both switches are added
 // to their schemas here rather than repeated in each one.
@@ -699,6 +711,16 @@ func init() {
 				"type": "boolean",
 				"description": "Echo the bytes that landed, as the file now holds them. Use when the text " +
 					"carries escapes or whitespace that must survive the JSON round trip exactly.",
+			}
+		}
+		if formattingTools[lspTools[i].Name] {
+			props["format"] = map[string]any{
+				"type": "string",
+				"enum": []string{"off", "range", "file"},
+				"description": "Run the language server's formatter over the written text afterwards. " +
+					"Default off: the text lands byte for byte as given. \"range\" formats the " +
+					"edited lines (servers with no range formatting, such as gopls, format the " +
+					"file and only the edited lines are kept); \"file\" formats the whole file.",
 			}
 		}
 	}

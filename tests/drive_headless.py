@@ -441,6 +441,25 @@ def main():
         check("undo_edit with empty ledger explains",
               res.get("undone") == [] and "no symbol edits" in res.get("note", ""), res)
 
+        # Formatting is opt-in. Without format= the text lands byte for
+        # byte, odd spacing included; with format="range" the server's
+        # formatter straightens it and the reply says so.
+        ugly = "function M.ugly(x)\n        return x   +  1\nend"
+        res = b.call("insert_after_symbol", {"file": util, "name_path": "M.shout", "text": ugly})
+        with open(util) as f:
+            on_disk = f.read()
+        check("no formatting unless asked",
+              ugly in on_disk and "formatted" not in res.get("polished", ""), res)
+        b.call("undo_edit", {})
+        res = b.call("insert_after_symbol", {"file": util, "name_path": "M.shout",
+                                             "text": ugly, "format": "range"})
+        with open(util) as f:
+            on_disk = f.read()
+        check("format=range runs the formatter",
+              ugly not in on_disk and "return x + 1" in on_disk
+              and "formatted" in res.get("polished", ""), res)
+        b.call("undo_edit", {})
+
         # rename_symbol: dry run touches nothing, the real one reaches the
         # caller in main.lua, undo restores both files.
         res = b.call("rename_symbol", {"file": util, "line": 6, "symbol": "greet",
