@@ -29,6 +29,15 @@ local CHECK_MAX_LINES = 60
 -- because a green check here is easy to mistake for a green project.
 local function guess_check_command(root)
     local function has(rel) return vim.uv.fs_stat(root .. "/" .. rel) ~= nil end
+    -- Whether the project holds files with this extension, taken from the
+    -- file list the rest of the plugin uses (git's, when there is a git) so
+    -- that asking costs no extra walk of the tree.
+    local function has_ext(ext)
+        for _, rel in ipairs(project_files(root)) do
+            if rel:sub(-#ext) == ext then return true end
+        end
+        return false
+    end
     -- `go build ./...` writes a binary named after a lone main package into
     -- the cwd, which fails when a directory of that name exists (a repo with
     -- its main package in ./bridge). vet compiles everything without that.
@@ -43,6 +52,21 @@ local function guess_check_command(root)
         if vim.fn.executable("mypy") == 1 then return "mypy ." end
     end
     if has("CMakeLists.txt") and has("build") then return "cmake --build build" end
+    -- QML has no compiler to run, and qmllint is the check every Qt project
+    -- ends up writing a script around. Two things about it are worth saying
+    -- once here rather than in every project: it takes files rather than a
+    -- directory, and it exits 0 on warnings, while the flag that changes
+    -- that (-W) does not exist on older Qt. The exit code is therefore not
+    -- the gate for this command; the baseline diff is, since a new warning
+    -- is still a new line.
+    if vim.fn.executable("qmllint") == 1 and has_ext(".qml") then
+        return "find . -name '*.qml' -not -path './.git/*' -print0 | xargs -0 -r qmllint",
+            "qmllint reports warnings but still exits 0, so read the new lines rather "
+            .. "than the exit code. It also checks one import path: types it cannot "
+            .. "resolve are reported as warnings that say nothing about your change, "
+            .. "which the baseline absorbs on the first call. Pass command= with your "
+            .. "own -I flags when that noise hides real findings."
+    end
     return nil
 end
 
@@ -113,12 +137,13 @@ local function check_project(args)
     local from_env = os.getenv("AGENT99_CHECK")
     if not cmds and from_env and from_env ~= "" then cmds = { from_env } end
     if not cmds and configured and configured ~= "" then cmds = { configured } end
-    local guessed = false
+    local guessed, guess_note = false, nil
     if not cmds then
-        local guess = guess_check_command(root)
+        local guess, note = guess_check_command(root)
         if guess then
             cmds = { guess }
             guessed = true
+            guess_note = note
         end
     end
     if not cmds then
@@ -189,6 +214,7 @@ local function check_project(args)
             .. "project, pass a better one: commands=[...] runs several (one per build "
             .. "configuration), and remember=true makes it the default for this root "
             .. "for the rest of the session."
+        out.about_this_command = guess_note
     end
     local key = root .. "\0" .. cmd
     local base = check_baseline[key]

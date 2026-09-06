@@ -152,6 +152,39 @@ check("map_region leaves an untouched buffer alone",
     first_line == 5 and last_line == 6 and #extra == 0,
     { first_line, last_line, extra })
 
+-- The QML JavaScript guard. A .js file that opens with QML's own directives
+-- is not JavaScript any TypeScript server can parse, so the server that
+-- attached to it is detached and what it published is discarded; this is the
+-- detection that decides it. No server is needed to check the decision, and
+-- none of the ones the smoke test can start would attach to a .js file
+-- anyway.
+local core = require("agent99.core")
+
+local function named_buffer(name, lines)
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(bufnr, name)
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+    return bufnr
+end
+
+check("a .pragma header marks a file as QML JavaScript",
+    core.dialect_note(named_buffer("/tmp/agent99-unit/Sanitize.js",
+        { "// helpers", "", ".pragma library", "function f() {}" })) ~= nil)
+
+check("an .import header counts too",
+    core.dialect_note(named_buffer("/tmp/agent99-unit/Helper.js",
+        { '.import "Sanitize.js" as Sanitize', "function g() {}" })) ~= nil)
+
+-- The directives come before any code. A dot at the start of a line further
+-- down is a method call split across lines, not a QML header.
+check("plain JavaScript is left alone",
+    core.dialect_note(named_buffer("/tmp/agent99-unit/plain.js",
+        { "const x = 1;", ".pragma library" })) == nil)
+
+check("a .qml file is not a JavaScript library",
+    core.dialect_note(named_buffer("/tmp/agent99-unit/Panel.qml",
+        { ".pragma library" })) == nil)
+
 if failures > 0 then
     io.stdout:write(("unit_edit: %d failed\n"):format(failures))
     vim.cmd("cquit 1")

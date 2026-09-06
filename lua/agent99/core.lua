@@ -279,6 +279,99 @@ local function load_buf(file)
     return bufnr, path
 end
 
+-- A .js file in a QML project is not the JavaScript a TypeScript server
+-- knows. It may open with QML's own directives - `.pragma library`, or
+-- `.import "Other.js" as Other` - which are a syntax error to every other
+-- JavaScript parser, so tsserver reports "Declaration or statement
+-- expected" on line 1 and "Type assertion expressions can only be used in
+-- TypeScript files" on line 2, of every such file, after every edit.
+--
+-- Those errors say nothing about the code, and a diagnostics block that is
+-- known to be wrong teaches the caller to stop reading it, which is exactly
+-- when a real error slips past. The file itself is fine: it stays a
+-- javascript buffer, so treesitter, the symbol index and the edit tools all
+-- work on it as before. Only the server that cannot parse it is sent away.
+local function qml_js_buf(bufnr, path)
+    path = path or vim.api.nvim_buf_get_name(bufnr)
+    if not (path:sub(-3) == ".js" or path:sub(-4) == ".mjs") then
+        return false
+    end
+    if not vim.api.nvim_buf_is_loaded(bufnr) then
+        return false
+    end
+    -- The directives come first in the file; only blank lines and comments
+    -- may precede them, so the first line of real code settles the question.
+    for _, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, 20, false)) do
+        if line:match("^%s*%.pragma%s") or line:match("^%s*%.import%s") then
+            return true
+        end
+        local text = line:gsub("^%s+", "")
+        if text ~= "" and text:sub(1, 2) ~= "//" and text:sub(1, 2) ~= "/*"
+            and text:sub(1, 1) ~= "*" then
+            return false
+        end
+    end
+    return false
+end
+
+-- Servers that would parse such a file as JavaScript or TypeScript. qmlls is
+-- deliberately not here: a project that has it should keep it attached.
+local JS_SERVERS = {
+    ts_ls = true, tsserver = true, vtsls = true, typescript_tools = true,
+    denols = true, eslint = true, biome = true, quick_lint_js = true,
+    oxlint = true, flow = true,
+}
+
+-- What to say instead of a diagnostics verdict for a file no attached server
+-- can judge, as opposed to one they judged and found clean.
+local function dialect_note(bufnr)
+    if qml_js_buf(bufnr) then
+        return "this is QML JavaScript (a .pragma/.import header), which no JavaScript "
+            .. "or TypeScript server can parse; the one that attached was detached and "
+            .. "its errors on this file discarded. Nothing checked this edit - qmllint "
+            .. "over the .qml files that import this one is the gate (check_project "
+            .. "runs it)."
+    end
+    return nil
+end
+
+local function drop_mismatched_client(client, bufnr)
+    pcall(vim.lsp.buf_detach_client, bufnr, client.id)
+    -- What the server already published goes with it. Without this the
+    -- errors outlive the detach, in the buffer and in vim.diagnostic.get,
+    -- and every later edit is charged with them.
+    for _, pull in ipairs({ false, true }) do
+        local okns, ns = pcall(vim.lsp.diagnostic.get_namespace, client.id, pull)
+        if okns and ns then
+            pcall(vim.diagnostic.reset, ns, bufnr)
+        end
+    end
+end
+
+vim.api.nvim_create_autocmd("LspAttach", {
+    group = vim.api.nvim_create_augroup("agent99_dialect", { clear = true }),
+    callback = function(ev)
+        local id = ev.data and ev.data.client_id
+        if type(id) ~= "number" then
+            return
+        end
+        local client = vim.lsp.get_client_by_id(id)
+        if not client or not JS_SERVERS[client.name] then
+            return
+        end
+        if not qml_js_buf(ev.buf) then
+            return
+        end
+        -- Detaching from inside the attach callback would run while the
+        -- client is still setting the buffer up.
+        vim.schedule(function()
+            if vim.api.nvim_buf_is_valid(ev.buf) then
+                drop_mismatched_client(client, ev.buf)
+            end
+        end)
+    end,
+})
+
 -- Buffers loaded within this window may have a server still indexing its
 -- project (tsserver, gopls on a big module); whole-project queries that
 -- come back near-empty are retried once after a pause.
@@ -521,5 +614,6 @@ M.decl_line = decl_line
 M.expand_glob = expand_glob
 M.has_parser = has_parser
 M.client_for = client_for
+M.dialect_note = dialect_note
 
 return M

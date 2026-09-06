@@ -12,7 +12,7 @@ local err, await, sleep, load_buf, rel_path = core.err, core.await, core.sleep, 
 local get_client, request, client_for, write_buf = core.get_client, core.request, core.client_for, core.write_buf
 local make_position, resync_open_buffers, disk_moved_on = core.make_position, core.resync_open_buffers, core.disk_moved_on
 local sync_buf, notify_changed_files, save_all = core.sync_buf, core.notify_changed_files, core.save_all
-local notify_watched_files = core.notify_watched_files
+local notify_watched_files, dialect_note = core.notify_watched_files, core.dialect_note
 local position_params, fresh_buf, enabled_lsp_configs_for =
     core.position_params, core.fresh_buf, core.enabled_lsp_configs_for
 local resolve_symbol, symbol_index, doc_block_start, decl_block_top =
@@ -1052,6 +1052,11 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         report.diagnostics_after = "not checked: the language server does not analyze this "
             .. "file in its current configuration (" .. not_analyzed .. "). An edit here is "
             .. "unverified - build or test with the tags that include it."
+    elseif bufnr and dialect_note(bufnr) then
+        -- A file whose language server was sent away because it cannot parse
+        -- this dialect. Same shape of answer as the build-tag case above: the
+        -- edit is real, and nothing checked it.
+        report.diagnostics_after = "not checked: " .. dialect_note(bufnr)
     elseif not attached and bufnr then
         report.diagnostics_after = "no language server attached to this file; nothing checked"
     elseif not bufnr then
@@ -1956,6 +1961,238 @@ local function rename_symbol(args)
     return result
 end
 
+-- ---------------------------------------------------------------------------
+-- replace_pattern: the same shape of change in many places.
+--
+-- Not every bulk edit is a rename. When a call site moves from one receiver
+-- to another (root.finiteNum(x) -> Sanitize.finiteNum(x)) the identifier the
+-- language server knows does not change at all, so rename_symbol has nothing
+-- to offer, and a hundred replace_symbol_lines chunks is not a real option.
+-- That left the shell, and a sed -i over the file is outside everything this
+-- plugin exists for: no ledger, no diagnostics, no idea what it touched.
+--
+-- This keeps it inside the editor - the same buffers, the same undo ledger,
+-- the same verdict afterwards - and adds the one thing sed cannot do, which
+-- is to leave a match inside a comment or a string literal alone.
+
+local MAX_PATTERN_FILES = 400
+
+-- The files a pattern call works over, absolute and deduplicated.
+local function pattern_files(args)
+    local wanted, glob_note = {}, nil
+    for _, f in ipairs(args.files or {}) do
+        wanted[#wanted + 1] = f
+    end
+    if type(args.glob) == "string" and args.glob ~= "" then
+        local paths, why = core.expand_glob(args.root, args.glob)
+        glob_note = why
+        vim.list_extend(wanted, paths)
+    end
+    if #wanted == 0 then
+        err("%s", glob_note
+            or "no files to work on: pass files (array of paths) and/or glob")
+    end
+    local seen, out = {}, {}
+    for _, f in ipairs(wanted) do
+        local path = vim.fn.fnamemodify(f, ":p")
+        if not seen[path] then
+            seen[path] = true
+            local rel = rel_path(path)
+            local is_test = core.is_test_path(rel)
+            if args.tests == "only" and not is_test then
+                -- filtered out
+            elseif args.tests == "exclude" and is_test then
+                -- filtered out
+            else
+                out[#out + 1] = path
+            end
+        end
+    end
+    return out
+end
+
+-- The Vim regex a call's pattern and replacement become. literal=true means
+-- the caller wants the bytes it wrote and nothing about them read as syntax,
+-- on both sides; otherwise the pattern is very magic (\v), which is close to
+-- an extended regular expression, and \1..\9 in the replacement are groups.
+local function pattern_regex(args)
+    local pattern, replacement = args.pattern, args.replacement
+    -- \C: case sensitive whatever 'ignorecase' is set to in this editor. A
+    -- bulk replace that quietly matched more or less depending on a user
+    -- setting would be the worst kind of surprise. A caller who wants the
+    -- other behaviour puts \c in the pattern, which wins for being later.
+    if args.literal then
+        -- \V: backslash is the only character left with a meaning in the
+        -- pattern. & ~ and \ are the ones with a meaning in a replacement.
+        return "\\C\\V" .. vim.fn.escape(pattern, "\\"),
+            vim.fn.escape(replacement, "\\&~")
+    end
+    return "\\C\\v" .. pattern, replacement
+end
+
+-- Every match of `re` in `line`, as 0-based [start, stop) byte pairs.
+local function match_spans(re, line)
+    local spans, from = {}, 0
+    while from <= #line do
+        local s, e = re:match_str(line:sub(from + 1))
+        if not s then break end
+        s, e = from + s, from + e
+        if e <= s then
+            -- A zero-width match replaces nothing and would loop here
+            -- forever; the pattern is not one this tool can act on.
+            return spans, true
+        end
+        spans[#spans + 1] = { s, e }
+        from = e
+    end
+    return spans, false
+end
+
+local function replace_pattern(args)
+    local pattern, replacement = args.pattern, args.replacement
+    if type(pattern) ~= "string" or pattern == "" then
+        err("missing required argument: pattern")
+    end
+    if type(replacement) ~= "string" then
+        err("missing required argument: replacement (\"\" deletes the match)")
+    end
+    if pattern:find("\n", 1, true) then
+        err("pattern matches within one line; a multi-line pattern is not supported "
+            .. "(replace_symbol_body or replace_symbol_lines take a whole block)")
+    end
+    local kind = args.kind
+    if kind ~= nil and kind ~= "code" and kind ~= "comment" and kind ~= "string" then
+        err("kind must be code, comment or string")
+    end
+    if args.tests ~= nil and args.tests ~= "exclude" and args.tests ~= "only" then
+        err("tests must be exclude or only")
+    end
+    local pat, rep = pattern_regex(args)
+    local okr, re = pcall(vim.regex, pat)
+    if not okr then
+        err("the pattern does not compile: %s. It is a Vim regex in very magic mode "
+            .. "(\\v), close to an extended regular expression; literal=true takes the "
+            .. "text as bytes instead.", tostring(re):gsub("\n", " "))
+    end
+    local files = pattern_files(args)
+    local capped = 0
+    if #files > MAX_PATTERN_FILES then
+        capped = #files - MAX_PATTERN_FILES
+        files = vim.list_slice(files, 1, MAX_PATTERN_FILES)
+    end
+
+    local per_file, samples = {}, {}
+    local total, skipped_total, unreadable, zero_width = 0, 0, {}, false
+    local pending = {}
+    for _, path in ipairs(files) do
+        local okb, bufnr = pcall(load_buf, path)
+        if not okb then
+            unreadable[#unreadable + 1] = rel_path(path)
+        else
+            local old = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+            local new = {}
+            local hits, skipped = 0, 0
+            for i, line in ipairs(old) do
+                local spans, degenerate = match_spans(re, line)
+                if degenerate then zero_width = true end
+                if #spans == 0 then
+                    new[i] = line
+                elseif not kind then
+                    -- No classification to do, so the whole line goes
+                    -- through Vim's own substitute: anchors, groups and
+                    -- lookaround all behave exactly as they would in the
+                    -- editor.
+                    new[i] = vim.fn.substitute(line, pat, rep, "g")
+                    hits = hits + #spans
+                else
+                    local out, from = {}, 0
+                    for _, span in ipairs(spans) do
+                        local at = index.classify_hit(bufnr, i, span[1] + 1)
+                        local want = kind == "code"
+                            and not (at == "comment" or at == "string")
+                            or kind == at
+                        out[#out + 1] = line:sub(from + 1, span[1])
+                        local text = line:sub(span[1] + 1, span[2])
+                        if want then
+                            out[#out + 1] = vim.fn.substitute(text, pat, rep, "")
+                            hits = hits + 1
+                        else
+                            out[#out + 1] = text
+                            skipped = skipped + 1
+                        end
+                        from = span[2]
+                    end
+                    out[#out + 1] = line:sub(from + 1)
+                    new[i] = table.concat(out)
+                end
+                if new[i] ~= line and #samples < 8 then
+                    samples[#samples + 1] = ("%s:%d"):format(rel_path(path), i)
+                    samples[#samples + 1] = "- " .. line
+                    samples[#samples + 1] = "+ " .. new[i]
+                end
+            end
+            total = total + hits
+            skipped_total = skipped_total + skipped
+            if hits > 0 or skipped > 0 then
+                per_file[#per_file + 1] = {
+                    file = path,
+                    replacements = hits > 0 and hits or nil,
+                    left_alone = skipped > 0 and skipped or nil,
+                }
+            end
+            if hits > 0 then
+                pending[#pending + 1] = { bufnr = bufnr, old = old, new = new }
+            end
+        end
+    end
+
+    local result = {
+        pattern = pattern,
+        replacement = replacement,
+        total_replacements = total,
+        files_matched = #per_file,
+        files = #per_file > 0 and per_file or nil,
+        samples = #samples > 0 and samples or nil,
+    }
+    if skipped_total > 0 then
+        result.left_alone = ("%d matches are inside a comment or a string literal and "
+            .. "were not replaced (kind=%s)"):format(skipped_total, kind)
+    end
+    if #unreadable > 0 then
+        result.unreadable = unreadable
+    end
+    if capped > 0 then
+        result.note = ("%d further files were not looked at (cap: %d); narrow with "
+            .. "glob= or files="):format(capped, MAX_PATTERN_FILES)
+    end
+    if zero_width then
+        result.warning = "the pattern can match nothing at some positions (a zero-width "
+            .. "match); those positions were left alone, and the count above may be short"
+    end
+    if total == 0 then
+        result.summary = "no replacements: nothing matched"
+            .. (skipped_total > 0 and ", except in comments and string literals" or "")
+        return result
+    end
+    if args.dry_run then
+        result.dry_run = true
+        result.note = "nothing applied; call again without dry_run to replace"
+        return result
+    end
+
+    settle_before_edit(pending[1].bufnr)
+    local before = diag_snapshot()
+    for _, p in ipairs(pending) do
+        vim.api.nvim_buf_set_lines(p.bufnr, 0, -1, false, p.new)
+        record_edit(p.bufnr, "replace_pattern " .. pattern, "pattern",
+            1, #p.old, p.old, p.new)
+    end
+    result.note = edit_note(args)
+    return vim.tbl_extend("error", result,
+        post_edit_report(pending[1].bufnr, before, args.root, args.headless, nil,
+            args.full_diagnostics))
+end
+
 local FILE_OP_CAPABILITY = {
     ["workspace/willCreateFiles"] = "willCreate",
     ["workspace/didCreateFiles"] = "didCreate",
@@ -2374,6 +2611,11 @@ local function move_symbols(args)
         to = rel_path(to_path),
         created = created or nil,
         note = edit_note(args),
+        -- What no diagnostic covers: a definition the extraction duplicated
+        -- rather than moved, or a helper whose last caller went with the
+        -- symbols, is unreferenced and unreferenced is not an error.
+        when_finished = ("unreferenced_symbols on %s finds anything the move left "
+            .. "behind with no callers"):format(rel_path(vim.fn.fnamemodify(args.from, ":p"))),
     }
     if #polished > 0 then
         result.polished = table.concat(polished, ", ")
@@ -2402,6 +2644,7 @@ M.replace_symbol_lines = replace_symbol_lines
 M.insert_symbol_tool = insert_symbol_tool
 M.undo_edit = undo_edit
 M.rename_symbol = rename_symbol
+M.replace_pattern = replace_pattern
 M.create_file = create_file
 M.move_file = move_file
 M.delete_file = delete_file

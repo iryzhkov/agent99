@@ -452,6 +452,26 @@ def group_index(c):
             check("a shell variable is editable as a symbol",
                   'MODE="${1:-fast}"' in f.read(), res)
 
+    reset(c)
+    # unreferenced_symbols: the sweep an extract-to-module refactor needs,
+    # because nothing else reports a definition left behind. messy.lua holds
+    # a function nothing calls.
+    messy = os.path.join(root, "lua", "testproj", "messy.lua")
+    res = b.call("unreferenced_symbols", {"file": messy})
+    names = [s["name"] for s in res.get("unreferenced", [])]
+    check("unreferenced_symbols finds what nothing calls",
+          "M.noop" in names and res.get("count", 0) >= 1, res)
+    # M.greet is called from main.lua, so it is not a finding - as long as
+    # the server links the two files at all.
+    refs = b.call("references", {"file": util, "line": 6, "symbol": "greet"})
+    if refs.get("count", 0) <= 1:
+        print("SKIP unreferenced_symbols cross-file check: no references from main.lua")
+    else:
+        res = b.call("unreferenced_symbols", {"file": util})
+        names = [s["name"] for s in res.get("unreferenced", [])]
+        check("unreferenced_symbols keeps quiet about a symbol with callers",
+              "M.greet" not in names, res)
+
 
 def group_edit(c):
     """The symbol edit tools: whole bodies, line ranges by number, text or
@@ -777,6 +797,63 @@ def group_edit(c):
     except RuntimeError as e:
         check("match names the symbol the text is really in",
               "not in M.greet" in str(e) and "buffer lines 11-11" in str(e), e)
+
+    reset(c)
+    # replace_pattern: the same change in many places, where a rename does
+    # not apply. dry_run counts without touching anything.
+    res = b.call("replace_pattern", {
+        "files": [util, main_lua], "pattern": "util.greet",
+        "replacement": "util.hello", "literal": True, "dry_run": True,
+    })
+    check("replace_pattern dry_run counts and changes nothing",
+          res.get("total_replacements") == 1 and res.get("dry_run") is True
+          and "util.greet" in open(main_lua).read()
+          and "util.hello" not in open(main_lua).read(), res)
+    res = b.call("replace_pattern", {
+        "files": [util, main_lua], "pattern": "util.greet",
+        "replacement": "util.hello", "literal": True,
+    })
+    check("replace_pattern applies and reports a verdict",
+          res.get("total_replacements") == 1
+          and "util.hello" in open(main_lua).read()
+          and res.get("diagnostics_after") is not None, res)
+    b.call("undo_edit", {})
+    check("replace_pattern is undoable",
+          "util.greet" in open(main_lua).read()
+          and "util.hello" not in open(main_lua).read(), None)
+
+    reset(c)
+    # kind=code is the thing sed cannot do: the only "hello" in util.lua is
+    # inside a string literal, so it is left alone with the filter and
+    # replaced without it.
+    res = b.call("replace_pattern", {
+        "files": [util], "pattern": "hello", "replacement": "howdy",
+        "literal": True, "kind": "code",
+    })
+    check("replace_pattern kind=code leaves a string literal alone",
+          res.get("total_replacements") == 0 and "left_alone" in res
+          and 'return "hello, " .. name' in open(util).read(), res)
+    res = b.call("replace_pattern", {
+        "files": [util], "pattern": "hello", "replacement": "howdy", "literal": True,
+    })
+    check("replace_pattern without kind replaces it",
+          res.get("total_replacements") == 1
+          and 'return "howdy, " .. name' in open(util).read(), res)
+
+    reset(c)
+    # A very magic pattern with a group, and a pattern that does not compile.
+    res = b.call("replace_pattern", {
+        "files": [util], "pattern": "return \"(hello), \"", "replacement": "return \"\\1! \"",
+    })
+    check("replace_pattern uses very magic groups",
+          res.get("total_replacements") == 1
+          and 'return "hello! " .. name' in open(util).read(), res)
+    try:
+        b.call("replace_pattern", {"files": [util], "pattern": "(unclosed", "replacement": "x"})
+        check("replace_pattern refuses a bad pattern", False, "call succeeded")
+    except RuntimeError as e:
+        check("replace_pattern refuses a bad pattern", "does not compile" in str(e), e)
+    reset(c)
 
 
 def group_verdict(c):

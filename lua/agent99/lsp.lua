@@ -41,6 +41,7 @@ local replace_symbol_body, replace_symbol_lines = edit.replace_symbol_body, edit
 local insert_symbol_tool, undo_edit, rename_symbol = edit.insert_symbol_tool, edit.undo_edit, edit.rename_symbol
 local create_file, move_file, delete_file, move_symbols = edit.create_file, edit.move_file, edit.delete_file,
     edit.move_symbols
+local replace_pattern = edit.replace_pattern
 
 local install = require("agent99.install")
 local check_project, workspace_support, install_language = install.check_project, install.workspace_support,
@@ -497,6 +498,204 @@ end
 
 
 
+-- ---------------------------------------------------------------------------
+-- unreferenced_symbols: what an extract-to-module refactor leaves behind.
+--
+-- Moving a group of functions into a new module and rewriting their call
+-- sites leaves the original definitions in place unless something removes
+-- them, and nothing complains: an unreferenced function is not an error to a
+-- language server, and a project linter does not report one either. Every
+-- edit along the way honestly answers "no new errors or warnings", and the
+-- dead copy ships. This is the sweep that finds it, and the one thing worth
+-- running at the end of an extraction.
+
+local MAX_UNREFERENCED_FILES = 40
+
+local MAX_UNREFERENCED_SYMBOLS = 200
+
+-- Every whole-word occurrence of `name` in the project, as file/line pairs.
+-- The fallback for a file whose language has no server that answers
+-- references (QML is one), which is the sweep a careful caller does by hand.
+local function textual_hits(root, name)
+    local cmd
+    if vim.fn.executable("rg") == 1 then
+        cmd = { "rg", "--no-heading", "--line-number", "--word-regexp",
+            "--fixed-strings", "--", name, root }
+    elseif vim.fn.executable("grep") == 1 then
+        cmd = { "grep", "-rnwI", "--", name, root }
+    else
+        return nil
+    end
+    local out = vim.fn.systemlist(cmd)
+    -- Both searchers exit 1 for "nothing matched", which is an answer.
+    if vim.v.shell_error > 1 then
+        return nil
+    end
+    local hits = {}
+    for _, line in ipairs(out) do
+        local path, lnum = line:match("^(.-):(%d+):")
+        if path then
+            hits[#hits + 1] = { file = path, line = tonumber(lnum) }
+        end
+    end
+    return hits
+end
+
+-- The line inside the symbol that carries its name, which is where a
+-- reference request has to be made from. Almost always the first line; a
+-- grammar that puts the name on the line after the keyword is the reason
+-- this looks past it.
+local function name_line(lines, entry)
+    -- The reference request has to sit on the name itself. An entry named
+    -- "M.noop" would put it on the M, and the answer would then be about M:
+    -- its other uses are real references and the symbol looks alive. The
+    -- last component is the one being declared here.
+    local name = entry.name:match("[^%.:/]+$") or entry.name
+    for lnum = entry.first, math.min(entry.last, entry.first + 2) do
+        local text = lines[lnum]
+        if text and text:find(name, 1, true) then
+            return lnum, name
+        end
+    end
+    return nil
+end
+
+-- How many places outside the symbol's own body mention it. nil means the
+-- question could not be answered, which is not the same as zero and is
+-- reported as such.
+local function references_outside(bufnr, path, entry, lines, client, root, cache, want_tests)
+    local function counts(list, file_of)
+        local n = 0
+        for _, hit in ipairs(list) do
+            local file, lnum = file_of(hit)
+            local own = file == path and lnum >= entry.first and lnum <= entry.last
+            if not own and (want_tests or not core.is_test_path(rel_path(file))) then
+                n = n + 1
+            end
+        end
+        return n
+    end
+    if client then
+        local lnum, name = name_line(lines, entry)
+        if not lnum then
+            return nil
+        end
+        local okp, params = pcall(position_params, bufnr, client,
+            { line = lnum, symbol = name })
+        if not okp then
+            return nil
+        end
+        params.context = { includeDeclaration = false }
+        local okr, result = pcall(request, client, bufnr, "textDocument/references", params)
+        if not okr then
+            return nil
+        end
+        -- A server with nothing to report answers with an empty list or with
+        -- nothing at all; both mean zero references, and only a request that
+        -- failed means the question went unanswered.
+        if result == nil then
+            result = {}
+        end
+        if type(result) ~= "table" then
+            return nil
+        end
+        return counts(result, function(loc)
+            local uri = loc.uri or loc.targetUri
+            local range = loc.range or loc.targetSelectionRange
+            return uri and vim.uri_to_fname(uri) or path,
+                range and (range.start.line + 1) or 0
+        end)
+    end
+    if cache[entry.name] == nil then
+        cache[entry.name] = textual_hits(root, entry.name) or false
+    end
+    local hits = cache[entry.name]
+    if hits == false then
+        return nil
+    end
+    return counts(hits, function(hit) return hit.file, hit.line end)
+end
+
+local function unreferenced_symbols(args)
+    local files = {}
+    if type(args.file) == "string" and args.file ~= "" then
+        files[#files + 1] = args.file
+    end
+    for _, f in ipairs(args.files or {}) do
+        files[#files + 1] = f
+    end
+    local glob_note
+    if type(args.glob) == "string" and args.glob ~= "" then
+        local paths, why = core.expand_glob(args.root, args.glob)
+        glob_note = why
+        vim.list_extend(files, paths)
+    end
+    if #files == 0 then
+        err("%s", glob_note or "no files to check: pass file, files or glob")
+    end
+    local capped = 0
+    if #files > MAX_UNREFERENCED_FILES then
+        capped = #files - MAX_UNREFERENCED_FILES
+        files = vim.list_slice(files, 1, MAX_UNREFERENCED_FILES)
+    end
+    local root = args.root
+    if type(root) ~= "string" or root == "" then
+        root = vim.fn.getcwd()
+    end
+    local dead, unknown, methods, cache = {}, {}, {}, {}
+    local checked = 0
+    for _, f in ipairs(files) do
+        local okb, bufnr = pcall(load_buf, f)
+        if okb then
+            local path = vim.api.nvim_buf_get_name(bufnr)
+            local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+            local client = core.client_for(bufnr, "textDocument/references")
+            methods[client and "language server" or "text search"] = true
+            for _, e in ipairs(symbol_index(bufnr)) do
+                -- Top-level names only. A method is reached through its
+                -- receiver, and a zero-reference answer for one says more
+                -- about the server than about the code.
+                if e.name and e.name ~= "" and not e.path:find("/", 1, true)
+                    and checked < MAX_UNREFERENCED_SYMBOLS then
+                    checked = checked + 1
+                    local n = references_outside(bufnr, path, e, lines, client, root,
+                        cache, args.include_tests)
+                    local entry = { file = path, line = e.first, name = e.path, kind = e.kind }
+                    if n == nil then
+                        unknown[#unknown + 1] = entry
+                    elseif n == 0 then
+                        dead[#dead + 1] = entry
+                    end
+                end
+            end
+        end
+    end
+    local method_names = vim.tbl_keys(methods)
+    table.sort(method_names)
+    local res = {
+        symbols_checked = checked,
+        count = #dead,
+        unreferenced = #dead > 0 and dead or nil,
+        method = #method_names > 0 and table.concat(method_names, " and ") or nil,
+    }
+    if #unknown > 0 then
+        res.not_answered = unknown
+        res.not_answered_note = "no reference answer for these; they are not a finding either way"
+    end
+    if capped > 0 then
+        res.note = ("%d further files were not checked (cap: %d)"):format(capped, MAX_UNREFERENCED_FILES)
+    end
+    if #dead > 0 then
+        res.summary = "nothing outside its own body mentions these names. A symbol that is "
+            .. "this file's public API, reached by reflection or a string, or used from a "
+            .. "file the search cannot see (another build configuration, another language) "
+            .. "lands here too, so read each one before deleting it."
+    else
+        res.summary = "every top-level symbol in these files is referenced somewhere else"
+    end
+    return res
+end
+
 local dispatch_table = {
     definition = location_tool("textDocument/definition"),
     type_definition = location_tool("textDocument/typeDefinition"),
@@ -554,11 +753,13 @@ local dispatch_table = {
     insert_before_symbol = insert_symbol_tool("before"),
     undo_edit = undo_edit,
     rename_symbol = rename_symbol,
+    replace_pattern = replace_pattern,
     create_file = create_file,
     move_file = move_file,
     delete_file = delete_file,
     move_symbols = move_symbols,
     check_project = check_project,
+    unreferenced_symbols = unreferenced_symbols,
     enclosing_symbols = enclosing_symbols,
     -- Internal: the bridge reports a disk read so the code window can follow.
     ui_follow = function(args)

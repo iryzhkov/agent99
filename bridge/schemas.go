@@ -251,7 +251,7 @@ var lspTools = []tool{
 			"root records a baseline; later calls report only new and resolved lines. Use " +
 			"after a refactor or before finishing. Without arguments it uses the configured " +
 			"command, AGENT99_CHECK, or a guess (go build+vet, tsc --noEmit, cargo check, " +
-			"pyright) - all type checks, none of which run tests. When that is the wrong gate, " +
+			"pyright, qmllint) - all static checks, none of which run tests. When that is the wrong gate, " +
 			"pass your own: commands=[...] runs several in turn (one per build configuration) " +
 			"and reports every failure, and remember=true makes them the default for this root, kept across workspaces.",
 		InputSchema: map[string]any{
@@ -270,6 +270,29 @@ var lspTools = []tool{
 		},
 	},
 	{
+		Name: "unreferenced_symbols",
+		Description: "Top-level symbols in these files that nothing outside their own body mentions. " +
+			"Run it after extracting code into a module or deleting a caller: a definition left " +
+			"behind is not an error to any language server and not a warning to any linter, so " +
+			"every edit reports clean and the dead copy ships. Uses the language server's " +
+			"references where there is one, a whole-word project search where there is not. " +
+			"A public API, a name reached by reflection or from a build configuration the search " +
+			"cannot see lands here too: read each one before deleting it.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"file":  map[string]any{"type": "string", "description": "One file to check."},
+				"files": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Several files to check."},
+				"glob":  map[string]any{"type": "string", "description": "Path glob relative to root, e.g. src/**/*.go; subdirectories need a **/ prefix."},
+				"include_tests": map[string]any{
+					"type":        "boolean",
+					"description": "Count references from test files as uses. Default false, so a symbol only its own test still calls is reported.",
+				},
+			},
+			"required": []string{},
+		},
+	},
+	{
 		Name:        "rename_symbol",
 		Description: "Rename the symbol at a position project-wide through the language server. dry_run lists affected files first. Undoable with undo_edit.",
 		InputSchema: map[string]any{
@@ -283,6 +306,41 @@ var lspTools = []tool{
 				"dry_run":  map[string]any{"type": "boolean", "description": "Only report what would change."},
 			},
 			"required": []string{"file", "line", "new_name"},
+		},
+	},
+	{
+		Name: "replace_pattern",
+		Description: "The same textual change in many places, for the bulk edits a rename cannot " +
+			"express: a call site's receiver changes (root.finiteNum -> Sanitize.finiteNum), an " +
+			"argument is added, a constant is spelled differently. Use it instead of leaving for " +
+			"a shell sed: the edits go through the buffers, the undo ledger and the diagnostics " +
+			"report like any other edit. pattern is a Vim regex in very magic mode (close to an " +
+			"extended regular expression; \\1..\\9 in the replacement are its groups), or plain " +
+			"text with literal=true. It matches within one line. kind=code leaves matches inside " +
+			"comments and string literals alone, which a regex cannot do on its own. dry_run " +
+			"reports the counts and sample lines first.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"pattern":     map[string]any{"type": "string", "description": "Vim regex in very magic mode, or plain text with literal=true. Matches within one line."},
+				"replacement": map[string]any{"type": "string", "description": "What each match becomes; \"\" deletes it. \\1..\\9 are the pattern's groups unless literal=true."},
+				"literal":     map[string]any{"type": "boolean", "description": "Take both pattern and replacement as plain text, with nothing in them read as regex syntax."},
+				"files": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Files to work over (optional if glob is given).",
+				},
+				"glob": map[string]any{"type": "string", "description": "Path glob relative to root, e.g. src/**/*.go; subdirectories need a **/ prefix."},
+				"kind": map[string]any{
+					"type": "string",
+					"enum": []string{"code", "comment", "string"},
+					"description": "Replace only matches of this kind, classified by treesitter: code skips " +
+						"comments and string literals, comment/string keep only those. Without it every match is replaced.",
+				},
+				"tests":   map[string]any{"type": "string", "enum": []string{"exclude", "only"}, "description": "exclude = production code only; only = test files only. Matched on the path, so it is exact."},
+				"dry_run": map[string]any{"type": "boolean", "description": "Report what would change (per-file counts and sample lines) without applying it."},
+			},
+			"required": []string{"pattern", "replacement"},
 		},
 	},
 	{

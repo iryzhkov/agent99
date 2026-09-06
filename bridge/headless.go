@@ -273,7 +273,9 @@ func openWorkspace(root string) (*headlessWorkspace, error) {
 	}
 	if max := maxWorkspaces(); len(workspaces) >= max {
 		return nil, fmt.Errorf("%d workspaces are already open (%s) and the limit is %d; "+
-			"close one first (each is a Neovim with its own language servers)",
+			"close one first (each is a Neovim with its own language servers), or raise "+
+			"AGENT99_MAX_WORKSPACES in the server's environment if this machine has the "+
+			"memory for another",
 			len(workspaces), strings.Join(rootsLocked(), ", "), max)
 	}
 
@@ -425,6 +427,7 @@ var editTools = map[string]bool{
 	"apply_code_action":    true,
 	"undo_edit":            true,
 	"rename_symbol":        true,
+	"replace_pattern":      true,
 	// The file-lifecycle tools write the file themselves, but a server may
 	// have rewritten other files' imports in response, and those land in
 	// buffers like any other edit.
