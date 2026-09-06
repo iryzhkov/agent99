@@ -166,15 +166,29 @@ func runReadFile(ses session, args map[string]any) (string, error) {
 	var out []string
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	total, next := 0, 0
 	for i := 1; scanner.Scan(); i++ {
+		total = i
 		if i < offset {
 			continue
 		}
 		if i >= offset+limit {
-			out = append(out, fmt.Sprintf("... (truncated at %d lines)", limit))
+			next = i
 			break
 		}
 		out = append(out, fmt.Sprintf("%d: %s", i, scanner.Text()))
+	}
+	if next > 0 {
+		// Read on to the end without keeping the lines, so the hint can say
+		// how much of the file is still ahead and not only where to resume.
+		// A truncated read otherwise costs a second call just to find out
+		// whether one more is worth making.
+		for scanner.Scan() {
+			total++
+		}
+		out = append(out, fmt.Sprintf(
+			"... (truncated: lines %d-%d of %d; continue with offset=%d)",
+			offset, next-1, total, next))
 	}
 	if err := scanner.Err(); err != nil {
 		return "", err

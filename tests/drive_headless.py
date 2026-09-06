@@ -158,6 +158,14 @@ def main():
             text = r["result"]["content"][0]["text"]
             check("read_file returns text when the outline is trivial",
                   text.startswith("1: items:") and "600: " in text, text[:120])
+            # A truncated read says where to resume and how much is left, so
+            # finding that out does not cost another call.
+            r = b.rpc("tools/call", {"name": "read_file",
+                                     "arguments": {"path": big, "offset": 1, "limit": 100}})
+            text = r["result"]["content"][0]["text"]
+            check("a truncated read points at the rest",
+                  "lines 1-100 of 601" in text and "offset=101" in text,
+                  text[-200:])
             os.remove(big)
 
         # A stale offset with the right expect is refused, and the refusal
