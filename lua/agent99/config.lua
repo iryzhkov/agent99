@@ -105,11 +105,17 @@ M.defaults = {
         idle_ms = 10 * 60 * 1000,
     },
     -- What a symbol edit tool reports back after applying: it waits for the
-    -- language servers to re-publish (up to post_edit.wait_ms, returning as
-    -- soon as they settle) and lists only the errors/warnings the edit
+    -- language servers' verdict and lists only the errors/warnings the edit
     -- introduced, with counts for what was already there and what it fixed.
+    -- The wait ends settle_ms after the last diagnostics publish, or
+    -- settle_ms after every server has answered a request sent with the
+    -- change without publishing (a push-only server such as lua_ls stays
+    -- silent when an edit changed no diagnostic), and never later than
+    -- wait_ms. Raise settle_ms for a server that takes longer than that to
+    -- publish after it has taken in a change.
     post_edit = {
         wait_ms = 4000,
+        settle_ms = 300,
         -- After a symbol edit, optionally format the edited region through
         -- the server: "range" (servers without range formatting, gopls among
         -- them, format the whole file only when it is a Go file, confined to

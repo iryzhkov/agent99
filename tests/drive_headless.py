@@ -460,6 +460,18 @@ def main():
               and "formatted" in res.get("polished", ""), res)
         b.call("undo_edit", {})
 
+        # A clean edit must not idle out post_edit.wait_ms (4 s): lua_ls
+        # publishes nothing when the diagnostics did not change, and the
+        # barrier request sent with the edit is what lets the wait end.
+        t0 = time.time()
+        res = b.call("insert_after_symbol", {"file": util, "name_path": "M.shout",
+                                             "text": "function M.quick() return 2 end"})
+        took = time.time() - t0
+        check("clean edit returns well before the ceiling",
+              took < 2.5 and res.get("diagnostics_after") == "no new errors or warnings",
+              "%.2fs %s" % (took, res))
+        b.call("undo_edit", {})
+
         # rename_symbol: dry run touches nothing, the real one reaches the
         # caller in main.lua, undo restores both files.
         res = b.call("rename_symbol", {"file": util, "line": 6, "symbol": "greet",

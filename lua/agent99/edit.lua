@@ -44,6 +44,7 @@ local function post_edit_options(args)
     local opts = ok and config.options and config.options.post_edit
     local merged = vim.tbl_deep_extend("force", {
         wait_ms = 4000,
+        settle_ms = 300,
         commands = {},
         nvim_lint = true,
         lint_timeout_ms = 30000,
@@ -359,9 +360,19 @@ local function diag_snapshot()
     return counts
 end
 
--- Wait until diagnostics for bufnr change (any server), then a short
--- settle window for servers that publish twice (syntax, then semantic).
--- Returns once nothing has changed for settle_ms or the deadline passes.
+-- Wait for the servers' verdict on the buffer without idling out the whole
+-- ceiling when they have nothing to say. Returns once the diagnostics have
+-- changed and then held still for settle_ms, once every server has
+-- acknowledged the change and settle_ms passed with no publish, or when
+-- wait_ms runs out.
+--
+-- The acknowledgement matters because a push-only server (lua_ls is one)
+-- does not republish when an edit left its diagnostics as they were, so
+-- silence alone cannot be told apart from "still analyzing" and every
+-- clean edit used to cost the full ceiling. Servers publish within a
+-- fraction of settle_ms of taking a change in (lua_ls: 50-80 ms after it
+-- answers a request sent with the change), so silence after the reply is
+-- a verdict. A server slower than that per edit needs a larger settle_ms.
 local function wait_for_diagnostics(bufnr, wait_ms, settle_ms)
     local deadline = vim.uv.now() + wait_ms
     local last_change = nil
@@ -371,13 +382,43 @@ local function wait_for_diagnostics(bufnr, wait_ms, settle_ms)
         buffer = bufnr,
         callback = function() last_change = vim.uv.now() end,
     })
+    -- One cheap request per server, sent right after the change. A server
+    -- answers it only once it has taken the change in, so the reply is
+    -- proof the edit was seen; from then on settle_ms of silence means no
+    -- diagnostics are coming. The result is discarded: it is a barrier, not
+    -- a query. (Asking pull-capable servers for textDocument/diagnostic
+    -- instead was tried and dropped: pyright answers the pull and pushes as
+    -- well, and every diagnostic then appeared twice.)
+    local pending, acked_at = 0, nil
+    local function answered()
+        pending = pending - 1
+        if pending == 0 then acked_at = vim.uv.now() end
+    end
+    local uri = vim.uri_from_bufnr(bufnr)
+    for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+        local method, params
+        if c:supports_method("textDocument/documentSymbol", bufnr) then
+            method = "textDocument/documentSymbol"
+            params = { textDocument = { uri = uri } }
+        elseif c:supports_method("textDocument/hover", bufnr) then
+            method = "textDocument/hover"
+            params = { textDocument = { uri = uri }, position = { line = 0, character = 0 } }
+        end
+        if method and c:request(method, params, answered, bufnr) then
+            pending = pending + 1
+        end
+    end
+    -- With no server to ask, the ceiling is all there is.
     local changed = false
     while vim.uv.now() < deadline do
+        local now = vim.uv.now()
         if last_change then
             changed = true
-            if vim.uv.now() - last_change >= settle_ms then break end
+            if now - last_change >= settle_ms then break end
+        elseif acked_at and pending == 0 and now - acked_at >= settle_ms then
+            break
         end
-        sleep(100)
+        sleep(50)
     end
     pcall(vim.api.nvim_del_augroup_by_id, group)
     return changed
@@ -402,7 +443,7 @@ local function settle_before_edit(bufnr)
     end
     local okc = pcall(get_client, bufnr, "textDocument/didOpen", 3000)
     if okc then
-        wait_for_diagnostics(bufnr, 2500, 300)
+        wait_for_diagnostics(bufnr, 2500, post_edit_options().settle_ms)
     end
 end
 
@@ -450,7 +491,7 @@ local function post_edit_report(bufnr, before, root, headless, opts, full)
     end
     local attached = bufnr ~= nil and #vim.lsp.get_clients({ bufnr = bufnr }) > 0
     if attached then
-        wait_for_diagnostics(bufnr, opts.wait_ms, 300)
+        wait_for_diagnostics(bufnr, opts.wait_ms, opts.settle_ms)
     end
     local report = {}
     -- AGENT99_LINT_<FILETYPE> in the environment (handy for `claude mcp add
