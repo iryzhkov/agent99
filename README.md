@@ -651,6 +651,18 @@ on the bundled `tests/testproj`, then asserts on real lua_ls results
 through the MCP bridge. lua-language-server must be on PATH or in mason's
 bin directory.
 
+It runs four suites in turn: `mcp` (the bridge attached to a live Neovim,
+`tests/drive_mcp.py`), `headless` (the standalone server and every edit
+tool, `tests/drive_headless.py`), `multi` (several workspaces at once) and
+`debug`. Naming suites narrows the run while iterating: `tests/smoke.sh
+headless`, or `make smoke SUITES="headless multi"`. A partial run says so
+on its last line; run the full suite with no arguments before committing,
+because the suites share the Lua and the bridge and a change that passes
+one can still break another. The `headless` suite is by far the longest
+(some 35 edit calls, each waiting up to `post_edit.wait_ms` for a server
+that publishes nothing when the edit changed no diagnostic), so `multi`
+and `debug` together run in under half a minute.
+
 `tests/drive_multi.py` opens two copies of `tests/testproj` side by side
 and checks the routing between them: the overlap and limit refusals, an
 absolute path reaching its own workspace, `workspace=<root>`, a relative
