@@ -12,6 +12,7 @@ local err, await, sleep, load_buf, rel_path = core.err, core.await, core.sleep, 
 local get_client, request, client_for, write_buf = core.get_client, core.request, core.client_for, core.write_buf
 local make_position, resync_open_buffers, disk_moved_on = core.make_position, core.resync_open_buffers, core.disk_moved_on
 local sync_buf, notify_changed_files, save_all = core.sync_buf, core.notify_changed_files, core.save_all
+local notify_watched_files = core.notify_watched_files
 local position_params, fresh_buf, enabled_lsp_configs_for =
     core.position_params, core.fresh_buf, core.enabled_lsp_configs_for
 local resolve_symbol, symbol_index, doc_block_start, decl_block_top =
@@ -1881,11 +1882,44 @@ local function file_op_clients(method)
     return out
 end
 
+-- The same operation as watched-file changes, which is how a server learns
+-- that its view of the project is out of date: a rename is the old path
+-- gone and the new path arrived.
+local WATCHED_CREATED, WATCHED_DELETED = 1, 3
+
+local function watched_changes_for(method, files)
+    local changes = {}
+    local function add(uri, type)
+        if uri then changes[#changes + 1] = { uri = uri, type = type } end
+    end
+    for _, f in ipairs(files) do
+        if method == "workspace/didCreateFiles" then
+            add(f.uri, WATCHED_CREATED)
+        elseif method == "workspace/didDeleteFiles" then
+            add(f.uri, WATCHED_DELETED)
+        elseif method == "workspace/didRenameFiles" then
+            add(f.oldUri, WATCHED_DELETED)
+            add(f.newUri, WATCHED_CREATED)
+        end
+    end
+    return changes
+end
+
 -- Tell every interested server that files appeared, moved or went away.
 local function notify_file_operation(method, files)
-    for _, client in ipairs(file_op_clients(method)) do
-        pcall(function() client:notify(method, { files = files }) end)
+    -- workspace/didCreateFiles is deliberately never sent. gopls answers "No
+    -- packages found for open file" for a file it is told about that way
+    -- before it has analyzed the document, and keeps answering it, so the
+    -- file created here would stay unanalyzed for the rest of the session
+    -- (measured: creating a Go file with the notification breaks it, without
+    -- it the same file analyzes at once). The watched-files change below is
+    -- what a server reloads its view of the project from anyway.
+    if method ~= "workspace/didCreateFiles" then
+        for _, client in ipairs(file_op_clients(method)) do
+            pcall(function() client:notify(method, { files = files }) end)
+        end
     end
+    notify_watched_files(watched_changes_for(method, files))
 end
 
 -- Ask the servers what else has to change for this operation, and apply it.

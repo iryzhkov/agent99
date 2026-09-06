@@ -210,20 +210,29 @@ function M.save_all()
     return failures
 end
 
--- Tell every language server that these files changed underneath it. A
--- server reads unopened files from disk and caches what it found, so until it
--- is told otherwise it keeps answering from the old content.
-local function notify_changed_files(paths)
-    if #paths == 0 then return end
-    local changes = {}
-    for _, path in ipairs(paths) do
-        changes[#changes + 1] = { uri = vim.uri_from_fname(path), type = 2 }
-    end
+-- Tell every language server what happened to a set of files on disk, as
+-- the watcher it would otherwise rely on: each change is a uri and a type
+-- (1 created, 2 changed, 3 deleted). This is the notification a server
+-- reloads its own view of the project from, so a file that appears or goes
+-- away reaches the package or module graph and not only the open buffer.
+local function notify_watched_files(changes)
+    if #changes == 0 then return end
     for _, client in ipairs(vim.lsp.get_clients()) do
         pcall(function()
             client:notify("workspace/didChangeWatchedFiles", { changes = changes })
         end)
     end
+end
+
+-- Tell every language server that these files changed underneath it. A
+-- server reads unopened files from disk and caches what it found, so until it
+-- is told otherwise it keeps answering from the old content.
+local function notify_changed_files(paths)
+    local changes = {}
+    for _, path in ipairs(paths) do
+        changes[#changes + 1] = { uri = vim.uri_from_fname(path), type = 2 }
+    end
+    notify_watched_files(changes)
 end
 
 -- Bring every buffer back in line with disk and tell the servers what moved.
@@ -476,6 +485,7 @@ M.disk_moved_on = disk_moved_on
 M.sync_buf = sync_buf
 M.write_buf = write_buf
 M.notify_changed_files = notify_changed_files
+M.notify_watched_files = notify_watched_files
 M.resync_open_buffers = resync_open_buffers
 M.load_buf = load_buf
 M.fresh_buf = fresh_buf
