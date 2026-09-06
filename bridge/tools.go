@@ -813,9 +813,11 @@ func callTool(name string, args map[string]any, ses session) (string, error) {
 		}
 		return out, nil
 	}
+	var out string
+	var err error
 	switch name {
 	case "read_file":
-		out, err := runReadFile(ses, args)
+		out, err = runReadFile(ses, args)
 		if err == nil && os.Getenv("AGENT99_NO_LSP") == "" {
 			// Let the editor's code window follow the read (best-effort).
 			nvimCall(ses.Socket, "ui_follow", map[string]any{
@@ -823,11 +825,39 @@ func callTool(name string, args map[string]any, ses session) (string, error) {
 				"line": argInt(args, "offset", 1),
 			})
 		}
-		return out, err
 	case "grep":
-		return runGrep(ses, args)
+		out, err = runGrep(ses, args)
 	case "list_files":
-		return runListFiles(ses, args)
+		out, err = runListFiles(ses, args)
+	default:
+		return "", fmt.Errorf("unknown tool: %s", name)
 	}
-	return "", fmt.Errorf("unknown tool: %s", name)
+	if err != nil {
+		return "", err
+	}
+	return out + verdictCarry(ses), nil
+}
+
+// verdictCarry fetches what the editor owes from earlier edits - verdicts
+// deferred by wait=false, diagnostics that arrived after their report - so
+// a reply produced outside the editor (grep, read_file, list_files) carries
+// them too, as the editor's own replies do. Best-effort: with no editor to
+// ask, or nothing owed, it adds nothing.
+func verdictCarry(ses session) string {
+	if ses.Socket == "" || os.Getenv("AGENT99_NO_LSP") != "" {
+		return ""
+	}
+	result, err := nvimCall(ses.Socket, "verdict_carry", map[string]any{})
+	if err != nil {
+		return ""
+	}
+	m, ok := result.(map[string]any)
+	if !ok || len(m) == 0 {
+		return ""
+	}
+	text, err := renderJSON(m)
+	if err != nil {
+		return ""
+	}
+	return "\n\nfrom earlier edits:\n" + string(text)
 }

@@ -188,6 +188,9 @@ local DIAG_GROUP_SHOW = 3
 
 local function diagnostics(args)
     local bufnr = load_buf(args.file)
+    -- A verdict still owed on an earlier edit is settled first: reading the
+    -- diagnostics before the server has answered would show the old set.
+    edit.flush_deferred(true)
     -- Same reason as before an edit: a file changed by another tool is stale
     -- in the server until it is told, and this file's diagnostics may depend
     -- on it.
@@ -564,6 +567,10 @@ local dispatch_table = {
         end)
         return { ok = true }
     end,
+    -- Internal: a reply produced outside the editor (grep, read_file) asks
+    -- for what earlier edits still owe; the dispatcher attaches it to this
+    -- empty result like to any other.
+    verdict_carry = function() return {} end,
 }
 
 -- Turn absolute "file" fields (and changed_files lists) into paths relative
@@ -596,7 +603,19 @@ function M.dispatch(tool, args)
         err("unknown tool: %s", tostring(tool))
     end
     local result = fn(args or {})
-    if tool ~= "ui_follow" and tool ~= "enclosing_symbols" then
+    -- ui_follow and enclosing_symbols are the bridge's own calls in the
+    -- middle of serving a read or a grep, not replies the agent sees: they
+    -- take no carry (it would vanish) and keep absolute paths.
+    local internal = tool == "ui_follow" or tool == "enclosing_symbols"
+    -- Verdicts owed from earlier edits (deferred by wait=false, or
+    -- diagnostics that arrived after their report) ride on this reply.
+    if not internal and type(result) == "table"
+        and (vim.tbl_isempty(result) or not vim.islist(result)) then
+        for k, v in pairs(edit.take_carry()) do
+            if result[k] == nil then result[k] = v end
+        end
+    end
+    if not internal then
         result = relativize(result)
     end
     return result

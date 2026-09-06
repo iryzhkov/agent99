@@ -714,6 +714,13 @@ func init() {
 			}
 		}
 		if formattingTools[lspTools[i].Name] {
+			props["wait"] = map[string]any{
+				"type": "boolean",
+				"description": "Default true: the reply carries the language server's verdict on the edit. " +
+					"false: return as soon as the text is in; the verdict comes with the next reply, " +
+					"whatever tool produces it, under deferred_verdicts. Use it for a run of edits " +
+					"you will check together.",
+			}
 			props["format"] = map[string]any{
 				"type": "string",
 				"enum": []string{"off", "range", "file"},

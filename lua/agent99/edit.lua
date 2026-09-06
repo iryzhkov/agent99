@@ -45,6 +45,7 @@ local function post_edit_options(args)
     local merged = vim.tbl_deep_extend("force", {
         wait_ms = 4000,
         settle_ms = 300,
+        wait = true,
         commands = {},
         nvim_lint = true,
         lint_timeout_ms = 30000,
@@ -62,6 +63,17 @@ local function post_edit_options(args)
         merged.format = args.format
     end
     merged.format = normalize_format(merged.format)
+    -- wait=false defers the verdict to the next reply; the environment
+    -- switch serves the standalone server, the argument one call.
+    local wait_env = os.getenv("AGENT99_POST_EDIT_WAIT")
+    if wait_env == "0" or wait_env == "false" or wait_env == "off" then
+        merged.wait = false
+    elseif wait_env and wait_env ~= "" then
+        merged.wait = true
+    end
+    if type(args) == "table" and args.wait ~= nil then
+        merged.wait = args.wait ~= false
+    end
     return merged
 end
 
@@ -349,7 +361,12 @@ local function diag_signature(d)
     return ("%s|%s|%s"):format(vim.api.nvim_buf_get_name(d.bufnr), d.severity, message)
 end
 
+-- Defined further down; a snapshot must not be taken while a verdict is
+-- still owed, or the owed diagnostics would be charged to the next edit.
+local flush_deferred
+
 local function diag_snapshot()
+    if flush_deferred then flush_deferred(true) end
     local counts = {}
     for _, d in ipairs(vim.diagnostic.get(nil)) do
         if d.severity <= vim.diagnostic.severity.WARN then
@@ -360,40 +377,111 @@ local function diag_snapshot()
     return counts
 end
 
--- Wait for the servers' verdict on the buffer without idling out the whole
--- ceiling when they have nothing to say. Returns once the diagnostics have
--- changed and then held still for settle_ms, once every server has
--- acknowledged the change and settle_ms passed with no publish, or when
--- wait_ms runs out.
+-- ---------------------------------------------------------------------------
+-- The verdict on an edit: when the servers have said all they will say.
 --
--- The acknowledgement matters because a push-only server (lua_ls is one)
--- does not republish when an edit left its diagnostics as they were, so
--- silence alone cannot be told apart from "still analyzing" and every
--- clean edit used to cost the full ceiling. Servers publish within a
--- fraction of settle_ms of taking a change in (lua_ls: 50-80 ms after it
--- answers a request sent with the change), so silence after the reply is
--- a verdict. A server slower than that per edit needs a larger settle_ms.
-local function wait_for_diagnostics(bufnr, wait_ms, settle_ms)
-    local deadline = vim.uv.now() + wait_ms
-    local last_change = nil
-    local group = vim.api.nvim_create_augroup("agent99_post_edit_" .. bufnr, { clear = true })
-    vim.api.nvim_create_autocmd("DiagnosticChanged", {
-        group = group,
-        buffer = bufnr,
-        callback = function() last_change = vim.uv.now() end,
-    })
-    -- One cheap request per server, sent right after the change. A server
-    -- answers it only once it has taken the change in, so the reply is
-    -- proof the edit was seen; from then on settle_ms of silence means no
-    -- diagnostics are coming. The result is discarded: it is a barrier, not
-    -- a query. (Asking pull-capable servers for textDocument/diagnostic
-    -- instead was tried and dropped: pyright answers the pull and pushes as
-    -- well, and every diagnostic then appeared twice.)
-    local pending, acked_at = 0, nil
-    local function answered()
-        pending = pending - 1
-        if pending == 0 then acked_at = vim.uv.now() end
+-- A push-only server (lua_ls is one) does not republish when an edit left
+-- its diagnostics as they were, so silence alone cannot be told apart from
+-- "still analyzing", and every clean edit used to cost the whole wait_ms
+-- ceiling. Three things resolve that:
+--
+--  * A barrier: one cheap request per server, sent with the change. A server
+--    answers it only once it has taken the change in, so the reply is proof
+--    the edit was seen, and settle_ms of silence after it means no
+--    diagnostics are coming. The reply itself is discarded. (Asking
+--    pull-capable servers for textDocument/diagnostic instead was tried and
+--    dropped: pyright answers the pull and pushes as well, and every
+--    diagnostic then appeared twice.)
+--  * Learning: how long after the barrier reply a server's diagnostics
+--    arrived is recorded per workspace and server, and the settle used for
+--    that server follows the longest lag seen with a margin, once enough
+--    publishes have been observed. Diagnostics that turn up after a report
+--    went out count as a miss and raise it at once.
+--  * Late delivery: whatever arrives after a report was sent is carried in
+--    the next reply, so a wrong estimate delays attribution rather than
+--    losing the diagnostic. With post_edit.wait off the whole report is
+--    deferred that way and the edit tool returns as soon as the text is in.
+
+-- When each buffer last had diagnostics published, and by which server,
+-- from one listener that outlives any single wait.
+local last_publish = {}    -- [bufnr] = { at = ms, by = { [client.name] = ms } }
+
+local function client_names_of(diags)
+    local names = {}
+    for _, d in ipairs(diags or {}) do
+        local ns = d.namespace and vim.diagnostic.get_namespace(d.namespace)
+        local name = ns and ns.name and ns.name:match("^nvim%.lsp%.(.-)%.%d+")
+        if name then names[name] = true end
     end
+    return names
+end
+
+vim.api.nvim_create_autocmd("DiagnosticChanged", {
+    group = vim.api.nvim_create_augroup("agent99_verdict", { clear = true }),
+    callback = function(ev)
+        local now = vim.uv.now()
+        local rec = last_publish[ev.buf] or { by = {} }
+        last_publish[ev.buf] = rec
+        rec.at = now
+        local names = client_names_of(ev.data and ev.data.diagnostics)
+        if next(names) == nil then
+            -- A cleared set names nobody; credit every attached server.
+            for _, c in ipairs(vim.lsp.get_clients({ bufnr = ev.buf })) do
+                names[c.name] = true
+            end
+        end
+        for name in pairs(names) do rec.by[name] = now end
+    end,
+})
+
+-- Publish lag learned over the session, per workspace root and server: the
+-- last few gaps between a server acknowledging a change and publishing
+-- diagnostics for it. A ring rather than a running maximum, so one slow
+-- moment stops mattering after a handful of ordinary publishes.
+local publish_lag = {}    -- [root][client.name] = { lags = { ms, ... }, next = i, n = count }
+local last_ack = {}       -- [root][client.name] = ms, the newest barrier reply anywhere
+local SETTLE_FLOOR_MS = 100
+local LEARN_AFTER = 3
+local LAG_RING = 10
+
+local function per_root(tbl, root)
+    local t = tbl[root or ""] or {}
+    tbl[root or ""] = t
+    return t
+end
+
+local function note_publish_lag(root, name, lag)
+    local e = per_root(publish_lag, root)[name] or { lags = {}, next = 1, n = 0 }
+    per_root(publish_lag, root)[name] = e
+    e.lags[e.next] = lag
+    e.next = e.next % LAG_RING + 1
+    e.n = e.n + 1
+end
+
+-- The settle to use for these servers: the configured value until enough
+-- has been seen of a server, then 1.5x the longest recent publish lag plus
+-- 50 ms, never below the floor nor above the ceiling. Several servers: the
+-- largest.
+local function settle_for(root, names, configured, ceiling)
+    local settle = nil
+    for _, name in ipairs(names or {}) do
+        local e = per_root(publish_lag, root)[name]
+        local ms = configured
+        if e and e.n >= LEARN_AFTER then
+            local worst = 0
+            for _, lag in pairs(e.lags) do worst = math.max(worst, lag) end
+            ms = math.floor(worst * 1.5 + 50)
+        end
+        ms = math.max(SETTLE_FLOOR_MS, math.min(ms, ceiling))
+        if not settle or ms > settle then settle = ms end
+    end
+    return settle or configured
+end
+
+-- Send the barrier to every server attached to bufnr. Returns the ack
+-- table the wait polls: acks[name] is false until that server replied.
+local function send_barriers(bufnr, root)
+    local acks, names = {}, {}
     local uri = vim.uri_from_bufnr(bufnr)
     for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
         local method, params
@@ -404,24 +492,208 @@ local function wait_for_diagnostics(bufnr, wait_ms, settle_ms)
             method = "textDocument/hover"
             params = { textDocument = { uri = uri }, position = { line = 0, character = 0 } }
         end
-        if method and c:request(method, params, answered, bufnr) then
-            pending = pending + 1
+        local name = c.name
+        local function acked()
+            acks[name] = vim.uv.now()
+            per_root(last_ack, root)[name] = acks[name]
+        end
+        if method and c:request(method, params, acked, bufnr) then
+            acks[name] = false
+            names[#names + 1] = name
         end
     end
-    -- With no server to ask, the ceiling is all there is.
-    local changed = false
-    while vim.uv.now() < deadline do
-        local now = vim.uv.now()
-        if last_change then
-            changed = true
-            if now - last_change >= settle_ms then break end
-        elseif acked_at and pending == 0 and now - acked_at >= settle_ms then
-            break
+    return acks, names
+end
+
+local function all_acked(acks)
+    local last = nil
+    for _, at in pairs(acks) do
+        if not at then return nil end
+        if not last or at > last then last = at end
+    end
+    return last
+end
+
+-- Whether the servers have said all they will about the change made at
+-- `since`: a publish followed by `settle` of quiet, or every barrier
+-- answered and `settle` of quiet after the last answer.
+local function verdict_in(bufnr, since, acks, settle)
+    local now = vim.uv.now()
+    local lp = last_publish[bufnr]
+    if lp and lp.at >= since then
+        return now - lp.at >= settle, true
+    end
+    local acked = all_acked(acks)
+    if acked and next(acks) ~= nil then
+        return now - acked >= settle, false
+    end
+    return false, false
+end
+
+-- Record what a publish on bufnr since `since` says about each server's
+-- lag: the gap from that server's newest acknowledgement anywhere in the
+-- workspace, since an edit elsewhere can be what changed this buffer's
+-- diagnostics. Publishes later than `within` after the acknowledgement are
+-- not lessons: that is a server re-checking the workspace on its own
+-- schedule (lua_ls does so three seconds after a change), and waiting for
+-- those on every edit would cost more than the late delivery does.
+local function learn_from(bufnr, root, since, within)
+    local lp = last_publish[bufnr]
+    if not (lp and lp.at >= since) then return end
+    for name, at in pairs(lp.by) do
+        local ack = per_root(last_ack, root)[name]
+        if at >= since and ack then
+            local lag = math.max(0, at - ack)
+            if not within or lag <= within then
+                note_publish_lag(root, name, lag)
+            end
         end
+    end
+end
+
+-- Wait for the verdict on bufnr, at most wait_ms from `since` (default now).
+-- Returns whether diagnostics were published for the change.
+local function wait_for_diagnostics(bufnr, root, wait_ms, settle_ms, since, acks, names)
+    since = since or vim.uv.now()
+    if not acks then acks, names = send_barriers(bufnr, root) end
+    local settle = settle_for(root, names, settle_ms, wait_ms)
+    local deadline = since + wait_ms
+    local done, published = verdict_in(bufnr, since, acks, settle)
+    while not done and vim.uv.now() < deadline do
         sleep(50)
+        done, published = verdict_in(bufnr, since, acks, settle)
     end
-    pcall(vim.api.nvim_del_augroup_by_id, group)
-    return changed
+    learn_from(bufnr, root, since, nil)
+    return published
+end
+
+-- Reports not yet delivered: verdicts deferred by wait=false, and
+-- diagnostics that arrived after a report went out. Both ride on the next
+-- reply, whatever tool produces it.
+local deferred = {}   -- [bufnr] = { since, acks, names, before, root, headless, opts, full, label }
+local watched = {}    -- [bufnr] = { reported_at, after, names, root, label, settle_ms, wait_ms }
+local carry = {}      -- what the next reply takes along
+
+local WATCH_MS = 60 * 1000
+
+local function edit_label(kind, bufnr)
+    return ("%s on %s"):format(kind, rel_path(vim.api.nvim_buf_get_name(bufnr)))
+end
+
+-- Signature counts for one buffer, the unit the late report diffs.
+local function buf_snapshot(bufnr)
+    local counts = {}
+    if not vim.api.nvim_buf_is_valid(bufnr) then return counts end
+    for _, d in ipairs(vim.diagnostic.get(bufnr)) do
+        if d.severity <= vim.diagnostic.severity.WARN then
+            local sig = diag_signature(d)
+            counts[sig] = (counts[sig] or 0) + 1
+        end
+    end
+    return counts
+end
+
+-- After a report on bufnr went out, remember what it showed so anything
+-- the server adds afterwards can be told apart and delivered.
+local function watch_after_report(bufnr, root, names, opts, label)
+    if not bufnr then return end
+    watched[bufnr] = {
+        reported_at = vim.uv.now(), after = buf_snapshot(bufnr),
+        names = names or {}, root = root, label = label,
+        settle_ms = opts.settle_ms, wait_ms = opts.wait_ms,
+    }
+end
+
+-- Diagnostics that arrived on watched buffers since their report: a diff of
+-- that buffer against what the report showed, added to the carry.
+local function collect_late()
+    local now = vim.uv.now()
+    for bufnr, w in pairs(watched) do
+        local lp = last_publish[bufnr]
+        if not vim.api.nvim_buf_is_valid(bufnr) or now - w.reported_at > WATCH_MS then
+            watched[bufnr] = nil
+        elseif lp and lp.at > w.reported_at then
+            local current = buf_snapshot(bufnr)
+            local added, gone = {}, 0
+            for _, d in ipairs(vim.diagnostic.get(bufnr)) do
+                if d.severity <= vim.diagnostic.severity.WARN then
+                    local sig = diag_signature(d)
+                    if (w.after[sig] or 0) > 0 then
+                        w.after[sig] = w.after[sig] - 1
+                    else
+                        added[#added + 1] = ("%s line %d: %s"):format(
+                            vim.diagnostic.severity[d.severity], d.lnum + 1, d.message)
+                    end
+                end
+            end
+            for _, n in pairs(w.after) do gone = gone + n end
+            if #added > 0 or gone > 0 then
+                local item = {
+                    after = w.label,
+                    file = vim.api.nvim_buf_get_name(bufnr),
+                    arrived = ("%d ms after that reply"):format(lp.at - w.reported_at),
+                }
+                if #added > 0 then item.new = added end
+                if gone > 0 then item.gone = gone .. " diagnostics reported then are no longer there" end
+                carry.late_diagnostics = carry.late_diagnostics or {}
+                carry.late_diagnostics[#carry.late_diagnostics + 1] = item
+                -- A near miss teaches: the server took a little longer than
+                -- the settle allowed, so the settle grows. A publish far
+                -- beyond it is the server's own re-check and only delivered.
+                local settle = settle_for(w.root, w.names, w.settle_ms, w.wait_ms)
+                learn_from(bufnr, w.root, w.reported_at, 2 * settle + 200)
+            end
+            w.after = current
+            w.reported_at = now
+        end
+    end
+end
+
+-- Forward declaration: post_edit_report is defined below and resolves a
+-- deferred entry into the report it would have been.
+local post_edit_report
+
+-- Deliver deferred verdicts: the ripe ones always, the rest only when
+-- `wait` is true (an edit or a diagnostics read is about to take a
+-- snapshot, and an unresolved verdict would be charged to it).
+function flush_deferred(wait)
+    for bufnr, d in pairs(deferred) do
+        if not vim.api.nvim_buf_is_valid(bufnr) then
+            deferred[bufnr] = nil
+        else
+            local settle = settle_for(d.root, d.names, d.opts.settle_ms, d.opts.wait_ms)
+            local ripe = verdict_in(bufnr, d.since, d.acks, settle)
+                or vim.uv.now() >= d.since + d.opts.wait_ms
+            if ripe or wait then
+                deferred[bufnr] = nil
+                local opts = vim.tbl_extend("force", d.opts, { wait = true })
+                local report = post_edit_report(bufnr, d.before, d.root, d.headless, opts, d.full,
+                    { since = d.since, acks = d.acks, names = d.names, label = d.label })
+                report.edit = d.label
+                report.file = vim.api.nvim_buf_get_name(bufnr)
+                carry.deferred_verdicts = carry.deferred_verdicts or {}
+                carry.deferred_verdicts[#carry.deferred_verdicts + 1] = report
+            else
+                carry.still_pending = carry.still_pending or {}
+                carry.still_pending[#carry.still_pending + 1] = d.label
+            end
+        end
+    end
+end
+
+-- What the reply about to leave takes along, and a reset for the next one.
+-- Called by the dispatcher on every tool result.
+local function take_carry()
+    collect_late()
+    flush_deferred(false)
+    local out = carry
+    carry = {}
+    local pending = out.still_pending
+    if type(pending) == "table" then
+        out.still_pending = ("%d edit(s) await the server's verdict, which comes with a later reply: %s")
+            :format(#pending, table.concat(pending, "; "))
+    end
+    return out
 end
 
 -- Before the first edit in a freshly loaded file, give its server time to
@@ -443,7 +715,7 @@ local function settle_before_edit(bufnr)
     end
     local okc = pcall(get_client, bufnr, "textDocument/didOpen", 3000)
     if okc then
-        wait_for_diagnostics(bufnr, 2500, post_edit_options().settle_ms)
+        wait_for_diagnostics(bufnr, nil, 2500, post_edit_options().settle_ms)
     end
 end
 
@@ -478,8 +750,13 @@ end
 -- report can say "no change" instead of listing them again.
 local last_prior_key = nil
 
-local function post_edit_report(bufnr, before, root, headless, opts, full)
+-- ctx (optional): label = what the edit was, for the deferred and late
+-- reports; since/acks/names = the barrier already sent, when resolving a
+-- deferred verdict rather than judging a fresh edit.
+function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     opts = opts or post_edit_options()
+    ctx = ctx or {}
+    local label = ctx.label or (bufnr and edit_label("edit", bufnr)) or "edit"
     local ft = bufnr and vim.bo[bufnr].filetype or ""
     -- Kick nvim-lint before waiting so its diagnostics join the same report.
     if opts.nvim_lint and bufnr then
@@ -490,8 +767,22 @@ local function post_edit_report(bufnr, before, root, headless, opts, full)
         end
     end
     local attached = bufnr ~= nil and #vim.lsp.get_clients({ bufnr = bufnr }) > 0
+    local since, acks, names = ctx.since or vim.uv.now(), ctx.acks, ctx.names
+    if attached and not acks then
+        acks, names = send_barriers(bufnr, root)
+    end
+    if attached and not opts.wait and not ctx.since then
+        deferred[bufnr] = {
+            since = since, acks = acks, names = names, before = before, root = root,
+            headless = headless, opts = opts, full = full, label = label,
+        }
+        return {
+            diagnostics_after = "deferred: the server's verdict on this edit comes with the next reply "
+                .. "(under deferred_verdicts); nothing was waited for",
+        }
+    end
     if attached then
-        wait_for_diagnostics(bufnr, opts.wait_ms, opts.settle_ms)
+        wait_for_diagnostics(bufnr, root, opts.wait_ms, opts.settle_ms, since, acks, names)
     end
     local report = {}
     -- AGENT99_LINT_<FILETYPE> in the environment (handy for `claude mcp add
@@ -623,6 +914,7 @@ local function post_edit_report(bufnr, before, root, headless, opts, full)
     if fixed > 0 then
         report.fixed = fixed .. " diagnostics from before the edit are gone"
     end
+    watch_after_report(bufnr, root, names, opts, label)
     return report
 end
 
@@ -847,7 +1139,8 @@ local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_o
             .. "in the request, the escape did not survive the round trip"):format(table.concat(odd, ", "))
     end
     return vim.tbl_extend("error", fields,
-        post_edit_report(bufnr, before, args.root, args.headless, opts, args.full_diagnostics))
+        post_edit_report(bufnr, before, args.root, args.headless, opts, args.full_diagnostics,
+            { label = edit_label(kind, bufnr) }))
 end
 
 -- A unified diff of what an edit would do, for the dry_run of the tools that
@@ -1750,6 +2043,8 @@ M.polish_after_edit = polish_after_edit
 M.diag_snapshot = diag_snapshot
 M.settle_before_edit = settle_before_edit
 M.post_edit_report = post_edit_report
+M.take_carry = take_carry
+M.flush_deferred = flush_deferred
 M.code_actions = code_actions
 M.apply_code_action = apply_code_action
 M.replace_symbol_body = replace_symbol_body

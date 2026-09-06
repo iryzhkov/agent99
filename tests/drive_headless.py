@@ -472,6 +472,54 @@ def main():
               "%.2fs %s" % (took, res))
         b.call("undo_edit", {})
 
+        # wait=false: the edit returns as soon as the text is in, and the
+        # verdict rides on the next reply, whatever tool produces it.
+        t0 = time.time()
+        res = b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
+            "text": '    return "hello, " .. nme', "wait": False,
+        })
+        took = time.time() - t0
+        check("wait=false returns at once",
+              took < 0.5 and "deferred" in str(res.get("diagnostics_after")), "%.2fs %s" % (took, res))
+        res = b.call("find_symbol", {"name": "M.greet", "file": util})
+        check("a reply before the verdict is in says so",
+              "still_pending" in res and "deferred_verdicts" not in res, res)
+        time.sleep(0.6)
+        res = b.call("find_symbol", {"name": "M.greet", "file": util})
+        verdicts = res.get("deferred_verdicts") or []
+        check("deferred verdict comes with the next reply",
+              len(verdicts) == 1 and "util.lua" in verdicts[0].get("edit", "")
+              and any("nme" in d for d in verdicts[0].get("diagnostics_after", [])), res)
+        res = b.call("find_symbol", {"name": "M.greet", "file": util})
+        check("a delivered verdict is not repeated", "deferred_verdicts" not in res, res)
+        # A reply produced outside the editor carries it too.
+        b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
+            "text": '    return "hello, " .. nme .. "?"', "wait": False,
+        })
+        time.sleep(0.6)
+        reply = b.rpc("tools/call", {"name": "grep", "arguments": {"pattern": "nme", "path": root}})
+        text = reply["result"]["content"][0]["text"]
+        check("grep reply carries the owed verdict",
+              "from earlier edits:" in text and "deferred_verdicts" in text
+              and text.index("nme") < text.index("from earlier edits:"), text)
+        # Two deferred edits, then an edit that must take a snapshot: the owed
+        # verdicts are settled first so nothing is charged to the wrong edit.
+        b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
+            "text": '    return "hello, " .. name', "wait": False,
+        })
+        res = b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.shout", "first_line": 2, "last_line": 2,
+            "text": '    return M.greet(name):upper() .. "!"',
+        })
+        verdicts = res.get("deferred_verdicts") or []
+        check("an owed verdict is settled before the next edit's snapshot",
+              len(verdicts) == 1 and "fixed" in verdicts[0]
+              and res.get("diagnostics_after") == "no new errors or warnings", res)
+        b.call("undo_edit", {"all": True})
+
         # rename_symbol: dry run touches nothing, the real one reaches the
         # caller in main.lua, undo restores both files.
         res = b.call("rename_symbol", {"file": util, "line": 6, "symbol": "greet",

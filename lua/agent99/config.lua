@@ -111,11 +111,18 @@ M.defaults = {
     -- settle_ms after every server has answered a request sent with the
     -- change without publishing (a push-only server such as lua_ls stays
     -- silent when an edit changed no diagnostic), and never later than
-    -- wait_ms. Raise settle_ms for a server that takes longer than that to
-    -- publish after it has taken in a change.
+    -- wait_ms. settle_ms is the starting point: how long each server takes
+    -- to publish after acknowledging a change is measured as the session
+    -- goes, and the settle for that server follows the longest of its
+    -- recent lags with a margin. Diagnostics that arrive after a report
+    -- went out are carried in the next reply, whatever tool produces it.
+    -- wait = false skips the wait altogether and carries the whole verdict
+    -- in the next reply (AGENT99_POST_EDIT_WAIT=0 for the standalone
+    -- server, wait=false on a single call).
     post_edit = {
         wait_ms = 4000,
         settle_ms = 300,
+        wait = true,
         -- After a symbol edit, optionally format the edited region through
         -- the server: "range" (servers without range formatting, gopls among
         -- them, format the whole file only when it is a Go file, confined to
