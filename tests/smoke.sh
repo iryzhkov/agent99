@@ -5,23 +5,46 @@
 #
 # Usage: tests/smoke.sh [suite ...]
 #   suites: unit mcp headless multi debug (default: all of them, in that order)
+#   the headless suite also takes one family of tools at a time:
+#   headless:workspace, :index, :edit, :verdict, :search, :files, :lifecycle
 # While iterating on one area run only the suite that covers it, e.g.
-# `tests/smoke.sh headless` after an edit-tool change; run the full set
-# before committing, since the suites share the Lua and the bridge.
+# `tests/smoke.sh headless:edit` after a change to the symbol edit tools;
+# run the full set before committing, since the suites share the Lua and
+# the bridge. The headless groups run as separate processes, four at a
+# time; AGENT99_TEST_JOBS sets that number, and 1 runs them in order in
+# one process, which is easier to read when something fails.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$PATH:$HOME/.local/share/nvim/mason/bin"
 
 ALL_SUITES="unit mcp headless multi debug"
+HEADLESS_GROUPS="workspace index edit verdict search files lifecycle"
+HEADLESS_ARGS=""
 if [ $# -eq 0 ]; then
     SUITES="$ALL_SUITES"
+    ASKED="$ALL_SUITES"
 else
-    SUITES="$*"
-    for s in $SUITES; do
-        case " $ALL_SUITES " in
-            *" $s "*) ;;
-            *) echo "unknown suite '$s' (known: $ALL_SUITES)"; exit 2 ;;
+    SUITES=""
+    ASKED="$*"
+    for s in "$@"; do
+        case "$s" in
+            headless:*)
+                g="${s#headless:}"
+                case " $HEADLESS_GROUPS " in
+                    *" $g "*) ;;
+                    *) echo "unknown headless group '$g' (known: $HEADLESS_GROUPS)"; exit 2 ;;
+                esac
+                SUITES="$SUITES headless"
+                HEADLESS_ARGS="$HEADLESS_ARGS $g"
+                ;;
+            *)
+                case " $ALL_SUITES " in
+                    *" $s "*) SUITES="$SUITES $s" ;;
+                    *) echo "unknown suite '$s' (known: $ALL_SUITES, or headless:<group>" \
+                            "with group in: $HEADLESS_GROUPS)"; exit 2 ;;
+                esac
+                ;;
         esac
     done
 fi
@@ -94,8 +117,12 @@ if want mcp; then
     # Full roster for coverage; drive_mcp separately checks the slim default.
     AGENT99_NVIM="$SOCK" AGENT99_FULL_TOOLS=1 python3 "$REPO/tests/drive_mcp.py"
 fi
-# Standalone mode: the bridge starts its own headless Neovim.
-if want headless; then python3 "$REPO/tests/drive_headless.py"; fi
+# Standalone mode: the bridge starts its own headless Neovim. One group of
+# tools at a time when the caller named one, the whole family otherwise.
+if want headless; then
+    # shellcheck disable=SC2086      # the group names are separate arguments
+    python3 "$REPO/tests/drive_headless.py" $HEADLESS_ARGS
+fi
 # Several workspaces open at once, and the routing between them.
 if want multi; then python3 "$REPO/tests/drive_multi.py"; fi
 # Debugger tools, standalone, against Delve.
@@ -110,8 +137,8 @@ elif [ -n "$debug_skip" ]; then
 else
     python3 "$REPO/tests/drive_debug.py"
 fi
-if [ "$SUITES" = "$ALL_SUITES" ]; then
+if [ "$ASKED" = "$ALL_SUITES" ]; then
     echo "smoke: OK"
 else
-    echo "smoke ($SUITES): OK - partial run, the full suite is tests/smoke.sh with no arguments"
+    echo "smoke ($ASKED): OK - partial run, the full suite is tests/smoke.sh with no arguments"
 fi

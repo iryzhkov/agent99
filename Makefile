@@ -5,8 +5,10 @@ build:
 	go build -o bin/agent99-bridge ./bridge
 
 # Bridge + LSP tools against a headless Neovim (no API calls, free).
-# SUITES narrows the run while iterating (mcp headless multi debug):
+# SUITES narrows the run while iterating (unit mcp headless multi debug),
+# and the headless suite narrows further, to one family of tools:
 #   make smoke SUITES=headless
+#   make smoke SUITES=headless:edit
 # Run it with no SUITES before committing.
 smoke: build
 	bash tests/smoke.sh $(SUITES)
