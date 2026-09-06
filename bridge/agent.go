@@ -504,7 +504,9 @@ func runAgent() {
 					seenCalls[key] = 1
 				}
 				freshCalls++
+				started := time.Now()
 				out, err := callTool(name, args, session{Root: p.Root, Socket: envSocket()})
+				tookMs := time.Since(started).Milliseconds()
 				if err == nil && stateChangingTools[name] {
 					// Buffers changed: older results are stale, so both
 					// repeat guards must forget their history.
@@ -519,8 +521,11 @@ func runAgent() {
 				if len(result) > maxToolOutputChars {
 					result = result[:maxToolOutputChars] + "\n... (output truncated)"
 				}
-				fmt.Fprintf(os.Stderr, "tool %s(%s) -> %d chars\n",
-					name, tc.Function.Arguments, len(result))
+				// The history harvests this line: name, argument text, size of
+				// the reply, how long the call took, and the call id that ties
+				// the timing to the transcript entry.
+				fmt.Fprintf(os.Stderr, "tool %s(%s) -> %d chars in %dms id=%s\n",
+					name, tc.Function.Arguments, len(result), tookMs, tc.ID)
 				toolCallNo++
 				if err == nil {
 					var suppressed bool

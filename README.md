@@ -216,9 +216,12 @@ line](doc/panel-chat.png)
 - An applied edit reverted by the user within 30s is marked on its record —
   the strongest "bad edit" signal — and undo via `gu` is tracked the same.
 - Every request persists as JSON under `stdpath("state")/agent99/history/`
-  (pruned to `history.keep`) with outcome, per-tool call counts, token
-  totals, duration, and the full transcript alongside. `:Agent99Stats`
-  aggregates outcome rates, cost, and tool usage; the records are plain
+  (pruned to `history.keep`) with outcome, per-tool call counts and time
+  spent in each tool (and per call, keyed by call id, so the record view
+  shows every call's duration next to its reply size), token totals,
+  duration, and the full transcript alongside. `:Agent99Stats` aggregates
+  outcome rates, cost, and tool usage with the seconds and average
+  milliseconds per tool; the records are plain
   JSON, so deeper analysis is a `jq` away. `<leader>9l` opens the log with
   a per-request trace.
 - **Off by default**, the MCP server can spool one JSON line per tool call to

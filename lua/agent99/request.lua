@@ -416,9 +416,20 @@ local function harvest_usage(record, stderr)
             end
         end
     end
-    local tools, repeated, duplicates = {}, 0, 0
-    for name in stderr:gmatch("tool ([%w_]+)%(") do
-        tools[name] = (tools[name] or 0) + 1
+    -- "tool NAME(args) -> N chars in Tms": one line per call the runner
+    -- made. Counts per tool, and the time spent in each, so the stats can
+    -- say not only which tools a run leaned on but which ones it waited on.
+    local tools, tool_ms, call_ms, repeated, duplicates = {}, {}, {}, 0, 0
+    for line in stderr:gmatch("[^\n]+") do
+        local name = line:match("^tool ([%w_]+)%(")
+        if name then
+            tools[name] = (tools[name] or 0) + 1
+            local ms, id = line:match(" in (%d+)ms id=(%S+)$")
+            if ms then
+                tool_ms[name] = (tool_ms[name] or 0) + tonumber(ms)
+                call_ms[id] = tonumber(ms)
+            end
+        end
     end
     for _ in stderr:gmatch("tool [%w_]+ REPEATED") do
         repeated = repeated + 1
@@ -441,6 +452,10 @@ local function harvest_usage(record, stderr)
     if next(tools) then
         record.tools = tools
     end
+    if next(tool_ms) then
+        record.tool_ms = tool_ms
+        record.call_ms = call_ms
+    end
     if repeated > 0 then
         record.repeated_calls = repeated
     end
@@ -448,6 +463,7 @@ local function harvest_usage(record, stderr)
         record.duplicate_results = duplicates
     end
 end
+M._harvest_usage = harvest_usage
 
 local function finish_failed(record, status, message)
     record.status = status

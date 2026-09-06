@@ -67,7 +67,7 @@ function M.stats_lines(scope)
     if #recs == 0 then
         return nil
     end
-    local by_status, by_mode, tools = {}, {}, {}
+    local by_status, by_mode, tools, tool_ms = {}, {}, {}, {}
     local n_usage, rounds, tin, tout, secs, repeated, autofixes = 0, 0, 0, 0, 0, 0, 0
     local tcached, undone = 0, 0
     local failures = {}
@@ -88,6 +88,9 @@ function M.stats_lines(scope)
         end
         for name, count in pairs(r.tools or {}) do
             tools[name] = (tools[name] or 0) + count
+        end
+        for name, ms in pairs(r.tool_ms or {}) do
+            tool_ms[name] = (tool_ms[name] or 0) + ms
         end
         repeated = repeated + (r.repeated_calls or 0) + (r.duplicate_results or 0)
         if r.autofix then
@@ -128,11 +131,30 @@ function M.stats_lines(scope)
         lines[#lines + 1] = ""
     end
     if next(tools) then
-        local total_calls = 0
+        local total_calls, total_ms = 0, 0
         for _, c in pairs(tools) do
             total_calls = total_calls + c
         end
-        section("Tool calls:", tools, math.max(1, total_calls))
+        for _, ms in pairs(tool_ms) do
+            total_ms = total_ms + ms
+        end
+        -- Per tool: calls, share of calls, and where the time went (records
+        -- from before durations were harvested have no timing and show none).
+        lines[#lines + 1] = total_ms > 0
+            and ("Tool calls (%.1fs in tools):"):format(total_ms / 1000)
+            or "Tool calls:"
+        local keys = vim.tbl_keys(tools)
+        table.sort(keys, function(a, b) return tools[a] > tools[b] end)
+        for _, k in ipairs(keys) do
+            local line = ("  %-18s %4d  (%d%%)"):format(k, tools[k],
+                math.floor(tools[k] * 100 / math.max(1, total_calls) + 0.5))
+            if tool_ms[k] then
+                line = line .. ("  %6.1fs  avg %4dms"):format(
+                    tool_ms[k] / 1000, math.floor(tool_ms[k] / tools[k] + 0.5))
+            end
+            lines[#lines + 1] = line
+        end
+        lines[#lines + 1] = ""
     end
     if #failures > 0 then
         lines[#lines + 1] = "Recent failures:"
@@ -523,8 +545,10 @@ local function record_sections(rec)
                             args = args:sub(1, 90) .. "…"
                         end
                         local size = sizes[tc.id]
-                        out[#out + 1] = ("- `%s(%s)`%s"):format(f.name or "?", args,
-                            size and (" → %.1fk chars"):format(size / 1000) or "")
+                        local ms = rec.call_ms and rec.call_ms[tc.id]
+                        out[#out + 1] = ("- `%s(%s)`%s%s"):format(f.name or "?", args,
+                            size and (" → %.1fk chars"):format(size / 1000) or "",
+                            ms and (" · %dms"):format(ms) or "")
                     end
                 end
             end
