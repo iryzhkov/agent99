@@ -696,6 +696,20 @@ local function take_carry()
     return out
 end
 
+-- Buffers this has already waited on. Whether a server has published for a
+-- buffer is `last_publish`, and nothing else separates "this file is clean"
+-- from "the server has not said anything about it yet" - a difference that
+-- decides whether the snapshot an edit is measured against holds the
+-- problems the file already had or an empty list.
+local settled_once = {}
+
+-- Buffer numbers are reused after a wipe, and a stale entry would skip the
+-- wait for the file that took the number over.
+vim.api.nvim_create_autocmd({ "BufDelete", "BufWipeout" }, {
+    group = vim.api.nvim_create_augroup("agent99_settled", { clear = true }),
+    callback = function(ev) settled_once[ev.buf] = nil end,
+})
+
 -- Before the first edit in a freshly loaded file, give its server time to
 -- attach and publish, or every problem the file already had would be
 -- reported as caused by the edit.
@@ -708,14 +722,27 @@ local function settle_before_edit(bufnr)
         -- about, or the diagnostics snapshot taken next is the old picture.
         sleep(300)
     end
-    if not fresh_buf(bufnr) then return end
+    -- Two reasons to wait: the buffer was loaded moments ago and its server
+    -- may still be indexing, or no server has ever published for it, in
+    -- which case the snapshot taken next would be empty and every problem
+    -- the file already had would be reported as caused by the edit.
+    local published = last_publish[bufnr] ~= nil
+    if not fresh_buf(bufnr) and (published or settled_once[bufnr]) then return end
     if #vim.lsp.get_clients({ bufnr = bufnr }) == 0
         and #enabled_lsp_configs_for(vim.bo[bufnr].filetype) == 0 then
         return -- nothing will ever attach
     end
+    -- Marked as waited-for either way: a server with nothing to say about a
+    -- clean file never publishes, and waiting again on every edit in that
+    -- file would spend the wait for nothing.
+    settled_once[bufnr] = true
     local okc = pcall(get_client, bufnr, "textDocument/didOpen", 3000)
     if okc then
-        wait_for_diagnostics(bufnr, nil, 2500, post_edit_options().settle_ms)
+        -- A server that has never reported on this file gets longer: the
+        -- first publish comes after it has parsed the file, which on a big
+        -- one is slower than the re-publish after an edit.
+        wait_for_diagnostics(bufnr, nil, published and 2500 or 4000,
+            post_edit_options().settle_ms)
     end
 end
 
