@@ -4,7 +4,7 @@
 # debugger tools against a real Delve session.
 #
 # Usage: tests/smoke.sh [suite ...]
-#   suites: mcp headless multi debug (default: all of them, in that order)
+#   suites: unit mcp headless multi debug (default: all of them, in that order)
 # While iterating on one area run only the suite that covers it, e.g.
 # `tests/smoke.sh headless` after an edit-tool change; run the full set
 # before committing, since the suites share the Lua and the bridge.
@@ -13,7 +13,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$PATH:$HOME/.local/share/nvim/mason/bin"
 
-ALL_SUITES="mcp headless multi debug"
+ALL_SUITES="unit mcp headless multi debug"
 if [ $# -eq 0 ]; then
     SUITES="$ALL_SUITES"
 else
@@ -71,6 +71,13 @@ cleanup() {
     rm -rf "$WORK"
 }
 trap cleanup EXIT
+
+# Pure-Lua checks that need no language server: the guards that decide
+# whether a formatter's pass is kept after an edit, and the region
+# mapping the ledger records.
+if want unit; then
+    nvim --clean --headless -u "$REPO/tests/minimal_init.lua" -l "$REPO/tests/unit_edit.lua"
+fi
 
 cd "$REPO/tests/testproj"
 if want mcp; then

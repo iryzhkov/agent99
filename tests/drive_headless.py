@@ -466,6 +466,14 @@ def main():
         check("format=range runs the formatter",
               ugly not in on_disk and "return x + 1" in on_disk
               and "formatted" in res.get("polished", ""), res)
+        # The reply says where the written text is, not how far the ledger
+        # reaches, and shows what the formatter changed instead of leaving
+        # the caller to find out with git diff.
+        span = [int(n) for n in res.get("lines", "0").split("-")]
+        check("a formatted edit reports its own span",
+              len(span) == 2 and span[0] > 1 and span[1] - span[0] < 6, res)
+        check("a formatted edit shows the formatter's diff",
+              any("return x" in line for line in res.get("polish_diff", [])), res)
         b.call("undo_edit", {})
 
         # A clean edit must not idle out post_edit.wait_ms (4 s): lua_ls

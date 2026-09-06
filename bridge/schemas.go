@@ -727,7 +727,10 @@ func init() {
 				"description": "Run the language server's formatter over the written text afterwards. " +
 					"Default off: the text lands byte for byte as given. \"range\" formats the " +
 					"edited lines (servers with no range formatting, such as gopls, format the " +
-					"file and only the edited lines are kept); \"file\" formats the whole file.",
+					"file and only the edited lines are kept); \"file\" formats the whole file. " +
+					"Either way the pass is confined to the edited lines, and it is taken back " +
+					"(and the reason reported in format_skipped) when it changes the text inside " +
+					"a string literal or re-indents to a width the file does not use.",
 			}
 		}
 	}

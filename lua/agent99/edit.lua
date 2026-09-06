@@ -123,6 +123,37 @@ local function organize_imports(bufnr)
     return applied
 end
 
+-- How a block of lines is indented: how many lines start with a tab, how
+-- many with spaces, how many distinct space widths there are, and the
+-- smallest step between those widths. The step is measured between the
+-- widths rather than from column zero, so a region that sits inside a
+-- nested block reports the file's unit and not the depth it starts at.
+local function indent_profile(lines)
+    local tabs, spaces, widths = 0, 0, {}
+    for _, line in ipairs(lines) do
+        local ws, first = line:match("^(%s+)(%S)")
+        -- A comment continuation line (" * ..." in JSDoc and Javadoc) sits
+        -- one column in; counting it makes the unit look like one space, the
+        -- "one space per level" bug. Skip it and the odd lone-space line.
+        if ws and first ~= "*" then
+            if ws:sub(1, 1) == "\t" then
+                tabs = tabs + 1
+            else
+                spaces = spaces + 1
+                if #ws > 1 then widths[#ws] = true end
+            end
+        end
+    end
+    local sorted = vim.tbl_keys(widths)
+    table.sort(sorted)
+    local step = nil
+    for i, w in ipairs(sorted) do
+        local gap = i == 1 and w or (w - sorted[i - 1])
+        if gap > 1 and (not step or gap < step) then step = gap end
+    end
+    return { tabs = tabs, spaces = spaces, step = step, levels = #sorted }
+end
+
 -- The file's own indentation (majority of indented lines: tabs or spaces,
 -- and the smallest space step), so formatting matches the code around the
 -- edit rather than the headless instance's buffer defaults.
@@ -145,33 +176,18 @@ local function detect_indent(bufnr)
             tabSize = tonumber(ec.indent_size) or vim.bo[bufnr].shiftwidth
         }
     end
-    local tabs, spaces, step = 0, 0, nil
-    for _, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, 2000, false)) do
-        local ws, first = line:match("^(%s+)(%S)")
-        -- A comment continuation line (" * ..." in JSDoc and Javadoc) sits
-        -- one column in; counting it makes the unit look like one space, the
-        -- "one space per level" bug. Skip it and the odd lone-space line.
-        if ws and first ~= "*" then
-            if ws:sub(1, 1) == "\t" then
-                tabs = tabs + 1
-            else
-                spaces = spaces + 1
-                local n = #ws
-                if n > 1 and (not step or n < step) then step = n end
-            end
-        end
-    end
-    if tabs == 0 and spaces == 0 then
+    local profile = indent_profile(vim.api.nvim_buf_get_lines(bufnr, 0, 2000, false))
+    if profile.tabs == 0 and profile.spaces == 0 then
         local sw = vim.bo[bufnr].shiftwidth
         return {
             insertSpaces = vim.bo[bufnr].expandtab,
             tabSize = sw > 0 and sw or vim.bo[bufnr].tabstop
         }
     end
-    if tabs > spaces then
+    if profile.tabs > profile.spaces then
         return { insertSpaces = false, tabSize = vim.bo[bufnr].tabstop }
     end
-    return { insertSpaces = true, tabSize = step or 4 }
+    return { insertSpaces = true, tabSize = profile.step or 4 }
 end
 
 -- Format lines first..last (1-based, inclusive) through the server: range
@@ -209,7 +225,10 @@ local function confine_format(bufnr, before_lines, first, last)
         -- start_a, so its footprint in the old text is that one position.
         local from = count_a > 0 and start_a or start_a + 1
         local to = count_a > 0 and (start_a + count_a - 1) or start_a
-        if from <= last and to >= first then
+        -- first == nil means keep nothing: the whole format pass is being
+        -- taken back because it changed something it had no business
+        -- changing (see format_damage).
+        if first and from <= last and to >= first then
             changed_inside = true
         else
             local restored = {}
@@ -226,6 +245,86 @@ local function confine_format(bufnr, before_lines, first, last)
     return changed_inside
 end
 
+-- Every string literal in `text`, in order, as the parser for `lang` sees
+-- them. Formatting is allowed to rearrange the whitespace between tokens;
+-- what is inside a literal is content, not layout. Returns nil when there
+-- is no parser for the language, so the caller can tell "nothing changed"
+-- apart from "nothing was checked".
+local function string_literals(text, lang)
+    if not lang then return nil end
+    local ok, parser = pcall(vim.treesitter.get_string_parser, text, lang)
+    if not ok or not parser then return nil end
+    local okp, trees = pcall(parser.parse, parser)
+    if not okp or type(trees) ~= "table" or not trees[1] then return nil end
+    local out = {}
+    local function walk(node)
+        local kind = node:type()
+        if kind:find("string") or kind:find("char_literal") or kind:find("heredoc") then
+            -- A template literal holds code as well as text. Its
+            -- interpolations are ordinary expressions and a formatter may
+            -- respace them; only the literal chunks around them are content.
+            local parts, interpolated = {}, false
+            for child in node:iter_children() do
+                local child_kind = child:type()
+                if child_kind:find("interpolation") or child_kind:find("substitution")
+                    or child_kind:find("expansion") then
+                    interpolated = true
+                else
+                    parts[#parts + 1] = child
+                end
+            end
+            if not interpolated then
+                out[#out + 1] = vim.treesitter.get_node_text(node, text)
+                return
+            end
+            for _, part in ipairs(parts) do
+                out[#out + 1] = vim.treesitter.get_node_text(part, text)
+            end
+            return
+        end
+        for child in node:iter_children() do walk(child) end
+    end
+    walk(trees[1]:root())
+    return out
+end
+
+-- What a format pass did beyond respacing code, or nil when it did only the
+-- job it is there for. Both cases below have been seen from real servers:
+--
+--   * the formatter rewrites the inside of a string literal, so an embedded
+--     shell script silently loses the indentation that is part of it;
+--   * the formatter ignores the indent options it was handed and re-indents
+--     the region to its own default, which rewrites every line of a symbol
+--     in a file that uses a different width.
+--
+-- Neither is something the caller asked for, and both are invisible in a
+-- reply that says "formatted", so the caller gets the edit as written
+-- instead and a line saying why the formatter was refused.
+local function format_damage(bufnr, before_lines, first, last)
+    local after_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local before_text = table.concat(before_lines, "\n")
+    local after_text = table.concat(after_lines, "\n")
+    if before_text == after_text then return nil end
+    local lang = vim.treesitter.language.get_lang(vim.bo[bufnr].filetype)
+    local was = string_literals(before_text, lang)
+    local now = was and string_literals(after_text, lang)
+    if was and now and table.concat(was, "\0") ~= table.concat(now, "\0") then
+        return "the formatter changed the text inside a string literal"
+    end
+    local file = indent_profile(before_lines)
+    if file.step then
+        local region = indent_profile(vim.list_slice(after_lines,
+            math.max(1, first), math.min(last, #after_lines)))
+        -- One indent width in the region says nothing: it is the depth the
+        -- region sits at. Two or more give the unit the formatter used.
+        if region.step and region.levels > 1 and region.step ~= file.step then
+            return ("the formatter re-indented the region in steps of %d in a %d-space file")
+                :format(region.step, file.step)
+        end
+    end
+    return nil
+end
+
 local function format_region(bufnr, first, last, mode)
     if mode == "range" or mode == true then
         local client = client_for(bufnr, "textDocument/rangeFormatting")
@@ -239,8 +338,14 @@ local function format_region(bufnr, first, last, mode)
                 options = detect_indent(bufnr),
             })
             if ok and type(edits) == "table" and #edits > 0 then
+                -- A range formatter is asked about a range and is free to
+                -- answer with anything: qmlls replies with edits for the
+                -- whole document. Confine those exactly as a whole-file
+                -- format is confined, so an edit never drags a file-wide
+                -- reflow along with it.
+                local before_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
                 pcall(vim.lsp.util.apply_text_edits, edits, bufnr, client.offset_encoding)
-                return true
+                return confine_format(bufnr, before_lines, first, last)
             end
             return false
         end
@@ -261,65 +366,124 @@ local function format_region(bufnr, first, last, mode)
     return false
 end
 
-local polish_ns = vim.api.nvim_create_namespace("agent99_polish")
 
--- Anchor for a multi-region edit's span: its own namespace, because
--- polish_after_edit clears polish_ns after every region it formats.
-local span_ns = vim.api.nvim_create_namespace("agent99_span")
+-- How much of the polish diff the reply carries before it becomes a tally.
+local POLISH_DIFF_LINES = 40
 
--- After an edit wrote `count` lines at `first`, format that region and
--- organize imports (both optional), then return where the region ended up
--- (imports added above it shift it) plus a list of what was done.
-local function polish_after_edit(bufnr, first, count, opts)
-    local done = {}
-    if not (opts.format or opts.organize_imports) then
-        return first, count, done
+-- Where a region ended up after polishing, measured from the diff of the
+-- buffer rather than from an extmark placed around it.
+--
+-- Extmarks are the obvious anchor and the wrong one: a server that answers
+-- a range format with edits covering the whole document (qmlls does)
+-- replaces every line, which collapses every mark in the buffer to the top.
+-- The region then reads as "line 1 to the end of the file", which is a lie
+-- in the reply and worse than a lie in the ledger, where it makes undo
+-- replace the whole file with the few lines the edit had written.
+--
+-- Returns the region's first and last line in the new text, plus the old
+-- lines below it that polishing also changed; the ledger folds those into
+-- the edit so an undo puts them back with it.
+local function map_region(before_lines, after_lines, first, last)
+    local hunks = vim.diff(
+        table.concat(before_lines, "\n") .. "\n",
+        table.concat(after_lines, "\n") .. "\n",
+        { result_type = "indices" })
+    if type(hunks) ~= "table" or #hunks == 0 then
+        return first, last, {}
     end
-    if not client_for(bufnr, "textDocument/didOpen") then
-        return first, count, done
-    end
-    local start_row = first - 1
-    -- The region's start is tracked by an extmark (imports added above it
-    -- move it down); its end is anchored by the untouched tail of the file,
-    -- which neither range formatting nor import edits reach.
-    local tail = vim.api.nvim_buf_get_lines(bufnr, start_row + count, -1, false)
-    local m_start = vim.api.nvim_buf_set_extmark(bufnr, polish_ns, start_row, 0,
-        { right_gravity = false })
-    if opts.format and count > 0 then
-        if format_region(bufnr, first, first + count - 1, opts.format) then
-            done[#done + 1] = "formatted"
+    -- shift: lines added or removed above the region, which move it.
+    -- grow: lines added or removed inside it or below it within reach.
+    -- reach: the last old line polishing touched at or after the region.
+    local shift, grow, reach = 0, 0, last
+    for _, h in ipairs(hunks) do
+        local start_a, count_a, count_b = h[1], h[2], h[4]
+        -- A hunk with count_a == 0 is an insertion sitting after old line
+        -- start_a, so its footprint in the old text is that one position.
+        local to = count_a > 0 and (start_a + count_a - 1) or start_a
+        local delta = count_b - count_a
+        if to < first then
+            shift = shift + delta
+        else
+            grow = grow + delta
+            if to > reach then reach = to end
         end
     end
+    local extra_old = {}
+    for i = last + 1, reach do extra_old[#extra_old + 1] = before_lines[i] end
+    return first + shift, reach + shift + grow, extra_old
+end
+
+-- After an edit wrote `count` lines at `first`, format that region and
+-- organize imports (both optional). Returns where the region ended up
+-- (imports added above it shift it), a list of what was done, the old
+-- lines a formatter reached below the region, and an info table holding
+-- where the written text now sits, the diff of what polishing changed,
+-- and the reason a format pass was refused when one was.
+local function polish_after_edit(bufnr, first, count, opts)
+    local done, info = {}, {}
+    if not (opts.format or opts.organize_imports) then
+        return first, count, done, nil, info
+    end
+    if not client_for(bufnr, "textDocument/didOpen") then
+        return first, count, done, nil, info
+    end
+    local last = first + count - 1
+    local before_polish = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    if opts.format and count > 0 then
+        if format_region(bufnr, first, last, opts.format) then
+            local harm = format_damage(bufnr, before_polish, first, last)
+            if harm then
+                confine_format(bufnr, before_polish, nil, nil)
+                info.format_skipped = harm ..
+                    ", so its pass was taken back; the text is in the file as it was written"
+            else
+                done[#done + 1] = "formatted"
+            end
+        end
+    end
+    -- Where the written text sits once the format pass is settled, before
+    -- imports can move it: that is the region the reply is about.
+    local after_format = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local edit_first, edit_last = map_region(before_polish, after_format, first, last)
     if opts.organize_imports then
         if organize_imports(bufnr) then
             done[#done + 1] = "organized imports"
+            local after_imports = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+            edit_first, edit_last = map_region(after_format, after_imports, edit_first, edit_last)
         end
     end
-    local s = vim.api.nvim_buf_get_extmark_by_id(bufnr, polish_ns, m_start, {})
-    vim.api.nvim_buf_clear_namespace(bufnr, polish_ns, 0, -1)
-    local new_total = vim.api.nvim_buf_line_count(bufnr)
-    -- A range formatter can reach past the region it was given (lua_ls
-    -- drops a blank line after a function that shrank). The part of the
-    -- old tail that no longer matches is folded into the edited region,
-    -- and handed back so the ledger's "before" covers it too; otherwise an
-    -- undo would restore the region and leave the formatter's change.
-    local keep = 0
-    while keep < #tail and keep < new_total do
-        local old_line = tail[#tail - keep]
-        local new_line = vim.api.nvim_buf_get_lines(bufnr, new_total - keep - 1, new_total - keep, false)[1]
-        if old_line ~= new_line then break end
-        keep = keep + 1
+    if count > 0 and edit_last >= edit_first then
+        info.edit_first, info.edit_last = edit_first, edit_last
     end
-    local extra_old = {}
-    for i = 1, #tail - keep do extra_old[#extra_old + 1] = tail[i] end
-    if s and s[1] then
-        local new_first = s[1] + 1
-        local new_count = (new_total - keep) - s[1]
-        if new_count >= 0 then
-            return new_first, new_count, done, extra_old
+    -- What polishing changed, so "formatted" is a statement the caller can
+    -- read rather than one it has to go and verify with git diff.
+    local after = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    if #done > 0 then
+        local diff = vim.diff(
+            table.concat(before_polish, "\n") .. "\n",
+            table.concat(after, "\n") .. "\n",
+            { result_type = "unified", ctxlen = 1 })
+        if type(diff) == "string" and diff ~= "" then
+            local lines = vim.split(diff:gsub("\n$", ""), "\n", { plain = true })
+            if #lines > POLISH_DIFF_LINES then
+                local extra = #lines - POLISH_DIFF_LINES
+                lines = vim.list_slice(lines, 1, POLISH_DIFF_LINES)
+                lines[#lines + 1] = ("… +%d more diff lines"):format(extra)
+            end
+            info.diff = lines
         end
     end
-    return first, count, done, extra_old
+    -- The ledger's region: the written text plus whatever polishing changed
+    -- below it (a formatter drops the blank line after a function that
+    -- shrank), so an undo does not restore the region and leave the
+    -- formatter's change standing.
+    local ledger_first, ledger_last, extra_old = map_region(before_polish, after, first, last)
+    local total = vim.api.nvim_buf_line_count(bufnr)
+    if ledger_last > total then ledger_last = total end
+    if ledger_first < 1 or ledger_last < ledger_first - 1 then
+        return first, count, done, {}, info
+    end
+    return ledger_first, ledger_last - ledger_first + 1, done, extra_old, info
 end
 
 -- Pre-existing diagnostics in the edited file are listed rather than counted,
@@ -1104,47 +1268,50 @@ end
 -- build the reply with the post-edit report.
 local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_old, old_lines, count, fields, regions)
     local opts = post_edit_options(args)
-    local pfirst, pcount, done, extra_old
+    local pfirst, pcount, done, extra_old, info
     if regions and #regions > 1 then
         -- Several edited regions far apart (chunks in different symbols):
         -- format each one on its own, bottom-up, so the code between them
         -- is left alone, then organize imports once. The span that goes in
-        -- the ledger is re-measured from an extmark at its start and the
-        -- untouched tail of the file, the same anchors polish_after_edit
-        -- uses for one region.
-        local tail = vim.api.nvim_buf_get_lines(bufnr, first - 1 + count, -1, false)
-        local m_start = vim.api.nvim_buf_set_extmark(bufnr, span_ns, first - 1, 0, { right_gravity = false })
+        -- the ledger is re-measured from the diff of the whole pass, the
+        -- same way polish_after_edit measures one region.
+        local span_before = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
         local seen = {}
         local format_only = vim.tbl_extend("force", opts, { organize_imports = false })
-        for i = #regions, 1, -1 do
-            local _, _, d = polish_after_edit(bufnr, regions[i].first, regions[i].count, format_only)
+        info = { diff = {}, skipped = {} }
+        local function absorb(d, region_info)
             for _, x in ipairs(d) do seen[x] = true end
+            if region_info.format_skipped then
+                info.skipped[region_info.format_skipped] = true
+            end
+            for _, l in ipairs(region_info.diff or {}) do
+                info.diff[#info.diff + 1] = l
+            end
         end
-        local _, _, d = polish_after_edit(bufnr, first, 0, vim.tbl_extend("force", opts, { format = false }))
-        for _, x in ipairs(d) do seen[x] = true end
+        for i = #regions, 1, -1 do
+            local _, _, d, _, region_info = polish_after_edit(bufnr, regions[i].first, regions[i].count, format_only)
+            absorb(d, region_info)
+        end
+        local _, _, d, _, imports_info =
+            polish_after_edit(bufnr, first, 0, vim.tbl_extend("force", opts, { format = false }))
+        absorb(d, imports_info)
         done = vim.tbl_keys(seen)
         table.sort(done)
-        local s = vim.api.nvim_buf_get_extmark_by_id(bufnr, span_ns, m_start, {})
-        vim.api.nvim_buf_clear_namespace(bufnr, span_ns, 0, -1)
-        local new_total = vim.api.nvim_buf_line_count(bufnr)
-        -- Same tail rule as polish_after_edit: whatever a formatter changed
-        -- below the span joins the recorded region.
-        local keep = 0
-        while keep < #tail and keep < new_total do
-            local new_line = vim.api.nvim_buf_get_lines(bufnr, new_total - keep - 1, new_total - keep, false)[1]
-            if tail[#tail - keep] ~= new_line then break end
-            keep = keep + 1
-        end
-        extra_old = {}
-        for i = 1, #tail - keep do extra_old[#extra_old + 1] = tail[i] end
-        pfirst, pcount = first, count
-        if s and s[1] then
-            pfirst = s[1] + 1
-            pcount = math.max(0, (new_total - keep) - s[1])
-        end
+        local reasons = vim.tbl_keys(info.skipped)
+        table.sort(reasons)
+        info.format_skipped = #reasons > 0 and table.concat(reasons, "; ") or nil
+        if #info.diff == 0 then info.diff = nil end
+        -- Same rule as polish_after_edit: whatever polishing changed below
+        -- the span joins the recorded region.
+        local span_after = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+        local span_first, span_last
+        span_first, span_last, extra_old = map_region(span_before, span_after, first, first + count - 1)
+        if span_last > #span_after then span_last = #span_after end
+        pfirst, pcount = span_first, math.max(0, span_last - span_first + 1)
     else
-        pfirst, pcount, done, extra_old = polish_after_edit(bufnr, first, count, opts)
+        pfirst, pcount, done, extra_old, info = polish_after_edit(bufnr, first, count, opts)
     end
+    info = info or {}
     if extra_old and #extra_old > 0 then
         old_lines = vim.list_extend(vim.list_slice(old_lines, 1, #old_lines), extra_old)
         last_old = last_old + #extra_old
@@ -1152,10 +1319,25 @@ local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_o
     local new_lines = vim.api.nvim_buf_get_lines(bufnr, pfirst - 1, pfirst - 1 + pcount, false)
     record_edit(bufnr, ledger_path, kind, pfirst, last_old + (pfirst - first), old_lines, new_lines)
     fields.file = vim.api.nvim_buf_get_name(bufnr)
-    fields.lines = pcount > 0 and ("%d-%d"):format(pfirst, pfirst + pcount - 1) or tostring(pfirst)
+    -- Where the written text is, not how far the ledger reaches: the ledger
+    -- deliberately swallows whatever a formatter or an import pass changed
+    -- around the edit, and reporting that span as `lines` turned a two-line
+    -- change into a claim that the tool had rewritten the file.
+    local efirst, elast = info.edit_first, info.edit_last
+    if efirst and elast then
+        fields.lines = ("%d-%d"):format(efirst, elast)
+    else
+        fields.lines = pcount > 0 and ("%d-%d"):format(pfirst, pfirst + pcount - 1) or tostring(pfirst)
+    end
     fields.note = edit_note(args)
     if #done > 0 then
         fields.polished = table.concat(done, ", ")
+        if info.diff then
+            fields.polish_diff = info.diff
+        end
+    end
+    if info.format_skipped then
+        fields.format_skipped = info.format_skipped
     end
     local odd = odd_bytes(new_lines)
     if args.verify or #odd > 0 then
@@ -1783,7 +1965,7 @@ local function create_file(args)
     local bufnr = load_buf(path)
     settle_before_edit(bufnr)
     local opts = post_edit_options(args)
-    local _, _, done = polish_after_edit(bufnr, 1, #lines, opts)
+    local _, _, done, _, info = polish_after_edit(bufnr, 1, #lines, opts)
     if args.headless then
         write_buf(bufnr)
     end
@@ -1807,6 +1989,12 @@ local function create_file(args)
     local result = { created = rel_path(path), lines = #lines, note = edit_note(args) }
     if #done > 0 then
         result.polished = table.concat(done, ", ")
+        if info.diff then
+            result.polish_diff = info.diff
+        end
+    end
+    if info.format_skipped then
+        result.format_skipped = info.format_skipped
     end
     return vim.tbl_extend("force", result,
         post_edit_report(bufnr, before, args.root, args.headless, opts, args.full_diagnostics))
@@ -2035,7 +2223,7 @@ local function move_symbols(args)
     end
 
     local opts = post_edit_options(args)
-    local _, _, polished = polish_after_edit(to_buf, at + 1, #appended, opts)
+    local _, _, polished, _, info = polish_after_edit(to_buf, at + 1, #appended, opts)
     if opts.organize_imports then
         organize_imports(from_buf)
     end
@@ -2060,6 +2248,12 @@ local function move_symbols(args)
     }
     if #polished > 0 then
         result.polished = table.concat(polished, ", ")
+        if info.diff then
+            result.polish_diff = info.diff
+        end
+    end
+    if info.format_skipped then
+        result.format_skipped = info.format_skipped
     end
     return vim.tbl_extend("force", result,
         post_edit_report(to_buf, before, args.root, args.headless, opts, args.full_diagnostics))
@@ -2083,5 +2277,11 @@ M.create_file = create_file
 M.move_file = move_file
 M.delete_file = delete_file
 M.move_symbols = move_symbols
+-- Exported for tests/unit_edit.lua: the two checks that decide whether a
+-- formatter's pass is kept are worth testing on their own, because the
+-- servers that fail them are not the ones the smoke test can run.
+M.indent_profile = indent_profile
+M.format_damage = format_damage
+M.map_region = map_region
 
 return M
