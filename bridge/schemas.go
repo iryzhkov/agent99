@@ -194,20 +194,20 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "replace_symbol_lines",
-		Description: "Replace part of a symbol: either the lines holding `match` (text that occurs once in the symbol - no line arithmetic, prefer this), or lines first_line..last_line, relative to the symbol's declaration (=1) as find_symbol bodies show, or absolute with absolute=true as read_file and grep report them. With match or absolute the doc comment above the symbol is reachable too. For a region with no symbol - a barrel/index file, an import block, an export list - omit name_path and give absolute=true line numbers or a match. Several places in one file go in chunks, each naming its own symbol (or none). Applied to the editor buffer immediately and tracked; returns fresh diagnostics and the text it replaced. Line numbers go stale the moment anything above the symbol changes - pass expect= with the current text of those lines: a stale offset is refused and the refusal offers the relocated edit as a code action, so apply_code_action(token, 1) finishes it without a re-read. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
+		Description: "Replace part of a symbol: either the lines holding `match` (text that occurs once in the symbol - no line arithmetic, prefer this), or lines first_line..last_line, relative to the symbol's declaration (=1) as find_symbol bodies show, or absolute with absolute=true as read_file and grep report them. With match or absolute the doc comment above the symbol is reachable too. For a region with no symbol - a barrel/index file, an import block, an export list - omit name_path and give absolute=true line numbers or a match. Several places in one file go in chunks, each naming its own symbol (or none). Applied to the editor buffer immediately and tracked; returns fresh diagnostics and the text it replaced. Numbers relative to name_path are re-anchored on every call, so an edit above the symbol does not move them; absolute=true numbers are moved by any edit above them in the file, and both kinds are moved by an earlier edit inside the same symbol. Pass expect= with the current text of those lines whenever the numbers came from an earlier call: a stale offset is then refused instead of overwriting working code, and the refusal offers the relocated edit as a code action, so apply_code_action(token, 1) finishes it without a re-read. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"file":       map[string]any{"type": "string", "description": "File containing the symbol."},
 				"name_path":  map[string]any{"type": "string", "description": "Symbol name path; the default for chunks that name none."},
 				"match":      map[string]any{"type": "string", "description": "The lines to replace, as they are now (whole lines); must occur exactly once in the symbol. Replaces first_line/last_line/expect."},
-				"first_line": map[string]any{"type": "integer", "description": "First line to replace, relative to the symbol (1-based) unless absolute."},
+				"first_line": map[string]any{"type": "integer", "description": "First line to replace, relative to the symbol's declaration (1-based) unless absolute. Relative numbers are re-anchored to wherever the declaration is now, so an edit above the symbol does not move them."},
 				"last_line":  map[string]any{"type": "integer", "description": "Last line to replace (inclusive)."},
-				"absolute":   map[string]any{"type": "boolean", "description": "first_line/last_line are buffer line numbers (as read_file, grep and buffer_lines report them), not symbol-relative."},
+				"absolute":   map[string]any{"type": "boolean", "description": "first_line/last_line are buffer line numbers (as read_file, grep and buffer_lines report them), not symbol-relative. These are not re-anchored: any edit above them in the file moves them, so pass expect= with numbers that came from an earlier call."},
 				"text":       map[string]any{"type": "string", "description": "Replacement for those lines."},
 				"expect": map[string]any{
 					"type":        "string",
-					"description": "The text those lines currently hold. Pass it whenever the line numbers came from an earlier call: an edit above the symbol shifts them, and without this the edit silently lands on the wrong lines.",
+					"description": "The text those lines currently hold. Pass it whenever the line numbers came from an earlier call: an earlier edit can have moved them, and without this the edit silently lands on the wrong lines. Indentation is ignored when comparing, and a refusal names where the text sits now.",
 				},
 				"chunks": map[string]any{
 					"type":        "array",

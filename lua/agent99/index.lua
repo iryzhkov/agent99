@@ -1473,14 +1473,6 @@ local function resolve_symbol(file, name_path)
     return bufnr, candidates[1].entry
 end
 
--- Edit a slice of a symbol, addressed by line numbers RELATIVE to the
--- symbol's first line (declaration = 1) - the numbering find_symbol bodies
--- use. Much cheaper than resending the whole symbol for a small change.
--- Where, inside the symbol, the expected text actually is. Relative line
--- numbers are read off a snapshot and drift when anything above the symbol
--- changes; the text they were meant to hit usually still exists, a few
--- lines away. Returns the relative first line of the single occurrence,
--- or nil plus how many occurrences there were.
 -- The first line of the comment block sitting directly above `lnum`, or
 -- lnum itself when there is none: a symbol's doc comment.
 local function doc_block_start(bufnr, lnum)

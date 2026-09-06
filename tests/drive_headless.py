@@ -504,8 +504,11 @@ def group_edit(c):
         })
         check("chunked edit is all-or-nothing", False, "call succeeded")
     except RuntimeError as e:
+        # The refusal names the chunk's symbol, and reports the search as
+        # file-wide, because that is how far locate_expected looked.
         check("chunked edit is all-or-nothing",
-              "nowhere in M.greet" in str(e) and open(util).read() == text, e)
+              "of M.greet do not hold the expected text" in str(e)
+              and "nowhere in" in str(e) and open(util).read() == text, e)
 
     # Chunks may name their own symbols: one concept living in two
     # functions is one call. The relocated range follows the expected
@@ -724,6 +727,56 @@ def group_edit(c):
     check("dry_run returns a diff",
           res.get("dry_run") is True
           and any(l.startswith("+") for l in res.get("diff", [])), res)
+
+    reset(c)
+    # Indentation alone is not drift. A format pass that re-indented the
+    # region left the same text on the same lines, and refusing there sends
+    # the caller to re-read a file that holds exactly what it expected.
+    res = b.call("replace_symbol_lines", {
+        "file": util, "name_path": "M.greet", "first_line": 1, "last_line": 2,
+        "expect": 'function M.greet(name)\nreturn "hello, " .. name',
+        "text": 'function M.greet(name)\n    return "hi, " .. name',
+    })
+    check("expect= ignores indentation",
+          res.get("replaced") == "lines 1-2 of M.greet"
+          and 'return "hi, " .. name' in open(util).read(), res)
+
+    reset(c)
+    # The expected text left the symbol entirely - the symbol shrank, or the
+    # code moved - and it is still findable in the file. Relocating there
+    # beats telling the caller to re-read a file that already holds it.
+    try:
+        b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
+            "expect": "return string.upper(M.greet(name))",
+            "text": "    return M.greet(name):upper()",
+        })
+        check("expect= relocates out of the symbol", False, "call succeeded")
+    except RuntimeError as e:
+        msg = str(e)
+        m = re.search(r"token=(\d+)", msg)
+        check("expect= relocates out of the symbol",
+              "outside M.greet, at buffer lines 11-11" in msg and m is not None, msg)
+        assert m is not None
+        # The relocated chunk drops name_path: buffer numbers outside the
+        # symbol would be converted back to offsets and refused for being
+        # out of its span.
+        res = b.call("apply_code_action", {"token": m.group(1), "index": 1})
+        check("the relocated edit applies outside the symbol",
+              "return M.greet(name):upper()" in open(util).read(), res)
+
+    reset(c)
+    # Same for match=, except that the text is not moved to; the caller is
+    # told where it actually sits, rather than that it is nowhere.
+    try:
+        b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet",
+            "match": "return string.upper(M.greet(name))", "text": "x",
+        })
+        check("match names the symbol the text is really in", False, "call succeeded")
+    except RuntimeError as e:
+        check("match names the symbol the text is really in",
+              "not in M.greet" in str(e) and "buffer lines 11-11" in str(e), e)
 
 
 def group_verdict(c):

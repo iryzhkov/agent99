@@ -1392,21 +1392,76 @@ local function replace_symbol_body(args)
         old, #new_lines, { replaced = entry.path })
 end
 
-local function locate_expected(bufnr, entry, want)
-    local want_lines = vim.split(want, "\n", { plain = true })
-    local n = #want_lines
-    local body = vim.api.nvim_buf_get_lines(bufnr, entry.first - 1, entry.last, false)
+-- Join lines with each one's indentation dropped. Text that a format pass
+-- re-indented is still the same text, and treating the moved leading
+-- whitespace as drift refuses an edit the caller had exactly right.
+local function indent_blind(lines)
+    local out = {}
+    for i, l in ipairs(lines) do
+        out[i] = vim.trim(l)
+    end
+    return table.concat(out, "\n")
+end
+
+-- Where `key` sits between two buffer lines, as a 1-based offset from
+-- `first`. Only an unambiguous hit counts: exactly one place, or none, in
+-- which case the number of places is returned instead.
+local function locate_between(bufnr, first, last, key, n, loose)
+    local body = vim.api.nvim_buf_get_lines(bufnr, first - 1, last, false)
     local hits = {}
     for start = 1, #body - n + 1 do
-        local window = vim.trim(table.concat(vim.list_slice(body, start, start + n - 1), "\n"))
-        if window == want then
+        local slice = vim.list_slice(body, start, start + n - 1)
+        local window = loose and indent_blind(slice) or vim.trim(table.concat(slice, "\n"))
+        if window == key then
             hits[#hits + 1] = start
         end
     end
     if #hits == 1 then
-        return hits[1], 1, n
+        return hits[1], 1
     end
-    return nil, #hits, n
+    return nil, #hits
+end
+
+-- Find the lines holding `want`: inside the symbol first, then anywhere in
+-- the file, and on a second pass ignoring indentation. The offset returned
+-- is relative to entry.first in every case, so a hit above or below the
+-- symbol comes back outside 1..span and the caller can still turn it into a
+-- buffer line number. Returns that offset (nil unless exactly one place
+-- matched), how many places matched, how many lines `want` holds, and where
+-- it was found: "symbol", "file", or nil for nowhere.
+
+local function locate_expected(bufnr, entry, want)
+    local want_lines = vim.split(want, "\n", { plain = true })
+    local n = #want_lines
+    local total = vim.api.nvim_buf_line_count(bufnr)
+    local whole = entry.first <= 1 and entry.last >= total
+    local keys = { vim.trim(want), indent_blind(want_lines) }
+    -- Exact before indent-blind, so a symbol holding two lines that differ
+    -- only in their indentation still resolves to the one the caller meant.
+    for pass = 1, 2 do
+        local loose = pass == 2
+        local at, count = locate_between(bufnr, entry.first, entry.last, keys[pass], n, loose)
+        if at then
+            return at, 1, n, "symbol"
+        end
+        if whole then
+            if count > 1 then
+                return nil, count, n, "file"
+            end
+        else
+            -- The symbol may have shrunk, or the text may have moved just
+            -- past its end. It is still in the file, so relocating it beats
+            -- telling the caller to re-read a file that already holds it.
+            local wide, wide_count = locate_between(bufnr, 1, total, keys[pass], n, loose)
+            if wide then
+                return wide - entry.first + 1, 1, n, "file"
+            end
+            if wide_count > 1 then
+                return nil, wide_count, n, "file"
+            end
+        end
+    end
+    return nil, 0, n, nil
 end
 
 -- The chunks of a replace_symbol_lines call: the single first_line/
@@ -1500,16 +1555,33 @@ local function replace_symbol_lines(args)
             -- symbol, which must be exactly one place. No line arithmetic,
             -- and the text doubles as the expect= guard.
             local want = vim.trim((c.match:gsub("\n+$", "")))
-            local at, count, n = locate_expected(bufnr,
+            local at, count, n, scope = locate_expected(bufnr,
                 { first = doc_first, last = c.entry.last }, want)
             if at then at = at - doc_lines end
+            local where = scope == "symbol" and c.entry.path
+                or rel_path(vim.api.nvim_buf_get_name(bufnr))
+            if at and scope == "file" then
+                -- Found, but not in the symbol the caller named. Saying where
+                -- it actually sits beats the bounds error this would become
+                -- further down, which only says the lines are outside.
+                local abs = c.entry.first + at - 1
+                err("chunk %d: the match text is not in %s; it is at buffer lines %d-%d. "
+                    .. "Name the symbol that holds it, or omit name_path and use absolute=true",
+                    c.index, c.entry.path, abs, abs + n - 1)
+            end
             if not at then
                 if count == 0 then
+                    -- Both scopes: the symbol the caller named, and the file
+                    -- the search went on to cover.
+                    if c.name_path then
+                        err("chunk %d: the match text is nowhere in %s, nor anywhere else in %s; "
+                            .. "re-read it with find_symbol", c.index, c.entry.path, where)
+                    end
                     err("chunk %d: the match text is nowhere in %s; re-read it with find_symbol",
-                        c.index, c.entry.path)
+                        c.index, where)
                 end
                 err("chunk %d: the match text occurs %d times in %s; include more context",
-                    c.index, count, c.entry.path)
+                    c.index, count, where)
             end
             c.first, c.last, c.expect = at, at + n - 1, c.match
         elseif c.absolute then
@@ -1538,28 +1610,36 @@ local function replace_symbol_lines(args)
                 chunks[i - 1].last, chunks[i - 1].entry.path, chunks[i].first, chunks[i].last, chunks[i].entry.path)
         end
     end
-    -- Relative line numbers are read off a snapshot - a find_symbol body or a
-    -- grep hit - and an edit anywhere above the symbol moves every one of
-    -- them. The numbers stay perfectly valid-looking after the shift, so the
-    -- edit lands on the wrong lines and silently replaces working code.
-    -- `expect` is the guard: give the text those lines are supposed to hold
-    -- and a stale offset fails loudly instead. The refusal also does the
-    -- search the caller would do next: when the expected text sits exactly
-    -- once in the symbol, it offers the relocated edit as a code action, so
-    -- the fix is one apply_code_action call and no re-read.
+    -- Line numbers are read off a snapshot - a find_symbol body, a grep hit -
+    -- and the code moves under them. Numbers relative to a symbol survive an
+    -- edit above it, because the symbol is resolved again on every call and
+    -- the offsets are counted from wherever its declaration is now; absolute
+    -- numbers survive nothing, and either kind is shifted by an earlier edit
+    -- inside the same symbol. The numbers stay perfectly valid-looking after
+    -- the shift, so the edit lands on the wrong lines and silently replaces
+    -- working code. `expect` is the guard: give the text those lines are
+    -- supposed to hold and a stale offset fails loudly instead. The refusal
+    -- also does the search the caller would do next: when the expected text
+    -- sits in exactly one place, it offers the relocated edit as a code
+    -- action, so the fix is one apply_code_action call and no re-read.
     local stale, relocated = {}, {}
     for _, c in ipairs(chunks) do
         if c.expect ~= nil and not args.force then
             local want = vim.trim((c.expect:gsub("\n+$", "")))
             local have = vim.trim(table.concat(c.old, "\n"))
-            if want ~= have then
+            -- Indentation alone is not drift: a format pass that re-indented
+            -- the region left the same text on the same lines.
+            local moved = want ~= have
+                and indent_blind(vim.split(want, "\n", { plain = true })) ~= indent_blind(c.old)
+            if moved then
                 -- The relocated range is as long as the expected text, not
                 -- as long as the requested one: a caller who miscounted the
                 -- last line still meant the text it named.
-                local at, count, n = locate_expected(bufnr, c.entry, want)
-                stale[#stale + 1] = { c = c, have = have, want = want, at = at, count = count, n = n }
+                local at, count, n, scope = locate_expected(bufnr, c.entry, want)
+                stale[#stale + 1] = { c = c, have = have, want = want, at = at,
+                    count = count, n = n, scope = scope }
                 if at then
-                    relocated[c] = { first_line = at, last_line = at + n - 1 }
+                    relocated[c] = { first_line = at, last_line = at + n - 1, scope = scope }
                 end
             end
         end
@@ -1570,15 +1650,24 @@ local function replace_symbol_lines(args)
             lines[#lines + 1] = ("lines %d-%d of %s do not hold the expected text, so the numbers are "
                     .. "probably from before an earlier edit shifted them.\nexpected: %s\nfound:    %s")
                 :format(s.c.first, s.c.last, s.c.entry.path, vim.inspect(s.want), vim.inspect(s.have))
-            if s.at then
+            local where = s.scope == "symbol" and s.c.entry.path
+                or rel_path(vim.api.nvim_buf_get_name(bufnr))
+            if s.at and s.scope == "symbol" then
                 lines[#lines + 1] = ("the expected text is at lines %d-%d (relative) instead."):format(
                     s.at, s.at + s.n - 1)
+            elseif s.at then
+                -- Outside the symbol, where a relative number would be
+                -- negative or past its end: name the buffer lines the code
+                -- action is going to use.
+                local abs = s.c.entry.first + s.at - 1
+                lines[#lines + 1] = ("the expected text is outside %s, at buffer lines %d-%d instead."):format(
+                    s.c.entry.path, abs, abs + s.n - 1)
             elseif s.count > 1 then
                 lines[#lines + 1] = ("the expected text occurs %d times in %s; pick with more context."):format(
-                    s.count, s.c.entry.path)
+                    s.count, where)
             else
                 lines[#lines + 1] = ("the expected text is nowhere in %s; re-read it with find_symbol."):format(
-                    s.c.entry.path)
+                    where)
             end
         end
         local actions = {}
@@ -1591,26 +1680,32 @@ local function replace_symbol_lines(args)
                 -- address its chunks: a chunk that names no symbol has no
                 -- declaration to be relative to, and relative numbers there
                 -- are refused outright.
+                -- A chunk whose text turned up outside its symbol cannot keep
+                -- naming it: the buffer line numbers below would be converted
+                -- back to offsets and refused for being out of its span.
+                local keep_symbol = not (r and r.scope == "file")
                 moved[#moved + 1] = {
                     first_line = r and (c.entry.first + r.first_line - 1) or c.abs_first,
                     last_line = r and (c.entry.first + r.last_line - 1) or c.abs_last,
                     text = c.text,
                     expect = c.expect,
-                    name_path = c.name_path,
+                    name_path = keep_symbol and c.name_path or nil,
                     absolute = true,
                 }
             end
+            -- The chunks carry their own addressing now. The single-chunk
+            -- fields are ignored once `chunks` is set, but a call-wide
+            -- name_path is inherited by every chunk that does not name one,
+            -- which would put the symbol back on a chunk that just left it.
+            local moved_args = vim.deepcopy(args)
+            moved_args.chunks = moved
+            moved_args.name_path = nil
+            moved_args.first_line, moved_args.last_line = nil, nil
+            moved_args.text, moved_args.expect = nil, nil
+            moved_args.match, moved_args.absolute = nil, nil
             actions[#actions + 1] = {
                 title = "apply the same edit at the relocated lines",
-                args = vim.tbl_extend("force", args, {
-                    chunks = moved,
-                    first_line = nil,
-                    last_line = nil,
-                    text = nil,
-                    expect = nil,
-                    match = nil,
-                    absolute = nil,
-                })
+                args = moved_args,
             }
         end
         actions[#actions + 1] = {
