@@ -19,6 +19,27 @@ local resolve_symbol, symbol_index, doc_block_start, decl_block_top =
     index.resolve_symbol, index.symbol_index, index.doc_block_start, index.decl_block_top
 
 
+-- A symbol edit whose target lines overlap the region a request in
+-- progress owns as its PRIMARY edit target (the one only the <replacement>
+-- reply is supposed to touch, per the tool guide) collides with whatever
+-- that reply is about to write. Refusing it here, instead of letting
+-- apply_lines silently drop the losing side later, gives the agent an
+-- immediate, actionable error instead of a same-run surprise.
+local function primary_region_conflict(bufnr, first, last)
+    local ok, req = pcall(require, "agent99.request")
+    if not ok then
+        return nil
+    end
+    local pfirst, plast = req.primary_region(bufnr)
+    if not pfirst or last < pfirst or first > plast then
+        return nil
+    end
+    return ("lines %d-%d overlap %d-%d, the primary edit region of the request "
+        .. "in progress. Make this change through the <replacement> reply instead "
+        .. "of a symbol edit tool.")
+        :format(first, last, pfirst, plast)
+end
+
 -- The format switch as setup(), AGENT99_FORMAT or a tool call may spell it,
 -- reduced to false, "range" or "file". Anything unrecognized is off, so a
 -- typo cannot turn formatting on.
@@ -1390,6 +1411,8 @@ local function replace_symbol_body(args)
             { file = rel_path(vim.api.nvim_buf_get_name(bufnr)) },
             preview_diff(old, new_lines, entry.path))
     end
+    local conflict = primary_region_conflict(bufnr, entry.first, entry.last)
+    if conflict then err(conflict) end
     settle_before_edit(bufnr)
     local before = diag_snapshot()
     vim.api.nvim_buf_set_lines(bufnr, entry.first - 1, entry.last, false, new_lines)
@@ -1603,6 +1626,8 @@ local function replace_symbol_lines(args)
         end
         c.abs_first = c.entry.first + c.first - 1
         c.abs_last = c.entry.first + c.last - 1
+        local conflict = primary_region_conflict(bufnr, c.abs_first, c.abs_last)
+        if conflict then err("chunk %d: %s", c.index, conflict) end
         c.new_lines = vim.split((c.text:gsub("\n+$", "")), "\n", { plain = true })
         c.old = vim.api.nvim_buf_get_lines(bufnr, c.abs_first - 1, c.abs_last, false)
     end
@@ -1818,6 +1843,8 @@ local function insert_symbol_tool(where)
             row = decl_block_top(bufnr, entry.first) - 1
             if spaced then table.insert(lines, "") end
         end
+        local conflict = primary_region_conflict(bufnr, row + 1, row + 1)
+        if conflict then err(conflict) end
         settle_before_edit(bufnr)
         local before = diag_snapshot()
         vim.api.nvim_buf_set_lines(bufnr, row, row, false, lines)
@@ -2180,6 +2207,14 @@ local function replace_pattern(args)
         return result
     end
 
+    for _, p in ipairs(pending) do
+        for i = 1, #p.new do
+            if p.new[i] ~= p.old[i] then
+                local conflict = primary_region_conflict(p.bufnr, i, i)
+                if conflict then err(conflict) end
+            end
+        end
+    end
     settle_before_edit(pending[1].bufnr)
     local before = diag_snapshot()
     for _, p in ipairs(pending) do
@@ -2531,6 +2566,10 @@ local function move_symbols(args)
                 moving[i - 1].path, moving[i].path)
         end
     end
+    for _, m in ipairs(moving) do
+        local conflict = primary_region_conflict(from_buf, m.first, m.last)
+        if conflict then err(conflict) end
+    end
 
     local from_before = vim.api.nvim_buf_get_lines(from_buf, 0, -1, false)
     local blocks = {}
@@ -2583,6 +2622,8 @@ local function move_symbols(args)
         vim.list_extend(appended, block)
     end
     local at = #to_before
+    local to_conflict = primary_region_conflict(to_buf, at + 1, at + 1)
+    if to_conflict then err(to_conflict) end
     vim.api.nvim_buf_set_lines(to_buf, at, at, false, appended)
     for i = #moving, 1, -1 do
         vim.api.nvim_buf_set_lines(from_buf, moving[i].first - 1, moving[i].last, false, {})

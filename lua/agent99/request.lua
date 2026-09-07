@@ -134,6 +134,22 @@ local function region_from_marks(buf, mark_start, mark_end)
     return spos[1], epos[1]
 end
 
+--- The region (1-based, inclusive) that only the <replacement> reply of the
+--- run in progress should touch, if buf is that run's target buffer right
+--- now. nil once the run has finished (apply_lines clears the marks) or for
+--- any other buffer. Used by the edit tools to refuse a symbol edit that
+--- would collide with the in-flight top-level replacement.
+function M.primary_region(buf)
+    if not (state.job and state.buf == buf and state.mark_start and state.mark_end) then
+        return nil
+    end
+    local srow, erow = region_from_marks(buf, state.mark_start, state.mark_end)
+    if not srow then
+        return nil
+    end
+    return srow + 1, erow + 1
+end
+
 local function del_mark(buf, id)
     if buf and id and vim.api.nvim_buf_is_valid(buf) then
         pcall(vim.api.nvim_buf_del_extmark, buf, ns, id)
