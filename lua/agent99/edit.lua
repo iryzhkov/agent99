@@ -1458,6 +1458,26 @@ end
 -- matched), how many places matched, how many lines `want` holds, and where
 -- it was found: "symbol", "file", or nil for nowhere.
 
+-- locate_between only ever matches a whole line (or whole lines, for a
+-- multi-line match=): a caller who quoted a fragment of a long line - a
+-- Markdown table row, a wrapped comment - gets "nowhere" even though the
+-- text is right there. Nowhere is still nowhere, but when the text is a
+-- substring of exactly one line, saying so turns a dead end into the fix:
+-- quote that whole line instead. More than one line containing it is not
+-- a fragment match worth reporting - there is nothing to point at.
+local function substring_hint(bufnr, first, last, want)
+    if want == "" or want:find("\n", 1, true) then return nil end
+    local body = vim.api.nvim_buf_get_lines(bufnr, first - 1, last, false)
+    local hit_line, hit_text
+    for i, line in ipairs(body) do
+        if line:find(want, 1, true) then
+            if hit_line then return nil end
+            hit_line, hit_text = first + i - 1, line
+        end
+    end
+    return hit_line, hit_text
+end
+
 local function locate_expected(bufnr, entry, want)
     local want_lines = vim.split(want, "\n", { plain = true })
     local n = #want_lines
@@ -1489,7 +1509,11 @@ local function locate_expected(bufnr, entry, want)
             end
         end
     end
-    return nil, 0, n, nil
+    local hint_line, hint_text = substring_hint(bufnr, entry.first, entry.last, want)
+    if not hint_line then
+        hint_line, hint_text = substring_hint(bufnr, 1, total, want)
+    end
+    return nil, 0, n, nil, hint_line, hint_text
 end
 
 -- The chunks of a replace_symbol_lines call: the single first_line/
@@ -1583,7 +1607,7 @@ local function replace_symbol_lines(args)
             -- symbol, which must be exactly one place. No line arithmetic,
             -- and the text doubles as the expect= guard.
             local want = vim.trim((c.match:gsub("\n+$", "")))
-            local at, count, n, scope = locate_expected(bufnr,
+            local at, count, n, scope, hint_line, hint_text = locate_expected(bufnr,
                 { first = doc_first, last = c.entry.last }, want)
             if at then at = at - doc_lines end
             local where = scope == "symbol" and c.entry.path
@@ -1599,6 +1623,11 @@ local function replace_symbol_lines(args)
             end
             if not at then
                 if count == 0 then
+                    if hint_line then
+                        err("chunk %d: the match text is part of line %d, not the whole line; "
+                            .. "match= must be the whole line. Line %d is: %s",
+                            c.index, hint_line, hint_line, vim.inspect(hint_text))
+                    end
                     -- Both scopes: the symbol the caller named, and the file
                     -- the search went on to cover.
                     if c.name_path then
@@ -1665,9 +1694,10 @@ local function replace_symbol_lines(args)
                 -- The relocated range is as long as the expected text, not
                 -- as long as the requested one: a caller who miscounted the
                 -- last line still meant the text it named.
-                local at, count, n, scope = locate_expected(bufnr, c.entry, want)
+                local at, count, n, scope, hint_line, hint_text = locate_expected(bufnr, c.entry, want)
                 stale[#stale + 1] = { c = c, have = have, want = want, at = at,
-                    count = count, n = n, scope = scope }
+                    count = count, n = n, scope = scope,
+                    hint_line = hint_line, hint_text = hint_text }
                 if at then
                     relocated[c] = { first_line = at, last_line = at + n - 1, scope = scope }
                 end
@@ -1695,6 +1725,10 @@ local function replace_symbol_lines(args)
             elseif s.count > 1 then
                 lines[#lines + 1] = ("the expected text occurs %d times in %s; pick with more context."):format(
                     s.count, where)
+            elseif s.hint_line then
+                lines[#lines + 1] = ("the expected text is part of line %d, not the whole line; "
+                        .. "expect= must be the whole line. Line %d is: %s")
+                    :format(s.hint_line, s.hint_line, vim.inspect(s.hint_text))
             else
                 lines[#lines + 1] = ("the expected text is nowhere in %s; re-read it with find_symbol."):format(
                     where)

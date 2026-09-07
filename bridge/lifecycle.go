@@ -111,6 +111,37 @@ func reviveFor(path string) *headlessWorkspace {
 	return ws
 }
 
+// relativeRevivalRoot picks the one root, among candidates, whose tree
+// actually holds this relative path - checking the path itself first (an
+// existing file: find_symbol, hover, replace_symbol_lines all name one),
+// then its parent directory (create_file names a path that does not exist
+// yet, but the directory it lands in does). More than one candidate holding
+// it is not a disambiguation, so that is treated the same as none: a guess
+// between two real projects is worse than the error the caller already
+// knows how to recover from.
+func relativeRevivalRoot(rel string, roots []string) string {
+	under := func(sub string) string {
+		match := ""
+		for _, root := range roots {
+			if _, err := os.Stat(filepath.Join(root, sub)); err != nil {
+				continue
+			}
+			if match != "" {
+				return ""
+			}
+			match = root
+		}
+		return match
+	}
+	if root := under(rel); root != "" {
+		return root
+	}
+	if dir := filepath.Dir(rel); dir != "." && dir != "" {
+		return under(dir)
+	}
+	return ""
+}
+
 // reviveIfNeeded gives a call that names a path in a vanished workspace its
 // workspace back, before the routing tries to pick one.
 func reviveIfNeeded(args map[string]any) {
@@ -135,13 +166,25 @@ func reviveIfNeeded(args map[string]any) {
 			}
 		}
 	}
-	// A call with no paths - check_project, undo_edit, a debugger step - can
-	// still be revived when there is only one candidate and nothing is open,
-	// because then there is nothing to be ambiguous about.
-	if len(openRoots()) == 0 {
-		if roots := reopenableRoots(); len(roots) == 1 {
-			reviveFor(roots[0])
+	// A relative path names no workspace by itself - that is what argPaths
+	// leaves it out for - but it can still pick one out of several
+	// reopenable roots: a path that exists under exactly one of them almost
+	// certainly belongs to it. This is what an idle-swept session with a
+	// relative-only call (no absolute path, cwd refused as a root) needs,
+	// since without it such a call falls through to autoOpenFor and finds
+	// nothing to open either.
+	roots := reopenableRoots()
+	for _, rel := range argPathValues(args) {
+		if filepath.IsAbs(rel) {
+			continue
 		}
+		if root := relativeRevivalRoot(rel, roots); root != "" {
+			reviveFor(root)
+			return
+		}
+	}
+	if len(openRoots()) == 0 && len(roots) == 1 {
+		reviveFor(roots[0])
 	}
 }
 

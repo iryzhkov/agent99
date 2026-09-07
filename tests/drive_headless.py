@@ -585,6 +585,16 @@ def group_edit(c):
         check("match refuses absent text", False, "call succeeded")
     except RuntimeError as e:
         check("match refuses absent text", "nowhere in M.greet" in str(e), e)
+    # A fragment of a longer line is never found - locate_between only
+    # matches whole lines - so the refusal should point at the whole line
+    # instead of just saying "nowhere" and sending the caller in a circle.
+    try:
+        b.call("replace_symbol_lines", {"file": util, "name_path": "M.greet",
+                                        "match": "tostring(name):upper", "text": "x"})
+        check("match on a line fragment is refused with the whole line", False, "call succeeded")
+    except RuntimeError as e:
+        check("match on a line fragment is refused with the whole line",
+              "part of line" in str(e) and "tostring(name):upper()" in str(e), e)
     # A name_path the file does not have names what it does have, so the
     # caller can fix the name from the refusal instead of going back to
     # find_symbol for it.

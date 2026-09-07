@@ -116,3 +116,38 @@ func TestReopenableBookkeeping(t *testing.T) {
 		t.Errorf("root still reopenable after being forgotten: %v", roots)
 	}
 }
+
+// TestRelativeRevivalRoot covers the gap issue #1 reported: a call that
+// names only a relative path (create_file, find_symbol, hover... after
+// argPaths has already dropped it) still needs a way to pick one workspace
+// out of several reopenable roots, or it falls through to a dead end.
+func TestRelativeRevivalRoot(t *testing.T) {
+	a := t.TempDir()
+	b := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(a, "roles/fleet_ssh/tasks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(a, "roles/fleet_ssh/tasks/existing.yml"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(b, "roles/nebula/tasks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	roots := []string{a, b}
+	if got := relativeRevivalRoot("roles/fleet_ssh/tasks/existing.yml", roots); got != a {
+		t.Errorf("existing file: got %q, want %q", got, a)
+	}
+	if got := relativeRevivalRoot("roles/fleet_ssh/tasks/new.yml", roots); got != a {
+		t.Errorf("new file in an existing directory: got %q, want %q", got, a)
+	}
+	if got := relativeRevivalRoot("roles/nebula/tasks/new.yml", roots); got != b {
+		t.Errorf("new file under the other root: got %q, want %q", got, b)
+	}
+	if got := relativeRevivalRoot("nowhere/at/all.yml", roots); got != "" {
+		t.Errorf("path under neither root: got %q, want \"\"", got)
+	}
+	if got := relativeRevivalRoot("README.md", roots); got != "" {
+		t.Errorf("bare filename with no directory to disambiguate: got %q, want \"\"", got)
+	}
+}

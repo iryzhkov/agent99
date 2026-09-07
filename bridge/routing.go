@@ -121,11 +121,13 @@ var pathArgKeys = []string{"file", "from", "to", "path", "program", "cwd"}
 // argPaths collects the absolute paths a call names. Relative paths are left
 // out on purpose: they mean "in the workspace this call is routed to", which
 // is the question being answered here.
-func argPaths(args map[string]any) []string {
+// argPathValues collects every path-valued string a call names, in the
+// argument shape argPaths knows about, absolute or relative.
+func argPathValues(args map[string]any) []string {
 	var out []string
 	add := func(v any) {
-		if s, ok := v.(string); ok && filepath.IsAbs(s) {
-			out = append(out, filepath.Clean(s))
+		if s, ok := v.(string); ok && s != "" {
+			out = append(out, s)
 		}
 	}
 	for _, key := range pathArgKeys {
@@ -137,6 +139,19 @@ func argPaths(args map[string]any) []string {
 	if list, ok := args["files"].([]any); ok {
 		for _, v := range list {
 			add(v)
+		}
+	}
+	return out
+}
+
+// argPaths collects the absolute paths a call names. Relative paths are left
+// out on purpose: they mean "in the workspace this call is routed to", which
+// is the question being answered here.
+func argPaths(args map[string]any) []string {
+	var out []string
+	for _, s := range argPathValues(args) {
+		if filepath.IsAbs(s) {
+			out = append(out, filepath.Clean(s))
 		}
 	}
 	return out
