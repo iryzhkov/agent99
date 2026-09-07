@@ -38,20 +38,40 @@ local function guess_check_command(root)
         end
         return false
     end
+    -- One entry per language the project mixes, not just the first match:
+    -- a repo with a Go bridge and a Lua plugin (this one) needs both, or
+    -- check_project silently covers only whichever language happened to be
+    -- checked first.
+    local guesses = {}
+    local function add(cmd, note)
+        guesses[#guesses + 1] = { cmd = cmd, note = note }
+    end
     -- `go build ./...` writes a binary named after a lone main package into
     -- the cwd, which fails when a directory of that name exists (a repo with
     -- its main package in ./bridge). vet compiles everything without that.
-    if has("go.mod") then return "go vet ./..." end
-    if has("Cargo.toml") then return "cargo check --message-format short" end
+    if has("go.mod") then
+        add("go vet ./...")
+    end
+    if has("Cargo.toml") then
+        add("cargo check --message-format short")
+    end
     if has("tsconfig.json") then
-        if has("node_modules/.bin/tsc") then return "node_modules/.bin/tsc --noEmit -p ." end
-        if vim.fn.executable("tsc") == 1 then return "tsc --noEmit -p ." end
+        if has("node_modules/.bin/tsc") then
+            add("node_modules/.bin/tsc --noEmit -p .")
+        elseif vim.fn.executable("tsc") == 1 then
+            add("tsc --noEmit -p .")
+        end
     end
     if has("pyproject.toml") or has("setup.py") or has("setup.cfg") then
-        if vim.fn.executable("pyright") == 1 then return "pyright" end
-        if vim.fn.executable("mypy") == 1 then return "mypy ." end
+        if vim.fn.executable("pyright") == 1 then
+            add("pyright")
+        elseif vim.fn.executable("mypy") == 1 then
+            add("mypy .")
+        end
     end
-    if has("CMakeLists.txt") and has("build") then return "cmake --build build" end
+    if has("CMakeLists.txt") and has("build") then
+        add("cmake --build build")
+    end
     -- QML has no compiler to run, and qmllint is the check every Qt project
     -- ends up writing a script around. Two things about it are worth saying
     -- once here rather than in every project: it takes files rather than a
@@ -60,14 +80,43 @@ local function guess_check_command(root)
     -- the gate for this command; the baseline diff is, since a new warning
     -- is still a new line.
     if vim.fn.executable("qmllint") == 1 and has_ext(".qml") then
-        return "find . -name '*.qml' -not -path './.git/*' -print0 | xargs -0 -r qmllint",
+        add("find . -name '*.qml' -not -path './.git/*' -print0 | xargs -0 -r qmllint",
             "qmllint reports warnings but still exits 0, so read the new lines rather "
             .. "than the exit code. It also checks one import path: types it cannot "
             .. "resolve are reported as warnings that say nothing about your change, "
             .. "which the baseline absorbs on the first call. Pass command= with your "
-            .. "own -I flags when that noise hides real findings."
+            .. "own -I flags when that noise hides real findings.")
     end
-    return nil
+    -- Lua has no project-wide type checker to shell out to (lua_ls, the LSP
+    -- this plugin already drives, is not a CLI); luacheck is the real lint
+    -- but is an optional install, so prefer it when present and fall back
+    -- to luac's own syntax-only parse check, which ships with Lua itself
+    -- and needs nothing installed.
+    if has_ext(".lua") then
+        if vim.fn.executable("luacheck") == 1 then
+            add("luacheck .",
+                "luacheck reads .luacheckrc if the project has one; without one it uses "
+                .. "its own defaults, which may flag style the project does not care "
+                .. "about. Pass command= with your own flags (e.g. --config path) when "
+                .. "that noise hides real findings.")
+        else
+            local luac = vim.fn.executable("luac") == 1 and "luac"
+                or vim.fn.executable("luac5.4") == 1 and "luac5.4"
+                or vim.fn.executable("luac5.1") == 1 and "luac5.1"
+                or nil
+            if luac then
+                add(("find . -name '*.lua' -not -path './.git/*' -print0 | xargs -0 -n1 %s -p")
+                    :format(luac),
+                    ("%s -p is a syntax check only: it parses each file and catches what "
+                        .. "breaks parsing, not an unused variable, an undefined global, or a "
+                        .. "logic error. lua_ls's live diagnostics, already surfaced on every "
+                        .. "edit through this server, cover more; this exists so a Lua project "
+                        .. "still gets some check_project coverage where luacheck is not "
+                        .. "installed."):format(luac))
+            end
+        end
+    end
+    return guesses
 end
 
 -- A check command the caller has chosen for this project, replacing the guess
@@ -139,11 +188,16 @@ local function check_project(args)
     if not cmds and configured and configured ~= "" then cmds = { configured } end
     local guessed, guess_note = false, nil
     if not cmds then
-        local guess, note = guess_check_command(root)
-        if guess then
-            cmds = { guess }
+        local guesses = guess_check_command(root)
+        if #guesses > 0 then
+            cmds = {}
+            local notes = {}
+            for _, g in ipairs(guesses) do
+                cmds[#cmds + 1] = g.cmd
+                if g.note then notes[#notes + 1] = g.note end
+            end
             guessed = true
-            guess_note = note
+            guess_note = #notes > 0 and table.concat(notes, "\n\n") or nil
         end
     end
     if not cmds then
