@@ -185,8 +185,10 @@ end
 -- one-round rule as the replacement path).
 local function schedule_auto_fix_tools(bufs, pre_errors, record)
     local opts = config.options
+    local kind = opts.provider.kind
     if not opts.auto_fix or record.autofix
-        or opts.provider.kind ~= "openai" or not record.transcript then
+        or (kind ~= "openai" and kind ~= "claude")
+        or (kind == "openai" and not record.transcript) then
         return
     end
     vim.defer_fn(function()
@@ -230,8 +232,10 @@ end
 -- follow-up round if the edit introduced errors that were not there before.
 local function schedule_auto_fix(buf, pre_errors, record)
     local opts = config.options
+    local kind = opts.provider.kind
     if not opts.auto_fix or record.autofix
-        or opts.provider.kind ~= "openai" or not record.transcript then
+        or (kind ~= "openai" and kind ~= "claude")
+        or (kind == "openai" and not record.transcript) then
         return
     end
     vim.defer_fn(function()
@@ -1014,8 +1018,9 @@ function M.followup(given_instruction, internal)
     if not last then
         return bail("no previous edit to follow up on")
     end
-    if config.options.provider.kind ~= "openai" then
-        return bail("follow-ups need an openai-kind provider (no transcript otherwise)")
+    local kind = config.options.provider.kind
+    if kind ~= "openai" and kind ~= "claude" then
+        return bail("follow-ups need an openai- or claude-kind provider")
     end
     if not (vim.api.nvim_buf_is_valid(last.buf)) then
         return bail("the buffer of the last edit is gone")
@@ -1024,15 +1029,24 @@ function M.followup(given_instruction, internal)
     if not srow then
         return bail("lost track of the last edit's region")
     end
-    local transcript_path = last.record and last.record.transcript
-    if not (transcript_path and vim.fn.filereadable(transcript_path) == 1) then
-        return bail("no transcript recorded for the last edit")
-    end
-    local ok, messages = pcall(function()
-        return vim.json.decode(table.concat(vim.fn.readfile(transcript_path), "\n"))
-    end)
-    if not ok then
-        return bail("could not read the last transcript")
+    -- Only openai-kind runs carry a message transcript the provider can
+    -- resume: claude's on_exit synthesizes one for the history view, but
+    -- the claude branch of M.start does not consume it as conversation
+    -- history, so a claude follow-up runs as a fresh turn instead, relying
+    -- on the followup prompt's own <current> region and instruction.
+    local messages
+    if kind == "openai" then
+        local transcript_path = last.record and last.record.transcript
+        if not (transcript_path and vim.fn.filereadable(transcript_path) == 1) then
+            return bail("no transcript recorded for the last edit")
+        end
+        local ok, decoded = pcall(function()
+            return vim.json.decode(table.concat(vim.fn.readfile(transcript_path), "\n"))
+        end)
+        if not ok then
+            return bail("could not read the last transcript")
+        end
+        messages = decoded
     end
     local buf, first, last_line = last.buf, srow + 1, erow + 1
     local function run(instruction)
