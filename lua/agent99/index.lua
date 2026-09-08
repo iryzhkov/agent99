@@ -537,15 +537,11 @@ local function top_level_outline(path, budget, missing)
     return out, #lines
 end
 
-local function workspace_map(args)
-    local root = args.root
-    if type(root) ~= "string" or root == "" then
-        err("missing project root")
-    end
-    local target = root
-    if type(args.path) == "string" and args.path ~= "" then
-        target = args.path:sub(1, 1) == "/" and args.path or (root .. "/" .. args.path)
-    end
+-- Every project file under `target`, relative to it and path-sorted: git's
+-- view when it is a repository (tracked plus untracked, ignores honoured),
+-- the filesystem otherwise. git lists tracked files before untracked ones;
+-- a sorted list is easier to scan and stable across runs.
+local function list_project_files(target)
     local files = vim.fn.systemlist({ "git", "-C", target,
         "ls-files", "--cached", "--others", "--exclude-standard" })
     if vim.v.shell_error ~= 0 then
@@ -556,9 +552,498 @@ local function workspace_map(args)
             end
         end
     end
-    -- git lists tracked files before untracked ones; a path-sorted map is
-    -- easier to scan and stable across runs.
     table.sort(files)
+    return files
+end
+
+-- Workspace tree: the directory structure with aggregated stats, and the
+-- files that matter most, cut to a line budget. Line counts come from one
+-- wc pass and binaries from git's own classification, so it costs a few
+-- hundred milliseconds on a monorepo where workspace_map would parse for
+-- minutes. open_workspace's reply carries the root's tree, as the check
+-- that the right project was opened and the hint which subdirectory to map
+-- next; the tool zooms into one.
+local TREE_BUDGET = 40
+local TREE_BUDGET_MAX = 400
+local TREE_DEPTH = 2
+local TREE_DEPTH_MAX = 8
+-- Biggest files a directory line names, as a hint to what to read there.
+local TREE_BIGGEST = 2
+-- Directory names that usually hold code nobody here wrote.
+local VENDOR_DIRS = {
+    node_modules = true, vendor = true, third_party = true, ["third-party"] = true,
+    [".deps"] = true, dist = true, build = true, target = true,
+}
+-- Binary by extension, for a tree with no git to ask.
+local BINARY_EXT = {
+    png = true, jpg = true, jpeg = true, gif = true, ico = true, webp = true, bmp = true,
+    pdf = true, zip = true, gz = true, tgz = true, xz = true, bz2 = true, tar = true, ["7z"] = true,
+    woff = true, woff2 = true, ttf = true, otf = true, eot = true,
+    so = true, o = true, a = true, dylib = true, dll = true, exe = true, bin = true, wasm = true,
+    mp3 = true, mp4 = true, ogg = true, wav = true, mov = true, webm = true,
+    sqlite = true, db = true, pyc = true, class = true, jar = true,
+}
+
+local function fmt_count(n)
+    if n < 1000 then return tostring(n) end
+    if n < 10000 then return ("%.1fk"):format(n / 1000) end
+    return ("%dk"):format(math.floor(n / 1000 + 0.5))
+end
+
+local function plural(n, word)
+    return fmt_count(n) .. " " .. word .. (n == 1 and "" or "s")
+end
+
+-- Which of the project files are binary. git knows (it classified them
+-- when it hashed them: "w/-text" in --eol output); elsewhere the extension
+-- has to do.
+local function binary_files(target, files)
+    local set = {}
+    local out = vim.fn.systemlist({ "git", "-C", target, "ls-files", "--eol",
+        "--cached", "--others", "--exclude-standard" })
+    if vim.v.shell_error == 0 then
+        for _, line in ipairs(out) do
+            local w, path = line:match("^i/%S*%s+w/(%S*)%s+attr/%S*%s+(.*)$")
+            if w == "-text" and path then
+                set[path] = true
+            end
+        end
+        return set, true
+    end
+    for _, rel in ipairs(files) do
+        local ext = rel:match("%.([%w]+)$")
+        if ext and BINARY_EXT[ext:lower()] then
+            set[rel] = true
+        end
+    end
+    return set, false
+end
+
+-- Line counts for many files in one wc pass (chunked, so a monorepo does
+-- not overflow the argument list). Files that are gone from disk but still
+-- tracked come back nil.
+local function count_lines(target, files)
+    local counts = {}
+    local CHUNK = 500
+    for i = 1, #files, CHUNK do
+        local cmd = { "wc", "-l" }
+        for j = i, math.min(i + CHUNK - 1, #files) do
+            cmd[#cmd + 1] = target .. "/" .. files[j]
+        end
+        for _, line in ipairs(vim.fn.systemlist(cmd)) do
+            local n, path = line:match("^%s*(%d+)%s+(.*)$")
+            if n and path ~= "total" and path:sub(1, #target + 1) == target .. "/" then
+                counts[path:sub(#target + 2)] = tonumber(n)
+            end
+        end
+        sleep(0)
+    end
+    return counts
+end
+
+local function workspace_tree(args)
+    local root = args.root
+    if type(root) ~= "string" or root == "" then
+        err("missing project root")
+    end
+    local target = root
+    if type(args.path) == "string" and args.path ~= "" then
+        target = args.path:sub(1, 1) == "/" and args.path or (root .. "/" .. args.path)
+        if vim.fn.isdirectory(target) == 0 then
+            err("not a directory: %s", target)
+        end
+    end
+    target = target:gsub("/+$", "")
+    local max_depth = math.max(1, math.min(TREE_DEPTH_MAX, tonumber(args.depth) or TREE_DEPTH))
+    local budget = math.max(5, math.min(TREE_BUDGET_MAX, tonumber(args.budget) or TREE_BUDGET))
+
+    local files = list_project_files(target)
+    local binaries, from_git = binary_files(target, files)
+    local text_files = {}
+    for _, rel in ipairs(files) do
+        if not binaries[rel] then
+            text_files[#text_files + 1] = rel
+        end
+    end
+    local counts = count_lines(target, text_files)
+    -- Declaration counts are a parse per file: worth it while the project is
+    -- small enough that the map would have listed them anyway.
+    local decls
+    if #text_files <= MAP_SMALL_PROJECT then
+        decls = {}
+        for _, rel in ipairs(text_files) do
+            local outline = top_level_outline(target .. "/" .. rel, 100000)
+            if outline then
+                decls[rel] = #outline
+            end
+        end
+    end
+    local ft_cache = {}
+    local function file_type(rel)
+        local key = rel:match("%.([%w_]+)$") or vim.fs.basename(rel)
+        key = key:lower()
+        local cached = ft_cache[key]
+        if cached == nil then
+            cached = vim.filetype.match({ filename = rel }) or false
+            ft_cache[key] = cached
+        end
+        return cached or nil
+    end
+
+    -- Pass 1: every directory with what is under it, at any depth.
+    local dirs = {}
+    local function dir_at(key)
+        local d = dirs[key]
+        if not d then
+            d = { path = key, files = 0, lines = 0, decls = 0, tests = 0, binaries = 0,
+                fts = {}, biggest = {}, children = {}, direct = {} }
+            dirs[key] = d
+        end
+        return d
+    end
+    dir_at("")
+    local total_lines, missing = 0, 0
+    for _, rel in ipairs(files) do
+        local binary = binaries[rel] or false
+        local lines = counts[rel]
+        if not binary and lines == nil then
+            missing = missing + 1
+        else
+            lines = lines or 0
+            total_lines = total_lines + lines
+            local ft = (not binary) and file_type(rel) or nil
+            local test = is_test_path(rel)
+            local parts = vim.split(rel, "/", { plain = true })
+            local name = parts[#parts]
+            local entry = { rel = rel, name = name, lines = lines, binary = binary,
+                decls = decls and decls[rel] or nil }
+            local key = ""
+            for k = 0, #parts - 1 do
+                if k > 0 then
+                    local child = key == "" and parts[k] or (key .. "/" .. parts[k])
+                    dir_at(key).children[child] = true
+                    key = child
+                end
+                local d = dir_at(key)
+                d.files = d.files + 1
+                d.lines = d.lines + lines
+                d.decls = d.decls + (entry.decls or 0)
+                if test then d.tests = d.tests + 1 end
+                if binary then
+                    d.binaries = d.binaries + 1
+                elseif ft then
+                    d.fts[ft] = (d.fts[ft] or 0) + 1
+                end
+                if not binary then
+                    local b = d.biggest
+                    b[#b + 1] = entry
+                    table.sort(b, function(x, y) return x.lines > y.lines end)
+                    if #b > TREE_BIGGEST then b[#b] = nil end
+                end
+            end
+            local parent = dir_at(key)
+            parent.direct[#parent.direct + 1] = entry
+        end
+    end
+
+    -- Pass 2: the shape to show. A chain of single-child directories with
+    -- nothing else in them (lua/agent99/, src/main/java/...) is one line
+    -- and one level, since the middle names carry no information.
+    local function child_count(d)
+        local n = 0
+        for _ in pairs(d.children) do n = n + 1 end
+        return n
+    end
+    local function walk(key, depth)
+        local d = dirs[key]
+        if key ~= "" then
+            while #d.direct == 0 and child_count(d) == 1 do
+                d = dirs[next(d.children)]
+            end
+        end
+        local node = { dir = d, label = d.path, depth = depth, kids = {}, hidden_subdirs = 0 }
+        local children = vim.tbl_keys(d.children)
+        table.sort(children)
+        if depth < max_depth then
+            for _, child in ipairs(children) do
+                node.kids[#node.kids + 1] = walk(child, depth + 1)
+            end
+        else
+            node.hidden_subdirs = #children
+        end
+        return node
+    end
+    local tree = walk("", 0)
+
+    -- Budget, in three rounds. Root files first, up to a third of it: a
+    -- Makefile or a go.mod is twenty lines that say how the project is
+    -- built, and they are what tells a wrong root from the right one.
+    -- Then directories, the skeleton, largest first (size discounted per
+    -- level). Then the remaining files by the same discounted size, so a
+    -- file two levels down needs four times the lines of a top-level one
+    -- to outrank it. A directory whose files all missed the cut says so on
+    -- its own line already ("40 files"), so it gets no "+N more" line;
+    -- one that shows some of its files does, and that line is budgeted.
+    local function score(lines, depth)
+        return lines * (0.5 ^ depth)
+    end
+    local dir_nodes, root_files, file_entries = {}, {}, {}
+    local function collect(node)
+        for _, kid in ipairs(node.kids) do
+            kid.parent = node
+            dir_nodes[#dir_nodes + 1] = kid
+            collect(kid)
+        end
+        -- Binaries are counted on the directory line and never listed; a
+        -- directory holding one file and nothing else is rendered as that
+        -- file, so its contents are not a separate line.
+        if node ~= tree and #node.dir.direct == 1 and next(node.dir.children) == nil then
+            node.single = node.dir.direct[1]
+            return
+        end
+        for _, f in ipairs(node.dir.direct) do
+            if not f.binary then
+                local fe = { node = node, entry = f, score = score(f.lines, node.depth) }
+                if node == tree then
+                    root_files[#root_files + 1] = fe
+                else
+                    file_entries[#file_entries + 1] = fe
+                end
+            end
+        end
+    end
+    collect(tree)
+    local function by_score(a, b)
+        if a.score ~= b.score then return a.score > b.score end
+        return a.entry.rel < b.entry.rel
+    end
+    table.sort(root_files, by_score)
+    table.sort(file_entries, by_score)
+    table.sort(dir_nodes, function(a, b)
+        local sa, sb = score(a.dir.lines, a.depth), score(b.dir.lines, b.depth)
+        if sa ~= sb then return sa > sb end
+        return a.label < b.label
+    end)
+
+    local shown_files, shown_dirs, used = {}, {}, 0
+    -- Round 1: root files.
+    local root_cap = math.floor(budget / 3)
+    for i, fe in ipairs(root_files) do
+        if i > root_cap then break end
+        shown_files[fe.entry] = true
+        used = used + 1
+    end
+    -- Round 2: directories. A parent always ranks at or above its children
+    -- (more lines, shallower), so they come in an order where a shown
+    -- directory's ancestors are shown too.
+    local dirs_cut = 0
+    for _, node in ipairs(dir_nodes) do
+        if used < budget then
+            shown_dirs[node] = true
+            used = used + 1
+        else
+            dirs_cut = dirs_cut + 1
+        end
+    end
+    local function ancestors_shown(node)
+        local n = node
+        while n and n ~= tree do
+            if not shown_dirs[n] then return false end
+            n = n.parent
+        end
+        return true
+    end
+    -- Round 3: the rest of the files, in one ranked list, with the root's
+    -- leftovers competing on equal terms.
+    for i = root_cap + 1, #root_files do
+        file_entries[#file_entries + 1] = root_files[i]
+    end
+    table.sort(file_entries, by_score)
+    local candidates = {}
+    for _, fe in ipairs(file_entries) do
+        if ancestors_shown(fe.node) then
+            candidates[#candidates + 1] = fe
+        end
+    end
+    -- Lines a "+N more files" summary costs: one per directory that shows
+    -- some of its files but not all.
+    local function summary_lines()
+        local partial, n = {}, 0
+        for _, fe in ipairs(candidates) do
+            if not shown_files[fe.entry] and not partial[fe.node] then
+                -- Does this directory show any file?
+                for _, other in ipairs(fe.node.dir.direct) do
+                    if shown_files[other] then
+                        partial[fe.node] = true
+                        n = n + 1
+                        break
+                    end
+                end
+            end
+        end
+        return n
+    end
+    local taken = 0
+    for _, fe in ipairs(candidates) do
+        if used + taken >= budget then break end
+        shown_files[fe.entry] = true
+        taken = taken + 1
+    end
+    -- Summary lines take slots too; give back the lowest-ranked files until
+    -- everything fits (a directory losing its last shown file loses its
+    -- summary line with it).
+    local over = used + taken + summary_lines() - budget
+    for i = #candidates, 1, -1 do
+        if over <= 0 then break end
+        local fe = candidates[i]
+        if shown_files[fe.entry] then
+            shown_files[fe.entry] = nil
+            taken = taken - 1
+            over = used + taken + summary_lines() - budget
+        end
+    end
+    local omitted = {}
+    for _, fe in ipairs(candidates) do
+        if not shown_files[fe.entry] then
+            omitted[fe.node] = (omitted[fe.node] or 0) + 1
+        end
+    end
+    for node, _ in pairs(omitted) do
+        local any = false
+        for _, f in ipairs(node.dir.direct) do
+            if shown_files[f] then any = true break end
+        end
+        if not any then omitted[node] = nil end
+    end
+    local n_omit_lines = 0
+    for _ in pairs(omitted) do n_omit_lines = n_omit_lines + 1 end
+
+    -- Render in tree order.
+    local out = {}
+    local function file_line(entry, indent)
+        local desc
+        if entry.binary then
+            desc = "binary"
+        else
+            desc = plural(entry.lines, "line")
+            if entry.decls then
+                desc = desc .. ", " .. entry.decls .. " decls"
+            end
+        end
+        return ("%s%s  %s"):format(("  "):rep(indent), entry.name, desc)
+    end
+    local function dir_line(node)
+        local d = node.dir
+        if node.single then
+            local f = node.single
+            local desc = f.binary and "binary" or plural(f.lines, "line")
+            if f.decls then desc = desc .. ", " .. f.decls .. " decls" end
+            return ("%s%s/%s  %s"):format(("  "):rep(node.depth - 1), node.label, f.name, desc)
+        end
+        local parts = { plural(d.files, "file") }
+        if d.lines > 0 then
+            parts[#parts + 1] = plural(d.lines, "line")
+        end
+        if decls and d.decls > 0 then
+            parts[#parts + 1] = d.decls .. " decls"
+        end
+        local fts = vim.tbl_keys(d.fts)
+        table.sort(fts, function(a, b)
+            if d.fts[a] ~= d.fts[b] then return d.fts[a] > d.fts[b] end
+            return a < b
+        end)
+        local langs = {}
+        for i = 1, math.min(2, #fts) do langs[#langs + 1] = fts[i] end
+        if #fts > 2 then langs[#langs + 1] = "+" .. (#fts - 2) end
+        if d.binaries > 0 and d.binaries == d.files then
+            langs = { "binary" }
+        elseif d.binaries > 0 then
+            langs[#langs + 1] = d.binaries .. " binary"
+        end
+        if #langs > 0 then
+            parts[#parts + 1] = table.concat(langs, " ")
+        end
+        local line = ("%s%s/  %s"):format(("  "):rep(node.depth - 1), node.label, table.concat(parts, "  "))
+        local extras = {}
+        if #d.biggest > 0 and d.files > 1 then
+            local names = {}
+            for _, b in ipairs(d.biggest) do
+                names[#names + 1] = b.name .. " " .. fmt_count(b.lines)
+            end
+            extras[#extras + 1] = table.concat(names, ", ")
+        end
+        if d.tests > 0 then
+            extras[#extras + 1] = d.tests .. " tests"
+        end
+        if node.hidden_subdirs > 0 then
+            extras[#extras + 1] = ("+%d subdirectories"):format(node.hidden_subdirs)
+        end
+        if #extras > 0 then
+            line = line .. " (" .. table.concat(extras, "; ") .. ")"
+        end
+        if VENDOR_DIRS[vim.fs.basename(node.label)] then
+            line = line .. " [vendored?]"
+        end
+        return line
+    end
+    local function render(node)
+        local direct = vim.list_slice(node.dir.direct)
+        table.sort(direct, function(a, b)
+            if a.lines ~= b.lines then return a.lines > b.lines end
+            return a.name < b.name
+        end)
+        for _, f in ipairs(direct) do
+            if shown_files[f] then
+                out[#out + 1] = file_line(f, node.depth)
+            end
+        end
+        if omitted[node] then
+            out[#out + 1] = ("%s… +%d more files"):format(("  "):rep(node.depth), omitted[node])
+        end
+        for _, kid in ipairs(node.kids) do
+            if shown_dirs[kid] then
+                out[#out + 1] = dir_line(kid)
+                render(kid)
+            end
+        end
+    end
+    render(tree)
+
+    local notes = {}
+    if dirs_cut > 0 then
+        notes[#notes + 1] = ("%d directories did not fit the budget of %d lines; raise budget=, "
+            .. "or zoom with path="):format(dirs_cut, budget)
+    end
+    if n_omit_lines > 0 or tree.hidden_subdirs > 0 or #dir_nodes > 0 then
+        notes[#notes + 1] = "workspace_tree(path=<dir>) zooms in; workspace_map(path=<dir>) lists "
+            .. "the declarations of the files there"
+    end
+    if not from_git then
+        notes[#notes + 1] = "not a git repository: nothing is ignored, and binaries are guessed by extension"
+    end
+    if missing > 0 then
+        notes[#notes + 1] = ("%d tracked files are missing from disk"):format(missing)
+    end
+    return {
+        root = target,
+        depth = max_depth,
+        file_count = #files,
+        line_count = total_lines,
+        tree = out,
+        note = #notes > 0 and table.concat(notes, ". ") or nil,
+    }
+end
+
+local function workspace_map(args)
+    local root = args.root
+    if type(root) ~= "string" or root == "" then
+        err("missing project root")
+    end
+    local target = root
+    if type(args.path) == "string" and args.path ~= "" then
+        target = args.path:sub(1, 1) == "/" and args.path or (root .. "/" .. args.path)
+    end
+    local files = list_project_files(target)
     local tests_skipped = 0
     -- Tests are left out to keep a big map readable; in a small project
     -- they are the spec (a bug-fix task starts from the failing test) and
@@ -1813,6 +2298,7 @@ M.ts_query = ts_query
 M.ts_outline = ts_outline
 M.skim = skim
 M.workspace_map = workspace_map
+M.workspace_tree = workspace_tree
 M.document_symbols = document_symbols
 M.symbol_match_rank = symbol_match_rank
 M.warm_up_project = warm_up_project

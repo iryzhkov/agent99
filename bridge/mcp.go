@@ -85,6 +85,21 @@ func openWorkspaceResult(ws *headlessWorkspace) map[string]any {
 	} else {
 		result["note"] = "could not probe language support: " + err.Error()
 	}
+	// The tree is the check that the right project was opened and the hint
+	// which subdirectory to map next; it costs one wc pass, so it is cheap
+	// enough for every open.
+	if tree, err := nvimCall(ws.Socket, "workspace_tree", map[string]any{"root": ws.Root}); err == nil {
+		if m, ok := tree.(map[string]any); ok {
+			result["tree"] = m["tree"]
+			result["file_count"] = m["file_count"]
+			result["line_count"] = m["line_count"]
+			if note, ok := m["note"].(string); ok && note != "" {
+				result["tree_note"] = note
+			}
+		}
+	} else {
+		result["tree_note"] = "could not build the workspace tree: " + err.Error()
+	}
 	// With more than one open, the roster is what the model needs in order
 	// to address them; with one it would be noise.
 	if roots := openRoots(); len(roots) > 1 {

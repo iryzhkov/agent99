@@ -134,6 +134,19 @@ var lspTools = []tool{
 		},
 	},
 	{
+		Name:        "workspace_tree",
+		Description: "The directory structure with aggregated stats (files, lines, languages, tests, biggest files) and the files that matter most, cut to a line budget; in a small project declaration counts too. open_workspace's reply carries the root's tree; call this to zoom into one directory (path=) or see more (depth=, budget=). Cheaper than workspace_map by orders of magnitude on a big repo: it reads no file contents beyond a line count.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":   map[string]any{"type": "string", "description": "Subdirectory to start from (default: root)."},
+				"depth":  map[string]any{"type": "integer", "description": "Directory levels to show (default 2; a chain of single-child directories counts as one)."},
+				"budget": map[string]any{"type": "integer", "description": "Lines of output (default 40, max 400). Directories go first, then files ranked by size discounted per level."},
+			},
+			"required": []string{},
+		},
+	},
+	{
 		Name:        "workspace_map",
 		Description: "Every project file with its line count and declarations - classes with their methods one level in - in one cheap call. The first move in an unfamiliar repo. In a big project test files are left out unless include_tests; a small one lists them.",
 		InputSchema: map[string]any{

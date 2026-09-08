@@ -60,6 +60,9 @@ def main():
         res = b.call("open_workspace", {"root": alpha})
         check("first workspace opens", res.get("root") == alpha, res)
         check("one workspace lists no roster", "workspaces" not in res, res)
+        check("open reply carries the workspace tree",
+              isinstance(res.get("tree"), list) and res.get("file_count", 0) > 0
+              and any("lua" in l for l in res["tree"]), res)
         alpha_pid = res["pid"]
 
         # A root that shares a file tree with an open workspace is refused,

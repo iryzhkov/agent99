@@ -342,8 +342,11 @@ imports and references that have to move with a change actually move.
 
 ### What you get over plain file tools
 
-- **Structure instead of text.** `workspace_map` gives every file in the
-  project with its declarations — classes with their methods one level in —
+- **Structure instead of text.** `open_workspace` answers with the
+  workspace tree: directories with their file and line counts, languages
+  and biggest files, so a wrong root is obvious and the right subdirectory
+  is named before anything is read. `workspace_map` gives every file in a
+  directory with its declarations — classes with their methods one level in —
   in one call. `find_symbol` fetches one function out of a 1600-line module
   by name path (`Flask/full_dispatch_request`), with its lines numbered
   relative to the symbol so the next edit can address them directly.
@@ -371,11 +374,14 @@ imports and references that have to move with a change actually move.
 Without `$AGENT99_NVIM` the server runs in **standalone mode**: it serves
 `open_workspace(root)`, which starts a headless Neovim in that project with
 your normal configuration (so the same language servers attach), and
-routes the calls naming a path in that tree to it. Its reply lists the
-languages found in the root with the parser and language server each one
-got, and warns about languages the instance cannot serve (`workspace_map`
-and `skim` say the same when they meet such files). `close_workspace` stops
-an instance, and every one of them is stopped when the server exits.
+routes the calls naming a path in that tree to it. Its reply carries the
+workspace tree (`workspace_tree`'s view of the root: directories with file
+and line counts, languages and biggest files, so a wrong root is obvious
+at once) and lists the languages found in the root with the parser and
+language server each one got, warning about languages the instance cannot
+serve (`workspace_map` and `skim` say the same when they meet such files).
+`close_workspace` stops an instance, and every one of them is stopped when
+the server exits.
 Standalone mode additionally serves the
 file tools (`read_file`, annotated `grep`, `list_files`), with relative paths resolved against the
 workspace, and symbol edits are saved to disk right after they are
@@ -664,7 +670,8 @@ the legitimate use), and streaming output outside replies.
 | `debug_stack`, `debug_variables`, `debug_evaluate`, `debug_output` | the rest on demand: deeper stack with external frames collapsed, variables of a frame one level deep or one path expanded, an expression in a frame, and the captured output (up to 200 lines, surviving the exit) |
 | `debug_stop` | terminate a launched program or disconnect from an attached one (left running unless `force`), remove the agent's breakpoints, kill the adapter if it lingers |
 | `install_debugger` | standalone MCP only: delve, debugpy, codelldb, js-debug-adapter or java-debug-adapter through Mason, for a language whose `debugger` field says none |
-| `workspace_map` | the whole workspace's shape in one call: every project file with its line count and its declarations, descending one level into classes so nested languages list their methods (string parsers on disk content — no buffers created, no servers attached); the outline budget is shared across files (`+N more` marks a cut); in a project of more than 40 files test files are left out unless `include_tests` (a small project's tests are its spec, so they stay in); the intended first move in an unfamiliar repo, ahead of skim/grep. Markdown files list their headings |
+| `workspace_tree` | the directory structure with aggregated stats, cut to a line budget (40 by default, `budget=` up to 400): each directory with its file and line counts, its languages, test count, biggest files and hidden subdirectories, and the files that matter most listed under it; in a project of 40 files or fewer, declaration counts too. Root files come first (a Makefile or go.mod is what tells the project apart), then directories largest first, then the remaining files ranked by size discounted per level, so a file two levels down needs four times the lines of a top-level one to earn a line. Chains of single-child directories collapse to one line (`lua/agent99/`), binaries are counted and never listed, and a directory holding one file is shown as that file. One `git ls-files` and one `wc` pass, so a monorepo answers in a quarter of a second. `open_workspace`'s reply carries the root's tree; `path=` zooms into a directory and `depth=` (default 2) goes further down |
+| `workspace_map` | the shape of a directory or the whole workspace: every project file with its line count and its declarations, descending one level into classes so nested languages list their methods (string parsers on disk content — no buffers created, no servers attached); the outline budget is shared across files (`+N more` marks a cut); in a project of more than 40 files test files are left out unless `include_tests` (a small project's tests are its spec, so they stay in); the move after `workspace_tree` has named the directory that matters, ahead of skim/grep. Markdown files list their headings |
 | `skim` | structure of up to 20 files in one call: every function/class/method declaration line with line numbers, nested (treesitter, LSP-symbol fallback; C/C++ take the server's symbols first because macros confuse the grammar) — measures ~6-25% of the tokens of reading the same files. Markdown headings index like declarations, so a README's sections are name paths (`Install/Requirements`) for `find_symbol`, the section edits and grep's hit tags. Data files index by key the same way: a compose file's `services/api/environment`, a TOML `[server]` table, a JSON object's members, a Dockerfile's build stages (`FROM … AS runtime` up to the next `FROM`); lists are not descended into. Build files too: a Makefile's targets and variables are symbols (`smoke` is the target with its recipe), and a shell script's are its functions and the variables it sets at the top — an assignment further in is a statement, not a declaration of the file. A long file whose outline is trivial (one top-level key) is read as text rather than answered with the outline |
 | `find_symbol` | look up symbols by `/`-joined name path, optionally returning the full body — fetch exactly one function instead of a whole file. `file`, `files` and `glob` narrow the search; with none of them it covers the whole workspace, ripgrep first cutting it down to the files that spell the name at all, since a file that never writes the name cannot declare it. Constants and module-level variables are included by folding in the server's document symbols, which treesitter's declaration nodes leave out. A name path that matches nothing answers with `count: 0` and `suggestions` (the symbols sharing its last segment), never with fuzzy matches that read like the symbol being found somewhere else |
 | `ts_query` | structural multi-file search: a treesitter s-expression query with `@captures` and `#eq?`/`#match?` predicates — for questions grep can't ask |

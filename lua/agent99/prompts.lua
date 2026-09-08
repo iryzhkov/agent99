@@ -8,9 +8,10 @@ local M = {}
 
 local TOOL_GUIDE = {
     "You have %s tools backed by the user's live editor.",
-    "Explore cheaply, from coarse to fine: workspace_map (whole-repo shape -",
-    "files and top-level declarations in one call; the first move in an",
-    "unfamiliar repo), skim (nested structure of specific files), find_symbol",
+    "Explore cheaply, from coarse to fine: workspace_tree (directories with",
+    "file and line counts and the biggest files; the first move in a repo you",
+    "do not know), workspace_map (files and top-level declarations of one",
+    "directory or the whole repo), skim (nested structure of specific files), find_symbol",
     "(fetch exactly one function/class by name with include_body=true -",
     "prefer this over reading files), ts_query (structural multi-file",
     "search), plus grep (hits are annotated with their enclosing",

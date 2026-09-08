@@ -341,6 +341,28 @@ def group_index(c):
           not any(f["file"].endswith("util_test.lua") for f in res.get("files", []))
           and "1 test files left out" in (res.get("note") or ""), res)
 
+    # workspace_tree: directories with aggregated stats, root files first,
+    # the tree cut to the budget, and a zoom by path.
+    res = b.call("workspace_tree", {})
+    tree = res.get("tree", [])
+    check("workspace_tree lists lua/testproj with stats",
+          any(l.startswith("lua/testproj/") and "files" in l and "lines" in l and "lua" in l
+              for l in tree)
+          and res.get("file_count", 0) > 0 and res.get("line_count", 0) > 0, res)
+    check("workspace_tree counts declarations in a small project",
+          any("decls" in l for l in tree), tree)
+    res = b.call("workspace_tree", {"budget": 5})
+    check("workspace_tree honours the budget", len(res.get("tree", [])) <= 5, res)
+    res = b.call("workspace_tree", {"path": "lua/testproj", "depth": 1})
+    check("workspace_tree zooms by path",
+          res.get("root", "").endswith("lua/testproj")
+          and any(l.startswith("util.lua") for l in res.get("tree", [])), res)
+    try:
+        b.call("workspace_tree", {"path": "nowhere"})
+        check("workspace_tree refuses a missing directory", False, "call succeeded")
+    except RuntimeError as e:
+        check("workspace_tree refuses a missing directory", "not a directory" in str(e), e)
+
     reset(c)
     # A name path that matches nothing yields suggestions, not matches.
     res = b.call("find_symbol", {"file": util, "name": "Nope/greet"})
