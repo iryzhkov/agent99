@@ -502,24 +502,19 @@ def group_edit(c):
     util, main_lua, tools = c.util, c.main_lua, c.tools
 
     reset(c)
-    # A stale offset with the right expect is refused, and the refusal
-    # carries a code action that applies the edit where the text is.
-    try:
-        b.call("replace_symbol_lines", {
-            "file": util, "name_path": "M.greet", "first_line": 3, "last_line": 3,
-            "expect": 'return "hello, " .. name', "text": '    return "hi, " .. name',
-        })
-        check("stale expect is refused", False, "call succeeded")
-    except RuntimeError as e:
-        msg = str(e)
-        m = re.search(r"token=(\d+)", msg)
-        check("stale expect is refused with a relocation",
-              "at lines 2-2 (relative)" in msg and m is not None, msg)
-        assert m is not None
-        res = b.call("apply_code_action", {"token": m.group(1), "index": 1})
-        check("relocated edit applies",
-              res.get("replaced") == "lines 2-2 of M.greet"
-              and 'return "hi, "' in open(util).read(), res)
+    # A stale offset with the right expect: the text sits in exactly one
+    # other place, so the edit is applied there and the reply says so.
+    res = b.call("replace_symbol_lines", {
+        "file": util, "name_path": "M.greet", "first_line": 3, "last_line": 3,
+        "expect": 'return "hello, " .. name', "text": '    return "hi, " .. name',
+    })
+    moves = res.get("relocated", [])
+    check("stale expect is relocated and applied",
+          res.get("replaced") == "lines 2-2 of M.greet"
+          and 'return "hi, "' in open(util).read()
+          and len(moves) == 1 and moves[0].get("requested") == "lines 3-3 of M.greet"
+          and moves[0].get("applied_at", "").startswith("lines 2-2 of M.greet")
+          and "stale too" in res.get("relocated_note", ""), res)
 
     # Several chunks in one symbol apply together, bottom-up.
     res = b.call("replace_symbol_lines", {
@@ -569,28 +564,21 @@ def group_edit(c):
     check("chunks across symbols apply together",
           "tostring(name):lower()" in text and '.. "!"' in text
           and [c.get("symbol") for c in res.get("replaced_chunks", [])] == ["M.greet", "M.shout"], res)
-    try:
-        b.call("replace_symbol_lines", {
-            "file": util,
-            "chunks": [
-                {"name_path": "M.greet", "first_line": 1, "last_line": 3,
-                 "expect": "name = tostring(name):lower()", "text": "    name = tostring(name)"},
-                {"name_path": "M.shout", "first_line": 3, "last_line": 3,
-                 "expect": 'return string.upper(M.greet(name)) .. "!"',
-                 "text": "    return string.upper(M.greet(name))"},
-            ],
-        })
-        check("stale chunks across symbols are refused", False, "call succeeded")
-    except RuntimeError as e:
-        m = re.search(r"token=(\d+)", str(e))
-        check("stale chunks across symbols are refused with a relocation",
-              "at lines 2-2 (relative)" in str(e) and m is not None, e)
-        assert m is not None
-        res = b.call("apply_code_action", {"token": m.group(1), "index": 1})
-        text = open(util).read()
-        check("relocated chunks apply in both symbols",
-              "tostring(name):lower()" not in text and '.. "!"' not in text
-              and "    name = tostring(name)\n" in text, res)
+    res = b.call("replace_symbol_lines", {
+        "file": util,
+        "chunks": [
+            {"name_path": "M.greet", "first_line": 1, "last_line": 3,
+             "expect": "name = tostring(name):lower()", "text": "    name = tostring(name)"},
+            {"name_path": "M.shout", "first_line": 3, "last_line": 3,
+             "expect": 'return string.upper(M.greet(name)) .. "!"',
+             "text": "    return string.upper(M.greet(name))"},
+        ],
+    })
+    text = open(util).read()
+    check("stale chunks across symbols are relocated and applied",
+          "tostring(name):lower()" not in text and '.. "!"' not in text
+          and "    name = tostring(name)\n" in text
+          and len(res.get("relocated", [])) == 2, res)
 
     # Text-keyed: match names the lines, no arithmetic; refused when the
     # text is absent or ambiguous.
@@ -656,21 +644,14 @@ def group_edit(c):
         check("symbol-less needs absolute or match", False, "call succeeded")
     except RuntimeError as e:
         check("symbol-less needs absolute or match", "absolute=true" in str(e), e)
-    # A stale symbol-less chunk relocates too. Its code action has to
-    # address the buffer's own lines: with no name_path there is no
-    # declaration to be relative to, and relative numbers are refused.
-    try:
-        b.call("replace_symbol_lines", {
-            "file": util, "absolute": True, "first_line": 3, "last_line": 3,
-            "expect": "local M = {}", "text": "local M = {} -- barrel"})
-        check("stale symbol-less expect is refused", False, "call succeeded")
-    except RuntimeError as e:
-        m = re.search(r"token=(\d+)", str(e))
-        check("stale symbol-less expect is refused with a relocation", m is not None, e)
-        assert m is not None
-        res = b.call("apply_code_action", {"token": m.group(1), "index": 1})
-        check("relocated symbol-less edit applies",
-              open(util).read().startswith("local M = {} -- barrel\n"), res)
+    # A stale symbol-less chunk relocates too, addressing the buffer's own
+    # lines: with no name_path there is no declaration to be relative to.
+    res = b.call("replace_symbol_lines", {
+        "file": util, "absolute": True, "first_line": 3, "last_line": 3,
+        "expect": "local M = {}", "text": "local M = {} -- barrel"})
+    check("stale symbol-less expect is relocated and applied",
+          open(util).read().startswith("local M = {} -- barrel\n")
+          and len(res.get("relocated", [])) == 1, res)
     b.call("replace_symbol_lines", {
         "file": util, "match": "local M = {} -- barrel", "text": "local M = {}"})
 
@@ -797,25 +778,19 @@ def group_edit(c):
     # The expected text left the symbol entirely - the symbol shrank, or the
     # code moved - and it is still findable in the file. Relocating there
     # beats telling the caller to re-read a file that already holds it.
-    try:
-        b.call("replace_symbol_lines", {
-            "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
-            "expect": "return string.upper(M.greet(name))",
-            "text": "    return M.greet(name):upper()",
-        })
-        check("expect= relocates out of the symbol", False, "call succeeded")
-    except RuntimeError as e:
-        msg = str(e)
-        m = re.search(r"token=(\d+)", msg)
-        check("expect= relocates out of the symbol",
-              "outside M.greet, at buffer lines 11-11" in msg and m is not None, msg)
-        assert m is not None
-        # The relocated chunk drops name_path: buffer numbers outside the
-        # symbol would be converted back to offsets and refused for being
-        # out of its span.
-        res = b.call("apply_code_action", {"token": m.group(1), "index": 1})
-        check("the relocated edit applies outside the symbol",
-              "return M.greet(name):upper()" in open(util).read(), res)
+    # The relocated chunk drops name_path: buffer numbers outside the
+    # symbol would be converted back to offsets and refused for being out
+    # of its span.
+    res = b.call("replace_symbol_lines", {
+        "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
+        "expect": "return string.upper(M.greet(name))",
+        "text": "    return M.greet(name):upper()",
+    })
+    moves = res.get("relocated", [])
+    check("expect= relocates out of the symbol and applies",
+          "return M.greet(name):upper()" in open(util).read()
+          and len(moves) == 1
+          and moves[0].get("applied_at") == "buffer lines 11-11, outside M.greet", res)
 
     reset(c)
     # Same for match=, except that the text is not moved to; the caller is

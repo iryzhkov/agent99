@@ -1707,6 +1707,38 @@ local function edit_chunks(args)
     return out
 end
 
+-- The same replace_symbol_lines call with every chunk re-addressed to
+-- where its expected text actually is. Buffer line numbers throughout,
+-- whatever the original used: a chunk that names no symbol has no
+-- declaration to be relative to, and one whose text turned up outside its
+-- symbol cannot keep naming it (the numbers would be converted back to
+-- offsets and refused for being out of its span). The single-chunk fields
+-- are cleared because a call-wide name_path is inherited by every chunk
+-- that does not name one, which would put the symbol back on a chunk that
+-- just left it.
+local function relocated_args(args, chunks, relocated)
+    local moved = {}
+    for _, c in ipairs(chunks) do
+        local r = relocated[c]
+        local keep_symbol = not (r and r.scope == "file")
+        moved[#moved + 1] = {
+            first_line = r and (c.entry.first + r.first_line - 1) or c.abs_first,
+            last_line = r and (c.entry.first + r.last_line - 1) or c.abs_last,
+            text = c.text,
+            expect = c.expect,
+            name_path = keep_symbol and c.name_path or nil,
+            absolute = true,
+        }
+    end
+    local moved_args = vim.deepcopy(args)
+    moved_args.chunks = moved
+    moved_args.name_path = nil
+    moved_args.first_line, moved_args.last_line = nil, nil
+    moved_args.text, moved_args.expect = nil, nil
+    moved_args.match, moved_args.absolute = nil, nil
+    return moved_args
+end
+
 local function replace_symbol_lines(args)
     local chunks = edit_chunks(args)
     -- Each chunk addresses its own symbol (default: the call's name_path),
@@ -1851,6 +1883,38 @@ local function replace_symbol_lines(args)
     end
     if #stale > 0 then
         local lines = {}
+        local everywhere = vim.tbl_count(relocated) == #stale
+        -- Every stale chunk sits in exactly one other place, and the search
+        -- that found it is the one the caller would do next before calling
+        -- again with the new numbers. Do that call now: apply at the
+        -- relocated lines, and say so in the reply. The refusal below is
+        -- for the cases with nothing safe to do - text that is nowhere, or
+        -- in two places.
+        if everywhere and not args._relocating then
+            local moved_args = relocated_args(args, chunks, relocated)
+            moved_args._relocating = true
+            local result = replace_symbol_lines(moved_args)
+            local moves = {}
+            for _, s in ipairs(stale) do
+                local abs_first = s.c.entry.first + s.at - 1
+                moves[#moves + 1] = {
+                    requested = ("lines %d-%d of %s"):format(s.c.first, s.c.last, s.c.entry.path),
+                    applied_at = s.scope == "symbol"
+                        and ("lines %d-%d of %s (buffer lines %d-%d)"):format(
+                            s.at, s.at + s.n - 1, s.c.entry.path, abs_first, abs_first + s.n - 1)
+                        or ("buffer lines %d-%d, outside %s"):format(
+                            abs_first, abs_first + s.n - 1, s.c.entry.path),
+                    found_at_requested = s.have,
+                }
+            end
+            result.relocated = moves
+            result.relocated_note = ("%d chunk(s) did not hold the expected text at the requested lines; "
+                .. "the numbers were from before an earlier edit shifted them. The expected text was "
+                .. "in exactly one other place, so the edit was applied there instead - the lines above "
+                .. "say where. Later numbers for this file are stale too: re-read it, or use match=.")
+                :format(#moves)
+            return result
+        end
         for _, s in ipairs(stale) do
             lines[#lines + 1] = ("lines %d-%d of %s do not hold the expected text, so the numbers are "
                     .. "probably from before an earlier edit shifted them.\nexpected: %s\nfound:    %s")
@@ -1880,41 +1944,13 @@ local function replace_symbol_lines(args)
             end
         end
         local actions = {}
-        if vim.tbl_count(relocated) == #stale then
-            -- Every stale chunk has one home: the whole call, relocated.
-            local moved = {}
-            for _, c in ipairs(chunks) do
-                local r = relocated[c]
-                -- Buffer line numbers, whatever the refused call used to
-                -- address its chunks: a chunk that names no symbol has no
-                -- declaration to be relative to, and relative numbers there
-                -- are refused outright.
-                -- A chunk whose text turned up outside its symbol cannot keep
-                -- naming it: the buffer line numbers below would be converted
-                -- back to offsets and refused for being out of its span.
-                local keep_symbol = not (r and r.scope == "file")
-                moved[#moved + 1] = {
-                    first_line = r and (c.entry.first + r.first_line - 1) or c.abs_first,
-                    last_line = r and (c.entry.first + r.last_line - 1) or c.abs_last,
-                    text = c.text,
-                    expect = c.expect,
-                    name_path = keep_symbol and c.name_path or nil,
-                    absolute = true,
-                }
-            end
-            -- The chunks carry their own addressing now. The single-chunk
-            -- fields are ignored once `chunks` is set, but a call-wide
-            -- name_path is inherited by every chunk that does not name one,
-            -- which would put the symbol back on a chunk that just left it.
-            local moved_args = vim.deepcopy(args)
-            moved_args.chunks = moved
-            moved_args.name_path = nil
-            moved_args.first_line, moved_args.last_line = nil, nil
-            moved_args.text, moved_args.expect = nil, nil
-            moved_args.match, moved_args.absolute = nil, nil
+        if everywhere then
+            -- Reached only from a relocated call that went stale again (the
+            -- file changed between the two): offer the action rather than
+            -- chase it.
             actions[#actions + 1] = {
                 title = "apply the same edit at the relocated lines",
-                args = moved_args,
+                args = relocated_args(args, chunks, relocated),
             }
         end
         actions[#actions + 1] = {
