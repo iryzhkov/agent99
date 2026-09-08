@@ -207,11 +207,24 @@ local function send()
         end
     end
     close_all()
+    -- The draft and the staged selections outlive a refused start (no
+    -- bridge, no key, a region beyond the buffer's end): the windows are
+    -- closed, but reopening the composer finds everything still there.
+    local ok, started = pcall(a99req.start, target.buf, target.first, target.last,
+        text, opts)
+    if not ok then
+        vim.notify("agent99: could not start the request (draft kept): "
+            .. tostring(started), vim.log.levels.ERROR)
+        return
+    end
+    if not started then
+        vim.notify("agent99: request not started - draft kept, reopen the composer to retry",
+            vim.log.levels.WARN)
+        return
+    end
     vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, {})
     state.mode, state.target, state.contexts = nil, nil, {}
     state.continuation = nil
-    require("agent99.request").start(target.buf, target.first, target.last,
-        text, opts)
 end
 
 -- ---------------------------------------------------------------- render --

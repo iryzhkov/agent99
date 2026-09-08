@@ -21,8 +21,6 @@ local state = {
     preview = nil,    -- { pbuf, lines } while a preview awaits a decision
     last = nil,       -- { buf, mark_start, mark_end, record } after an apply
     last_edits = nil, -- symbol-tool edits of the last run, for :Agent99Revert
-    stderr_acc = nil, -- accumulated stderr when streaming (chat mode)
-    stdout_acc = nil, -- accumulated stdout when streaming (chat mode)
 }
 
 local function check_bridge()
@@ -54,12 +52,19 @@ local function bridge_env()
     return env
 end
 
--- Write the MCP config claude is pointed at. Regenerated per request so the
--- socket path is always the current instance's.
+-- The MCP config claude is pointed at. One file per Neovim instance (the
+-- pid is in the name): the config carries this instance's socket, and two
+-- instances sharing one file could hand each other's socket to claude.
+-- Regenerated per request so the socket path is always current; removed
+-- on exit.
+local function mcp_config_path()
+    return vim.fn.stdpath("cache") .. "/agent99/mcp-" .. vim.fn.getpid() .. ".json"
+end
+
+-- Returns the path, or nil (after notifying) when it could not be written.
 local function write_mcp_config()
-    local dir = vim.fn.stdpath("cache") .. "/agent99"
-    vim.fn.mkdir(dir, "p")
-    local path = dir .. "/mcp.json"
+    local path = mcp_config_path()
+    vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
     local cfg = {
         mcpServers = {
             lsp = {
@@ -69,7 +74,11 @@ local function write_mcp_config()
             },
         },
     }
-    vim.fn.writefile({ vim.json.encode(cfg) }, path)
+    if vim.fn.writefile({ vim.json.encode(cfg) }, path) == -1 then
+        vim.notify("agent99: could not write the MCP config at " .. path,
+            vim.log.levels.ERROR)
+        return nil
+    end
     return path
 end
 
@@ -95,31 +104,52 @@ local function clear_request(kill)
     state.record, state.started_at = nil, nil
 end
 
+-- vim.system children are not tied to the editor's lifetime: without this
+-- a :qa mid-run leaves `claude -p` or the bridge's agent loop running.
+vim.api.nvim_create_autocmd("VimLeavePre", {
+    group = vim.api.nvim_create_augroup("agent99_request", { clear = true }),
+    callback = function()
+        if state.record then
+            state.record.status = "cancelled"
+            pcall(history.write, state.record)
+        end
+        clear_request(true)
+        vim.fn.delete(mcp_config_path())
+    end,
+})
+
 -- Extract the replacement text from a reply, or nil when the reply does not
 -- contain one. Never fall back to the raw reply: a model that lost the
 -- format contract produces prose, and applying prose into a buffer is worse
--- than refusing.
-local function extract_replacement(out)
+-- than refusing. Only the newline right after the opening tag (or fence)
+-- and the one right before the closing tag are dropped, so a replacement
+-- that ends in a blank line keeps it and a selection round-trips intact.
+--
+-- With `strict`, only the <replacement> tag counts: in auto mode the
+-- reply's shape decides whether the instruction was an edit or a question,
+-- and a markdown answer that quotes an example in a code fence must not be
+-- taken for an edit and pasted over the selection.
+local function extract_replacement(out, strict)
     out = out:gsub("\r\n", "\n")
     -- Preferred: the <replacement> contract from the prompt.
     local tagged = out:match("<replacement>\n?(.-)\n?</replacement>")
     if tagged then
-        return (tagged:gsub("\n+$", ""))
+        return tagged
+    end
+    if strict then
+        return nil
     end
     -- Tolerate a fully fenced reply despite instructions to the contrary.
     local whole = out:match("^%s*```[%w_%-]*\n(.*)\n```%s*$")
     if whole then
-        return (whole:gsub("\n+$", ""))
+        return whole
     end
     -- Commentary with code fences: salvage the last fenced block.
     local last
     for block in out:gmatch("```[%w_%-]*\n(.-)\n```") do
         last = block
     end
-    if last then
-        return (last:gsub("\n+$", ""))
-    end
-    return nil
+    return last
 end
 
 -- Exposed for tests.
@@ -499,8 +529,12 @@ local function finish_failed(record, status, message)
 end
 
 local function keep_last_region()
+    if not (state.buf and vim.api.nvim_buf_is_valid(state.buf)
+            and state.mark_start and state.mark_end) then
+        return
+    end
     local srow, erow = region_from_marks(state.buf, state.mark_start, state.mark_end)
-    if not srow then
+    if not (srow and erow) then
         return
     end
     if state.last then
@@ -515,23 +549,31 @@ local function keep_last_region()
     }
 end
 
-local function on_exit(result)
+-- `run` is the closure of the M.start call that spawned the process:
+-- { record, job, stdout_acc, stderr_acc }. The exit is bound to it rather
+-- than to the module state, because a cancelled process still exits later:
+-- by then state may hold nothing (cancel) or the next request, and this
+-- exit must not consume that one's record and marks.
+local function on_exit(run, result)
     vim.schedule(function()
-        local record = state.record
+        local record = run.record
+        if state.record ~= record or state.job ~= run.job then
+            log("ignoring the exit of superseded run " .. tostring(record.id))
+            return
+        end
         -- When stderr was streamed (chat mode), vim.system delivers none in
         -- the result; use what the stream callback accumulated.
-        if result.stderr == nil and state.stderr_acc then
-            result.stderr = table.concat(state.stderr_acc.chunks)
+        if result.stderr == nil and run.stderr_acc then
+            result.stderr = table.concat(run.stderr_acc.chunks)
         end
-        state.stderr_acc = nil
         local streamed = false
-        if result.stdout == nil and state.stdout_acc then
-            result.stdout = table.concat(state.stdout_acc.chunks)
-            streamed = state.stdout_acc.started
+        if result.stdout == nil and run.stdout_acc then
+            result.stdout = table.concat(run.stdout_acc.chunks)
+            streamed = run.stdout_acc.started
         end
-        state.stdout_acc = nil
         log({
-            "exit code: " .. tostring(result.code),
+            "exit code: " .. tostring(result.code)
+            .. " signal: " .. tostring(result.signal),
             "stdout:", result.stdout or "", "stderr:", result.stderr or "",
         })
         -- The claude provider's stream-json output: one JSON event per
@@ -615,22 +657,23 @@ local function on_exit(result)
                 if #msgs > 0 and record.transcript then
                     table.insert(msgs, 1, { role = "user",
                         content = "The user says:\n" .. (record.instruction or "") })
-                    vim.fn.writefile(
-                        { vim.json.encode(msgs) }, record.transcript)
+                    if vim.fn.writefile(
+                            { vim.json.encode(msgs) }, record.transcript) == -1 then
+                        vim.notify("agent99: could not write the transcript at "
+                            .. record.transcript, vim.log.levels.WARN)
+                    end
                 end
             end
         end
         harvest_usage(record, result.stderr)
-        if not (state.buf and vim.api.nvim_buf_is_valid(state.buf)) then
-            record.status = "buffer_gone"
-            history.write(record)
-            clear_request(false)
-            return
-        end
-        if result.code ~= 0 then
+        -- A process killed by a signal reports code 0 in vim.system's
+        -- result; only the signal tells the run apart from a clean exit.
+        local signal = result.signal or 0
+        if result.code ~= 0 or signal ~= 0 then
             record.error = (result.stderr or ""):sub(-500)
-            finish_failed(record, "error",
-                ("agent exited with code %d (:Agent99Logs for details)"):format(result.code))
+            finish_failed(record, "error", signal ~= 0
+                and ("agent killed by signal %d (:Agent99Logs for details)"):format(signal)
+                or ("agent exited with code %d (:Agent99Logs for details)"):format(result.code))
             return
         end
         if result.stdout == nil or result.stdout:gsub("%s", "") == "" then
@@ -652,7 +695,7 @@ local function on_exit(result)
                 -- so the change is exact even if later edits shifted lines.
                 -- Stored as before/after so the history view can render both
                 -- sides with the file's own syntax highlighting.
-                if e.new_lines and #changes < 20 then
+                if e.new_lines then
                     changes[#changes + 1] = {
                         label = label,
                         file = e.file,
@@ -695,8 +738,11 @@ local function on_exit(result)
         -- Auto mode: the reply's shape decides. A replacement (or symbol
         -- edits) means it was an edit; a plain markdown reply means the
         -- instruction was a question. The record keeps the resolved mode.
-        if record.mode == "auto" then
-            if extract_replacement(result.stdout) or #tool_edits > 0 then
+        -- Only the <replacement> tag is evidence of an edit here: a
+        -- markdown answer routinely quotes example code in a fence.
+        local was_auto = record.mode == "auto"
+        if was_auto then
+            if extract_replacement(result.stdout, true) or #tool_edits > 0 then
                 record.mode = "edit"
             else
                 record.mode = "ask"
@@ -711,7 +757,7 @@ local function on_exit(result)
         if record.mode == "ask" then
             out = (result.stdout:gsub("\r\n", "\n"):gsub("\n+$", ""))
         else
-            out = extract_replacement(result.stdout)
+            out = extract_replacement(result.stdout, was_auto)
             if not out and #tool_edits > 0 then
                 local summary = result.stdout:match("<summary>%s*(.-)%s*</summary>")
                     or (result.stdout:gsub("%s+$", ""))
@@ -744,6 +790,17 @@ local function on_exit(result)
                     .. "(reply kept in :Agent99History)")
                 return
             end
+            -- Only an edit needs its target buffer; a chat or ask answer
+            -- was absorbed or shown above regardless of what got closed.
+            if not (state.buf and vim.api.nvim_buf_is_valid(state.buf)) then
+                record.result = out
+                record.status = "buffer_gone"
+                history.write(record)
+                vim.notify("agent99: the target buffer was closed; nothing applied "
+                    .. "(reply kept in :Agent99History)", vim.log.levels.WARN)
+                clear_request(false)
+                return
+            end
         end
         local lines = vim.split(out, "\n", { plain = true })
         record.result = out
@@ -774,7 +831,8 @@ end
 --- built one), messages (prior transcript for follow-ups/chat), system,
 --- stream, followup_of, autofix, provider (a resolved provider table
 --- overriding the configured one for this request only - the chat panel's
---- chat_provider fallback).
+--- chat_provider fallback). Returns true once the process is running,
+--- false when the request was refused (the reason has been notified).
 function M.start(buf, first, last, instruction, opts)
     opts = opts or {}
     local cfg = config.options
@@ -783,7 +841,19 @@ function M.start(buf, first, last, instruction, opts)
     local file = vim.api.nvim_buf_get_name(buf)
     if file == "" and opts.mode ~= "chat" then
         vim.notify("agent99: buffer has no file name", vim.log.levels.ERROR)
-        return
+        return false
+    end
+    if first then
+        -- A staged region can outlive edits to its buffer (the compose
+        -- draft survives closing); clamp it to what the buffer holds now
+        -- rather than let the end mark's placement throw.
+        local count = vim.api.nvim_buf_line_count(buf)
+        if first > count then
+            vim.notify(("agent99: lines %d-%d are beyond the end of the buffer (%d lines)")
+                :format(first, last, count), vim.log.levels.ERROR)
+            return false
+        end
+        last = math.min(last, count)
     end
     if state.preview then
         discard_preview(true)
@@ -830,17 +900,21 @@ function M.start(buf, first, last, instruction, opts)
 
     local bin = check_bridge()
     if not bin then
-        return
+        return false
     end
     local cmd, stdin
     if provider.kind == "claude" then
+        local mcp_config = write_mcp_config()
+        if not mcp_config then
+            return false
+        end
         cmd = {
             provider.claude_cmd, "-p",
             -- stream-json emits every step (assistant turns, tool calls,
             -- tool results) plus a final result envelope with usage - the
             -- material for the record's work trace; parsed in on_exit.
             "--output-format", "stream-json", "--verbose",
-            "--mcp-config", write_mcp_config(),
+            "--mcp-config", mcp_config,
             "--strict-mcp-config",
             "--allowedTools", table.concat(provider.allowed_tools, ","),
         }
@@ -856,7 +930,7 @@ function M.start(buf, first, last, instruction, opts)
             vim.notify(("agent99: no API key found. Run :Agent99SetKey to store one in the "
                 .. "keyring, or export $%s before starting Neovim.")
                 :format(provider.api_key_env or "API_KEY"), vim.log.levels.ERROR)
-            return
+            return false
         end
         opts.api_key = api_key
         cmd = { bin, "agent" }
@@ -942,10 +1016,12 @@ function M.start(buf, first, last, instruction, opts)
         timeout = cfg.timeout_ms,
         env = env,
     }
+    -- What on_exit is bound to (see there).
+    local run = { record = state.record }
     if opts.stream then
         -- Answer text streams into the panel as it is generated.
-        state.stdout_acc = { chunks = {}, started = false }
-        local oacc = state.stdout_acc
+        run.stdout_acc = { chunks = {}, started = false }
+        local oacc = run.stdout_acc
         sysopts.stdout = function(_, data)
             if not data then return end
             oacc.chunks[#oacc.chunks + 1] = data
@@ -954,14 +1030,15 @@ function M.start(buf, first, last, instruction, opts)
                     local ui = require("agent99.ui")
                     if not oacc.started then
                         oacc.started = true
+                        oacc.panel_mark = ui.mark()
                         ui.append({ "", "## Agent", "" })
                     end
                     ui.stream_text(data)
                 end)
             end)
         end
-        state.stderr_acc = { chunks = {}, partial = "" }
-        local acc = state.stderr_acc
+        run.stderr_acc = { chunks = {}, partial = "" }
+        local acc = run.stderr_acc
         sysopts.stderr = function(_, data)
             if not data then return end
             acc.chunks[#acc.chunks + 1] = data
@@ -978,6 +1055,23 @@ function M.start(buf, first, last, instruction, opts)
                             require("agent99.ui").activity(name .. "(" .. cargs .. ")")
                         end)
                     end)
+                elseif line:find("degenerate reply detected", 1, true) then
+                    -- The bridge discarded the turn it just streamed and
+                    -- is asking for another: drop the streamed text from
+                    -- the accumulator and from the panel, so neither the
+                    -- record nor the user sees the discarded turn ahead
+                    -- of the retry.
+                    oacc.chunks = {}
+                    vim.schedule(function()
+                        pcall(function()
+                            local ui = require("agent99.ui")
+                            if oacc.started and oacc.panel_mark then
+                                ui.rewind(oacc.panel_mark)
+                                oacc.started = false
+                            end
+                            ui.activity(line)
+                        end)
+                    end)
                 elseif line:find("REPEATED", 1, true) or line:find("DUPLICATE", 1, true)
                     or line:find("degenerate", 1, true) then
                     vim.schedule(function()
@@ -989,17 +1083,21 @@ function M.start(buf, first, last, instruction, opts)
             end
         end
     end
-    local ok, job = pcall(vim.system, cmd, sysopts, on_exit)
+    local ok, job = pcall(vim.system, cmd, sysopts, function(result)
+        on_exit(run, result)
+    end)
     if not ok then
         clear_request(false)
         vim.notify("agent99: failed to spawn agent: " .. tostring(job), vim.log.levels.ERROR)
-        return
+        return false
     end
+    run.job = job
     state.job = job
     if mode ~= "chat" then
         vim.notify(("agent99: working on %s:%d-%d…")
             :format(vim.fn.fnamemodify(file, ":t"), first, last))
     end
+    return true
 end
 
 --- Continue the conversation of the last applied edit with a new
@@ -1180,8 +1278,20 @@ function M.revert_edits()
         vim.notify("agent99: no symbol edits to revert")
         return
     end
-    local n = require("agent99.edits").revert(state.last_edits)
-    vim.notify(("agent99: reverted %d of %d symbol edit(s)"):format(n, #state.last_edits))
+    local n, refused = require("agent99.edits").revert(state.last_edits)
+    local msg = ("agent99: reverted %d of %d symbol edit(s)"):format(n, #state.last_edits)
+    if refused and #refused > 0 then
+        local lines = {}
+        for _, r in ipairs(refused) do
+            lines[#lines + 1] = ("  %s%s: %s"):format(
+                vim.fn.fnamemodify(r.file or "?", ":."),
+                r.name_path and (" " .. r.name_path) or "", r.why)
+        end
+        msg = msg .. "\nnot reverted:\n" .. table.concat(lines, "\n")
+        vim.notify(msg, vim.log.levels.WARN)
+    else
+        vim.notify(msg)
+    end
     state.last_edits = nil
 end
 

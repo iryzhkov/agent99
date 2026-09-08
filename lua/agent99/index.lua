@@ -11,7 +11,7 @@ local M = {}
 
 local core = require("agent99.core")
 local err, sleep, load_buf, rel_path = core.err, core.sleep, core.load_buf, core.rel_path
-local get_client, request, client_for = core.get_client, core.request, core.client_for
+local get_client, request = core.get_client, core.request
 local has_parser, expand_glob, decl_line = core.has_parser, core.expand_glob, core.decl_line
 local project_files, is_test_path, better_sample = core.project_files, core.is_test_path, core.better_sample
 local fresh_buf, DATA_FILETYPES, FRESH_RETRY_MS = core.fresh_buf, core.DATA_FILETYPES, core.FRESH_RETRY_MS
@@ -770,16 +770,24 @@ local function workspace_symbols(args)
         end
         return file == root or file:sub(1, #root + 1) == root .. "/"
     end
-    local inside, outside, seen_client, warming
+    local inside, outside, seen_client, warming, failed
     local function collect()
-        inside, outside, seen_client, warming = {}, {}, false, false
+        inside, outside, seen_client, warming, failed = {}, {}, false, false, {}
         for _, client in ipairs(vim.lsp.get_clients()) do
             if client:supports_method("workspace/symbol") then
                 local bufnr = next(client.attached_buffers or {})
                 if bufnr then
                     seen_client = true
                     if fresh_buf(bufnr) then warming = true end
-                    local result = request(client, bufnr, "workspace/symbol", { query = query })
+                    -- One server timing out or erroring must not take the
+                    -- others' answers with it; its failure is reported
+                    -- beside what the rest found.
+                    local okr, result = pcall(request, client, bufnr, "workspace/symbol", { query = query })
+                    if not okr then
+                        failed[#failed + 1] = ("%s: %s"):format(client.name,
+                            tostring(result):gsub("\n", " "))
+                        result = nil
+                    end
                     for _, s in ipairs(result or {}) do
                         local loc = s.location or {}
                         local file = loc.uri and vim.uri_to_fname(loc.uri) or nil
@@ -873,10 +881,19 @@ local function workspace_symbols(args)
             .. "files directly and do not depend on the server's index)"
             .. (note and ("; " .. note) or "")
     end
+    if #failed > 0 then
+        note = ("%d server(s) did not answer: %s"):format(#failed, table.concat(failed, "; "))
+            .. (note and ("; " .. note) or "")
+    end
     return { count = #out, project_matches = project_matches, symbols = out, note = note }
 end
 
 local index_cache = {}
+
+-- How long an index built without the language server (it did not attach
+-- within ATTACH_TIMEOUT_MS) is served from the cache before the server is
+-- asked for again.
+local NO_SERVER_RETRY_MS = 60000
 
 -- A Markdown section is named by its heading, without the markers: the
 -- "## Install" line of an ATX heading, or the text line of a setext one.
@@ -1095,14 +1112,28 @@ local function merge_lsp_only_symbols(entries, bufnr)
     if not from_lsp or #from_lsp == 0 then
         return entries, false
     end
-    local covered = {}
+    -- Covered by path, not by bare name: A/Name and B/Name are two fields
+    -- of two structs, and one of them must not hide the other. An entry
+    -- with no path falls back to its name. The same name on the same line
+    -- is the same declaration, however the two sides nested it (a Go
+    -- method under its receiver for the server, top-level for the
+    -- grammar), and is not added twice.
+    local function key(e)
+        return e.path or e.name
+    end
+    local function same_decl(e)
+        return (e.name or "") .. "\0" .. tostring(e.first)
+    end
+    local covered, declared = {}, {}
     for _, e in ipairs(entries) do
-        covered[e.name] = true
+        covered[key(e)] = true
+        declared[same_decl(e)] = true
     end
     for _, e in ipairs(from_lsp) do
-        if not covered[e.name] then
+        if not covered[key(e)] and not declared[same_decl(e)] then
             entries[#entries + 1] = e
-            covered[e.name] = true
+            covered[key(e)] = true
+            declared[same_decl(e)] = true
         end
     end
     table.sort(entries, function(a, b)
@@ -1115,8 +1146,19 @@ end
 local function symbol_index(bufnr)
     local tick = vim.api.nvim_buf_get_changedtick(bufnr)
     local cached = index_cache[bufnr]
-    if cached and cached.tick == tick and cached.complete then
-        return cached.entries
+    if cached and cached.tick == tick then
+        if cached.complete then
+            return cached.entries
+        end
+        -- An index assembled without the server is served again for a
+        -- while rather than rebuilt: the rebuild would wait the attach
+        -- timeout once more, on every call, for a server that is not
+        -- coming. It is retried when a client has attached since, or
+        -- once the grace period is over.
+        if cached.retry_after and vim.uv.now() < cached.retry_after
+            and #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/documentSymbol" }) == 0 then
+            return cached.entries
+        end
     end
     local entries, complete
     if PREFER_LSP_OUTLINE[vim.bo[bufnr].filetype] then
@@ -1134,7 +1176,10 @@ local function symbol_index(bufnr)
         entries = lsp_index(bufnr) or {}
         complete = #entries > 0
     end
-    index_cache[bufnr] = { tick = tick, entries = entries, complete = complete }
+    index_cache[bufnr] = {
+        tick = tick, entries = entries, complete = complete,
+        retry_after = not complete and (vim.uv.now() + NO_SERVER_RETRY_MS) or nil,
+    }
     return entries
 end
 
@@ -1279,6 +1324,17 @@ local function find_symbol(args)
         glob_note = why
         vim.list_extend(files, paths)
     end
+    -- One file named through file, files and glob at once is searched
+    -- once, or every symbol in it would be reported as many times.
+    local seen, unique = {}, {}
+    for _, f in ipairs(files) do
+        local abs = vim.fn.fnamemodify(f, ":p")
+        if not seen[abs] then
+            seen[abs] = true
+            unique[#unique + 1] = f
+        end
+    end
+    files = unique
     -- Nothing said where to look. Refusing was measured as one of the
     -- commonest failures in real sessions, and the recovery was always the
     -- same call again with a glob around the whole project, so do that here
@@ -1473,16 +1529,48 @@ local function resolve_symbol(file, name_path)
     return bufnr, candidates[1].entry
 end
 
+-- Filetypes where a line starting with # is not a comment: a preprocessor
+-- directive in the C family, a private field in JS/TS, a selector in CSS,
+-- a heading in Markdown. Consulted only when 'commentstring' does not say.
+local HASH_NOT_COMMENT = {
+    c = true, cpp = true, objc = true, objcpp = true, cuda = true,
+    glsl = true, hlsl = true,
+    javascript = true, javascriptreact = true, typescript = true, typescriptreact = true,
+    css = true, scss = true, less = true, html = true, markdown = true,
+}
+
+-- Whether # opens a line comment in this buffer's language. The filetype's
+-- commentstring answers when it is set (python, sh, yaml, toml, make, ruby
+-- and perl all say "# %s"); otherwise the table above rules the C family
+-- and friends out, and anything unknown keeps the old permissive answer.
+local function hash_is_comment(bufnr)
+    local cs = vim.bo[bufnr].commentstring or ""
+    if cs ~= "" then
+        return cs:match("^%s*#") ~= nil
+    end
+    return not HASH_NOT_COMMENT[vim.bo[bufnr].filetype]
+end
+
+-- Whether a stripped line reads as (part of) a comment block, by its
+-- leader. Language-agnostic apart from the # question above, since an
+-- #endif over a C function is not its doc comment and must not travel
+-- with it or have a sibling inserted above it.
+local function comment_leader(s, hash_ok)
+    return s:match("^%-%-") ~= nil or s:match("^//") ~= nil
+        or (hash_ok and s:match("^#") ~= nil)
+        or s:match("^/%*") ~= nil or s:match("^%*") ~= nil
+        or s:match([[^"""]]) ~= nil
+end
+
 -- The first line of the comment block sitting directly above `lnum`, or
 -- lnum itself when there is none: a symbol's doc comment.
 local function doc_block_start(bufnr, lnum)
     local first = lnum
+    local hash_ok = hash_is_comment(bufnr)
     for l = lnum - 1, 1, -1 do
         local text = vim.api.nvim_buf_get_lines(bufnr, l - 1, l, false)[1] or ""
         local stripped = text:gsub("^%s+", "")
-        if stripped:match("^%-%-") or stripped:match("^//") or stripped:match("^#")
-            or stripped:match("^/%*") or stripped:match("^%*")
-            or stripped:match([[^"""]]) then
+        if comment_leader(stripped, hash_ok) then
             first = l
         else
             break
@@ -1497,14 +1585,13 @@ end
 -- between a decorator and the class it annotates.
 local function decl_block_top(bufnr, lnum)
     local first = lnum
+    local hash_ok = hash_is_comment(bufnr)
     for l = lnum - 1, 1, -1 do
         local text = vim.api.nvim_buf_get_lines(bufnr, l - 1, l, false)[1] or ""
         local s = text:gsub("^%s+", "")
         if s:match("^@")       -- TS/JS/Java/Python decorator
             or s:match("^#%[") -- Rust attribute
-            or s:match("^%-%-") or s:match("^//") or s:match("^#")
-            or s:match("^/%*") or s:match("^%*") or s:match("^%*/")
-            or s:match([[^"""]]) then
+            or comment_leader(s, hash_ok) then
             first = l
         else
             break
@@ -1517,11 +1604,11 @@ end
 -- surfacing a symbol's doc summary. Language-agnostic prefix heuristic.
 local function comment_above(bufnr, lnum)
     local first_comment
+    local hash_ok = hash_is_comment(bufnr)
     for l = lnum - 1, math.max(1, lnum - 8), -1 do
         local text = vim.api.nvim_buf_get_lines(bufnr, l - 1, l, false)[1] or ""
         local stripped = text:gsub("^%s+", "")
-        if stripped:match("^%-%-") or stripped:match("^//") or stripped:match("^#")
-            or stripped:match("^/%*") or stripped:match("^%*") or stripped:match('^"""') then
+        if comment_leader(stripped, hash_ok) then
             first_comment = stripped
         else
             break

@@ -10,8 +10,6 @@ local core = require("agent99.core")
 local err, await, sleep, load_buf, rel_path = core.err, core.await, core.sleep, core.load_buf, core.rel_path
 local project_files, better_sample, has_parser = core.project_files, core.better_sample, core.has_parser
 local enabled_lsp_configs_for, DATA_FILETYPES = core.enabled_lsp_configs_for, core.DATA_FILETYPES
-local resync_open_buffers, write_buf, disk_moved_on = core.resync_open_buffers, core.write_buf, core.disk_moved_on
-local post_edit_options = require("agent99.edit").post_edit_options
 
 
 -- check_project: one project-wide check (type checker, vet, cargo check)
@@ -134,23 +132,47 @@ local function check_store_path()
     return dir .. "/check_commands.json"
 end
 
-local function load_check_overrides()
+-- The store as it is on disk right now, keyed by root. Roots that are gone
+-- (scratch checkouts, test copies) are dropped here, so the file never
+-- grows without bound.
+local function read_check_store()
+    local data = {}
     local ok, lines = pcall(vim.fn.readfile, check_store_path())
-    if not ok or #lines == 0 then return end
-    local okd, data = pcall(vim.json.decode, table.concat(lines, "\n"))
-    if okd and type(data) == "table" then
-        for root, cmds in pairs(data) do
-            -- Roots that are gone (scratch checkouts, test copies) are
-            -- dropped here, so the file never grows without bound.
+    if not ok or #lines == 0 then return data end
+    local okd, decoded = pcall(vim.json.decode, table.concat(lines, "\n"))
+    if okd and type(decoded) == "table" then
+        for root, cmds in pairs(decoded) do
             if type(cmds) == "table" and vim.fn.isdirectory(root) == 1 then
-                check_override[root] = cmds
+                data[root] = cmds
             end
         end
     end
+    return data
 end
 
-local function save_check_overrides()
-    local okj, text = pcall(vim.json.encode, check_override)
+local function load_check_overrides()
+    for root, cmds in pairs(read_check_store()) do
+        check_override[root] = cmds
+    end
+end
+
+-- Persist the command remembered for one root. The file is shared by every
+-- Neovim instance on the machine, and each holds its own copy of it from
+-- module load, so writing that copy back whole would drop whatever another
+-- instance remembered since. Re-read the file first and replace only this
+-- root's entry: a read-modify-write with no lock, so two saves in the same
+-- instant can still race, but the window is one write rather than a whole
+-- session. Entries other instances added are taken into memory on the way,
+-- so a later call here sees them too.
+local function save_check_overrides(root)
+    local data = read_check_store()
+    for other, cmds in pairs(data) do
+        if other ~= root and check_override[other] == nil then
+            check_override[other] = cmds
+        end
+    end
+    data[root] = check_override[root]
+    local okj, text = pcall(vim.json.encode, data)
     if okj then
         pcall(vim.fn.writefile, { text }, check_store_path())
     end
@@ -162,7 +184,6 @@ local function check_project(args)
     if type(root) ~= "string" or root == "" then
         root = vim.fn.getcwd()
     end
-    local opts = post_edit_options()
     local okc, config = pcall(require, "agent99.config")
     local configured = okc and config.options and config.options.post_edit
         and config.options.post_edit.check or nil
@@ -206,19 +227,32 @@ local function check_project(args)
     end
     if explicit and args.remember then
         check_override[root] = cmds
-        save_check_overrides()
+        save_check_overrides(root)
     end
     -- Only for the baseline key and the reply; the commands are run one at a
     -- time below, not handed to a shell as one line.
     local cmd = table.concat(cmds, " ; ")
     local timeout = (okc and config.options and config.options.post_edit
         and config.options.post_edit.check_timeout_ms) or 5 * 60 * 1000
-    -- Shell linters read the disk: flush what the tools changed first.
-    local unsaved
+    -- Shell linters read the disk: flush what the tools changed first. In a
+    -- live editor the user's buffers are theirs to save, so the check runs
+    -- against the disk copies and the reply says which buffers it did not
+    -- see, or a tool edit still sitting in a buffer reads as "clean".
+    local unsaved, unsaved_buffers
     if args.headless then
         local failures = core.save_all()
         if #failures > 0 then
             unsaved = failures
+        end
+    else
+        for _, b in ipairs(vim.api.nvim_list_bufs()) do
+            if vim.api.nvim_buf_is_loaded(b) and vim.bo[b].modified and vim.bo[b].buftype == "" then
+                local name = vim.api.nvim_buf_get_name(b)
+                if name ~= "" and name:sub(1, #root + 1) == root .. "/" then
+                    unsaved_buffers = unsaved_buffers or {}
+                    unsaved_buffers[#unsaved_buffers + 1] = rel_path(name)
+                end
+            end
         end
     end
     local started = vim.uv.now()
@@ -227,7 +261,7 @@ local function check_project(args)
     -- failure in an earlier one; joining with "&&" would stop at the first
     -- failure and never check the other build configuration, which is the
     -- main reason for passing more than one command in the first place.
-    local lines, exit, failed = {}, 0, nil
+    local lines, exit, failed, timed_out = {}, 0, nil, nil
     for _, one in ipairs(cmds) do
         local result = await(function(resume)
             local ok, e = pcall(vim.system, { "sh", "-c", one }, {
@@ -242,6 +276,12 @@ local function check_project(args)
         if text ~= "" then
             vim.list_extend(lines, vim.split(text, "\n", { plain = true }))
         end
+        -- vim.system kills a command that outruns its timeout with SIGTERM
+        -- and reports 124; that is a different answer from "the check found
+        -- something", and its partial output must not become the baseline.
+        if result.code == 124 and result.signal == 15 and not timed_out then
+            timed_out = one
+        end
         if result.code ~= 0 and exit == 0 then
             exit, failed = result.code, one
         end
@@ -254,6 +294,10 @@ local function check_project(args)
         failed_command = failed,
         seconds = math.floor((vim.uv.now() - started) / 100) / 10,
         unsaved = unsaved,
+        unsaved_buffers = unsaved_buffers,
+        unsaved_note = unsaved_buffers and ("%d buffer%s ha%s unsaved changes; the check ran against the disk copies")
+            :format(#unsaved_buffers, #unsaved_buffers == 1 and "" or "s", #unsaved_buffers == 1 and "s" or "ve")
+            or nil,
     }
     if explicit and args.remember then
         out.remembered = "later check_project calls in this root use this without arguments, "
@@ -272,7 +316,14 @@ local function check_project(args)
     end
     local key = root .. "\0" .. cmd
     local base = check_baseline[key]
-    if base and not args.reset then
+    if timed_out then
+        out.timed_out = timed_out
+        out.output = vim.list_slice(lines, 1, CHECK_MAX_LINES)
+        if #lines > CHECK_MAX_LINES then out.output_truncated = #lines - CHECK_MAX_LINES end
+        out.summary = ("timed out after %g s: the output is partial, and no baseline was "
+            .. "recorded or compared from it. Raise post_edit.check_timeout_ms in setup() "
+            .. "or pass a faster command."):format(timeout / 1000)
+    elseif base and not args.reset then
         local base_set, now_set = {}, {}
         for _, l in ipairs(base) do base_set[l] = (base_set[l] or 0) + 1 end
         for _, l in ipairs(lines) do now_set[l] = (now_set[l] or 0) + 1 end
@@ -519,6 +570,16 @@ local function install_parser(ft, lang)
             or "install finished but the parser still does not load" }
 end
 
+-- vim.lsp.get_log_path is deprecated from 0.11 in favour of
+-- vim.lsp.log.get_filename; take whichever this Neovim has.
+local function lsp_log_path()
+    if vim.lsp.log and vim.lsp.log.get_filename then
+        return vim.lsp.log.get_filename()
+    end
+    ---@diagnostic disable-next-line: deprecated
+    return vim.lsp.get_log_path()
+end
+
 local function attached_client(root, ft)
     local files = vim.fn.systemlist({ "git", "-C", root,
         "ls-files", "--cached", "--others", "--exclude-standard" })
@@ -552,9 +613,15 @@ local function attached_client(root, ft)
         collect(msg, level)
         return orig_once(msg, level, opts)
     end
+    -- Everything between the swap and the restore runs under pcall, so an
+    -- error (or a bad sample file) cannot leave vim.notify hijacked for the
+    -- rest of the session; the error is re-raised once the originals are
+    -- back. The wait yields the coroutine, and LuaJIT allows that inside
+    -- pcall.
     local okb, bufnr = pcall(load_buf, root .. "/" .. sample)
     local client
-    if okb then
+    local okw, werr = pcall(function()
+        if not okb then return end
         -- The sample may have been loaded before the server existed (the
         -- open_workspace probe does that); re-setting the filetype fires
         -- FileType again so vim.lsp.enable's autocmd gets a second chance.
@@ -570,8 +637,11 @@ local function attached_client(root, ft)
             end
             sleep(200)
         end
-    end
+    end)
     vim.notify, vim.notify_once = orig_notify, orig_once
+    if not okw then
+        error(werr, 0)
+    end
     if client then
         return client
     end
@@ -584,7 +654,7 @@ local function attached_client(root, ft)
         why = why .. ": " .. table.concat(notices, "; ")
     else
         why = why .. "; the server's config may need a toolchain on PATH "
-            .. "(rust_analyzer wants cargo, jdtls a JDK); see " .. vim.lsp.get_log_path()
+            .. "(rust_analyzer wants cargo, jdtls a JDK); see " .. lsp_log_path()
     end
     return nil, why
 end
@@ -632,8 +702,14 @@ local function enable_system_server(ft, name, cmd, root, why)
     local out = { lspconfig = name, cmd = cmd, status = "on the system" }
     local okcfg = pcall(function()
         local current = (vim.lsp.config[name] or {}).cmd
-        if type(current) ~= "table" or current[1] ~= cmd then
+        if type(current) ~= "table" then
             vim.lsp.config(name, { cmd = { cmd } })
+        elseif current[1] ~= cmd then
+            -- Replace only the executable: a versioned binary (clangd-18)
+            -- stands in for the plain name, and the config's own arguments
+            -- ("--stdio", "--background-index") still apply to it.
+            local replaced = vim.list_extend({ cmd }, vim.list_slice(current, 2))
+            vim.lsp.config(name, { cmd = replaced })
         end
     end)
     if not okcfg then

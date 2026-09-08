@@ -17,18 +17,38 @@ end
 -- Ids of records created in this Neovim session, so stats can be scoped.
 local session_ids = {}
 
---- Persist (or re-persist) one request record.
+--- Persist (or re-persist) one request record. Returns the path, or nil
+--- when the write failed (the failure has been notified: a record that
+--- silently never lands is a run the history view cannot show).
 function M.write(record)
     session_ids[record.id] = true
     local path = config.history_dir() .. "/" .. record.id .. ".json"
-    vim.fn.writefile(vim.split(vim.json.encode(record), "\n"), path)
+    if vim.fn.writefile(vim.split(vim.json.encode(record), "\n"), path) == -1 then
+        vim.notify("agent99: could not write the history record at " .. path,
+            vim.log.levels.WARN)
+        return nil
+    end
     prune()
     return path
 end
 
+-- Four digits that differ between two ids minted in the same second, in
+-- this instance or another one sharing the history directory. Not
+-- math.random: unseeded, every Neovim instance draws the same sequence,
+-- so two instances starting a request in the same second would collide.
+local last_nonce = -1
+function M.nonce()
+    local n = math.floor(vim.uv.hrtime() / 1000 + vim.fn.getpid()) % 10000
+    if n == last_nonce then
+        n = (n + 1) % 10000
+    end
+    last_nonce = n
+    return ("%04d"):format(n)
+end
+
 --- Fresh id + transcript path for a new request.
 function M.new_id()
-    local id = os.date("%Y%m%d-%H%M%S") .. "-" .. math.random(1000, 9999)
+    local id = os.date("%Y%m%d-%H%M%S") .. "-" .. M.nonce()
     return id, config.history_dir() .. "/" .. id .. ".transcript.json"
 end
 

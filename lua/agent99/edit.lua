@@ -10,14 +10,17 @@ local core = require("agent99.core")
 local index = require("agent99.index")
 local err, await, sleep, load_buf, rel_path = core.err, core.await, core.sleep, core.load_buf, core.rel_path
 local get_client, request, client_for, write_buf = core.get_client, core.request, core.client_for, core.write_buf
-local make_position, resync_open_buffers, disk_moved_on = core.make_position, core.resync_open_buffers, core.disk_moved_on
-local sync_buf, notify_changed_files, save_all = core.sync_buf, core.notify_changed_files, core.save_all
+local make_position, resync_open_buffers, save_all = core.make_position, core.resync_open_buffers, core.save_all
 local notify_watched_files, dialect_note = core.notify_watched_files, core.dialect_note
 local position_params, fresh_buf, enabled_lsp_configs_for =
     core.position_params, core.fresh_buf, core.enabled_lsp_configs_for
-local resolve_symbol, symbol_index, doc_block_start, decl_block_top =
-    index.resolve_symbol, index.symbol_index, index.doc_block_start, index.decl_block_top
+local resolve_symbol, doc_block_start, decl_block_top =
+    index.resolve_symbol, index.doc_block_start, index.decl_block_top
 
+-- Neovim 0.12 moved the diff to vim.text.diff and deprecated vim.diff; one
+-- name for it here keeps the rest of the file indifferent to the version.
+---@diagnostic disable-next-line: deprecated
+local text_diff = (vim.text and vim.text.diff) or vim.diff
 
 -- A symbol edit whose target lines overlap the region a request in
 -- progress owns as its PRIMARY edit target (the one only the <replacement>
@@ -103,6 +106,84 @@ end
 -- formatting the file after an edit never produces an unrelated diff.
 local FILE_FORMAT_OK = { go = true }
 
+-- How long a server command gets to do its work before the reply goes out.
+local COMMAND_WAIT_MS = 2000
+
+-- Run a server command and wait, bounded, for what it does. exec_cmd only
+-- sends workspace/executeCommand; the edit the command makes arrives later,
+-- as a workspace/applyEdit request from the server, so returning right
+-- after the send would report "applied" about a buffer that has not
+-- changed yet and, headless, save it before it does. Returns whether the
+-- server answered the command in time and the list of buffers that
+-- changed meanwhile (freshly loaded ones included).
+local function exec_command_and_wait(client, cmd, bufnr, wait_ms)
+    local ticks = {}
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_loaded(b) then
+            ticks[b] = vim.api.nvim_buf_get_changedtick(b)
+        end
+    end
+    local function changed()
+        local out = {}
+        for _, b in ipairs(vim.api.nvim_list_bufs()) do
+            if vim.api.nvim_buf_is_loaded(b)
+                and ticks[b] ~= vim.api.nvim_buf_get_changedtick(b) then
+                out[#out + 1] = b
+            end
+        end
+        return out
+    end
+    -- A command the client itself implements runs synchronously inside
+    -- exec_cmd, and one the server never registered is dropped with a
+    -- warning; neither will ever call the handler, so neither is waited on.
+    local name = type(cmd) == "table" and cmd.command or nil
+    local provider = (client.server_capabilities or {}).executeCommandProvider
+    local offered = type(provider) == "table" and provider.commands or {}
+    local answered = name == nil
+        or client.commands[name] ~= nil or vim.lsp.commands[name] ~= nil
+        or not vim.list_contains(offered, name)
+    local ok = pcall(function()
+        client:exec_cmd(cmd, { bufnr = bufnr }, function() answered = true end)
+    end)
+    if not ok then return false, {} end
+    local waited, grace = 0, nil
+    while waited < (wait_ms or COMMAND_WAIT_MS) do
+        local bufs = changed()
+        if #bufs > 0 then return true, bufs end
+        -- A server usually sends its applyEdit and waits for the answer
+        -- before it replies to the command, but not every one does: give
+        -- the edit a moment more after the reply before deciding nothing came.
+        if answered then
+            grace = (grace or 0) + 50
+            if grace > 200 then return true, {} end
+        end
+        sleep(50)
+        waited = waited + 50
+    end
+    return answered, changed()
+end
+
+-- Tell the ledger how a change above the recorded edits (an import block
+-- that grew or shrank) moved them, so an entry recorded earlier in the
+-- same buffer keeps pointing at the text it wrote and a later undo of it
+-- is not refused as "changed since".
+local function ledger_absorb(bufnr, before_lines, after_lines)
+    local hunks = text_diff(
+        table.concat(before_lines, "\n") .. "\n",
+        table.concat(after_lines, "\n") .. "\n",
+        { result_type = "indices" })
+    if type(hunks) ~= "table" or #hunks == 0 then return end
+    local ledger = require("agent99.edits")
+    -- Bottom-up, in the old text's numbering: each hunk moves what sits
+    -- below it, and a lower hunk's shift never carries an entry above a
+    -- higher hunk's footprint.
+    for i = #hunks, 1, -1 do
+        local start_a, count_a, count_b = hunks[i][1], hunks[i][2], hunks[i][4]
+        local to = count_a > 0 and (start_a + count_a - 1) or start_a
+        ledger.shift(bufnr, to, count_b - count_a)
+    end
+end
+
 -- Run the server's source.organizeImports action on the buffer. Returns
 -- true when an action was applied.
 local function organize_imports(bufnr)
@@ -132,26 +213,36 @@ local function organize_imports(bufnr)
         local okr, resolved = pcall(request, client, bufnr, "codeAction/resolve", action)
         if okr and resolved then action = resolved end
     end
-    local applied = false
+    local before_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local applied, note = false, nil
     if action.edit then
         pcall(vim.lsp.util.apply_workspace_edit, action.edit, client.offset_encoding)
         applied = true
     end
     if action.command then
         local cmd = type(action.command) == "table" and action.command or action
-        pcall(function() client:exec_cmd(cmd, { bufnr = bufnr }) end)
-        applied = true
+        local answered, changed = exec_command_and_wait(client, cmd, bufnr)
+        if #changed > 0 then
+            applied = true
+        elseif not answered then
+            note = ("the server's organize-imports command had not answered after %d ms; "
+                .. "the imports may still change"):format(COMMAND_WAIT_MS)
+        end
     end
-    return applied
+    if applied then
+        ledger_absorb(bufnr, before_lines, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
+    end
+    return applied, note
 end
 
 -- How a block of lines is indented: how many lines start with a tab, how
 -- many with spaces, how many distinct space widths there are, and the
--- smallest step between those widths. The step is measured between the
--- widths rather than from column zero, so a region that sits inside a
--- nested block reports the file's unit and not the depth it starts at.
+-- step between those widths that most of the lines follow. The step is
+-- measured between the widths rather than from column zero, so a region
+-- that sits inside a nested block reports the file's unit and not the
+-- depth it starts at.
 local function indent_profile(lines)
-    local tabs, spaces, widths = 0, 0, {}
+    local tabs, spaces, counts = 0, 0, {}
     for _, line in ipairs(lines) do
         local ws, first = line:match("^(%s+)(%S)")
         -- A comment continuation line (" * ..." in JSDoc and Javadoc) sits
@@ -162,18 +253,38 @@ local function indent_profile(lines)
                 tabs = tabs + 1
             else
                 spaces = spaces + 1
-                if #ws > 1 then widths[#ws] = true end
+                if #ws > 1 then counts[#ws] = (counts[#ws] or 0) + 1 end
             end
         end
     end
-    local sorted = vim.tbl_keys(widths)
+    local sorted = vim.tbl_keys(counts)
     table.sort(sorted)
-    local step = nil
+    -- The candidates are the gaps between the widths that occur (and the
+    -- first width itself). The step is the largest candidate that divides
+    -- the width of nearly every indented line: one paren-aligned
+    -- continuation at width 6 in a 4-space file must not turn the unit
+    -- into 2, which the smallest gap alone would do, and the formatter
+    -- would then re-indent to it.
+    local total, candidates, smallest = 0, {}, nil
     for i, w in ipairs(sorted) do
+        total = total + counts[w]
         local gap = i == 1 and w or (w - sorted[i - 1])
-        if gap > 1 and (not step or gap < step) then step = gap end
+        if gap > 1 then
+            candidates[gap] = true
+            if not smallest or gap < smallest then smallest = gap end
+        end
     end
-    return { tabs = tabs, spaces = spaces, step = step, levels = #sorted }
+    local step = nil
+    for cand in pairs(candidates) do
+        local covered = 0
+        for _, w in ipairs(sorted) do
+            if w % cand == 0 then covered = covered + counts[w] end
+        end
+        if covered * 5 >= total * 4 and (not step or cand > step) then
+            step = cand
+        end
+    end
+    return { tabs = tabs, spaces = spaces, step = step or smallest, levels = #sorted }
 end
 
 -- The file's own indentation (majority of indented lines: tabs or spaces,
@@ -229,7 +340,7 @@ end
 -- Returns whether anything survived inside the region.
 local function confine_format(bufnr, before_lines, first, last)
     local after_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-    local hunks = vim.diff(
+    local hunks = text_diff(
         table.concat(before_lines, "\n") .. "\n",
         table.concat(after_lines, "\n") .. "\n",
         { result_type = "indices" })
@@ -406,7 +517,7 @@ local POLISH_DIFF_LINES = 40
 -- lines below it that polishing also changed; the ledger folds those into
 -- the edit so an undo puts them back with it.
 local function map_region(before_lines, after_lines, first, last)
-    local hunks = vim.diff(
+    local hunks = text_diff(
         table.concat(before_lines, "\n") .. "\n",
         table.concat(after_lines, "\n") .. "\n",
         { result_type = "indices" })
@@ -468,11 +579,13 @@ local function polish_after_edit(bufnr, first, count, opts)
     local after_format = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
     local edit_first, edit_last = map_region(before_polish, after_format, first, last)
     if opts.organize_imports then
-        if organize_imports(bufnr) then
+        local organized, note = organize_imports(bufnr)
+        if organized then
             done[#done + 1] = "organized imports"
             local after_imports = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
             edit_first, edit_last = map_region(after_format, after_imports, edit_first, edit_last)
         end
+        info.imports_note = note
     end
     if count > 0 and edit_last >= edit_first then
         info.edit_first, info.edit_last = edit_first, edit_last
@@ -481,7 +594,7 @@ local function polish_after_edit(bufnr, first, count, opts)
     -- read rather than one it has to go and verify with git diff.
     local after = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
     if #done > 0 then
-        local diff = vim.diff(
+        local diff = text_diff(
             table.concat(before_polish, "\n") .. "\n",
             table.concat(after, "\n") .. "\n",
             { result_type = "unified", ctxlen = 1 })
@@ -1152,20 +1265,28 @@ local function code_actions(args)
     -- So when neither symbol nor col is given, take the whole line - that is
     -- what "code actions at that line" is supposed to mean.
     local col, symbol = args.col, args.symbol
+    local range
     if col == nil and (symbol == nil or symbol == "") then
-        local text = vim.api.nvim_buf_get_lines(bufnr, (tonumber(args.line) or 1) - 1,
-            (tonumber(args.line) or 1), false)[1] or ""
-        col = (text:find("%S") or 1)
+        local lnum = tonumber(args.line) or 1
+        local text = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)[1] or ""
+        -- From the first non-blank to the end of the line, not a point at
+        -- the first non-blank: a quick fix for a diagnostic further along
+        -- the line is offered only when the range reaches it.
+        local start = make_position(bufnr, client, lnum, nil, text:find("%S") or 1)
+        local stop = make_position(bufnr, client, lnum, nil, #text + 1)
+        range = { start = start, ["end"] = stop }
+    else
+        local pos = make_position(bufnr, client, args.line, symbol, col)
+        range = { start = pos, ["end"] = pos }
     end
-    local pos = make_position(bufnr, client, args.line, symbol, col)
     local lsp_diags = {}
     pcall(function()
         lsp_diags = vim.lsp.diagnostic.from(
-            vim.diagnostic.get(bufnr, { lnum = pos.line }))
+            vim.diagnostic.get(bufnr, { lnum = range.start.line }))
     end)
     local result = request(client, bufnr, "textDocument/codeAction", {
         textDocument = { uri = vim.uri_from_bufnr(bufnr) },
-        range = { start = pos, ["end"] = pos },
+        range = range,
         context = { diagnostics = lsp_diags, triggerKind = 1 },
     }) or {}
     action_token = action_token + 1
@@ -1229,14 +1350,34 @@ local function apply_code_action(args)
         end
         vim.lsp.util.apply_workspace_edit(action.edit, client.offset_encoding)
     end
+    local command_note
     if action.command then
+        -- The command's edit comes back from the server later; wait for
+        -- it (bounded) so the reply names the files it touched and, when
+        -- headless, the save that follows this tool has something to save.
         local cmd = type(action.command) == "table" and action.command or action
-        client:exec_cmd(cmd, { bufnr = entry.bufnr })
+        local answered, bufs = exec_command_and_wait(client, cmd, entry.bufnr)
+        local seen = {}
+        for _, f in ipairs(changed) do seen[f] = true end
+        for _, b in ipairs(bufs) do
+            local name = vim.api.nvim_buf_get_name(b)
+            if name ~= "" and not seen[name] then
+                seen[name] = true
+                changed[#changed + 1] = name
+            end
+        end
+        if #bufs == 0 then
+            command_note = answered
+                and "the server ran the command but changed no buffer"
+                or ("the server had not answered the command after %d ms; its edit, "
+                    .. "if any, arrives later and is not in changed_files"):format(COMMAND_WAIT_MS)
+        end
     end
     action_cache[tostring(args.token)] = nil
     return {
         applied = action.title,
         changed_files = changed,
+        command_note = command_note,
         note = args.headless
             and "changes applied and saved to disk"
             or "changes live in editor buffers (unsaved); use buffer_lines to inspect them",
@@ -1322,6 +1463,7 @@ local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_o
         local _, _, d, _, imports_info =
             polish_after_edit(bufnr, first, 0, vim.tbl_extend("force", opts, { format = false }))
         absorb(d, imports_info)
+        info.imports_note = imports_info.imports_note
         done = vim.tbl_keys(seen)
         table.sort(done)
         local reasons = vim.tbl_keys(info.skipped)
@@ -1366,6 +1508,9 @@ local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_o
     if info.format_skipped then
         fields.format_skipped = info.format_skipped
     end
+    if info.imports_note then
+        fields.imports_note = info.imports_note
+    end
     local odd = odd_bytes(new_lines)
     if args.verify or #odd > 0 then
         fields.new_text = new_lines
@@ -1384,7 +1529,7 @@ end
 -- blast radius before committing to it; a large body replacement is no less
 -- worth looking at first.
 local function preview_diff(old_lines, new_lines, label)
-    local diff = vim.diff(
+    local diff = text_diff(
         table.concat(old_lines, "\n") .. "\n",
         table.concat(new_lines, "\n") .. "\n",
         { result_type = "unified", ctxlen = 2 })
@@ -1889,8 +2034,7 @@ end
 
 local function undo_edit(args)
     local edits = require("agent99.edits")
-    local count = tonumber(args.count) or 1
-    if args.all then count = nil end
+    local count = (not args.all) and (tonumber(args.count) or 1) or nil
     if edits.count() == 0 then
         return {
             undone = {},
@@ -1998,16 +2142,23 @@ local function rename_symbol(args)
             total_edits = total, file_operations = #file_ops > 0 and file_ops or nil,
             note = "nothing applied; call again without dry_run to rename" }
     end
+    -- Every touched file is loaded before anything is applied. load_buf
+    -- refuses a file that changed on disk while this session holds unsaved
+    -- edits to it, and that refusal has to stop the rename here: applying
+    -- anyway would edit a buffer nobody had snapshotted, with no undo.
+    -- Each freshly loaded buffer is settled too, so the problems it
+    -- already had are in the baseline and not charged to the rename.
+    local snaps = {}
+    for _, f in ipairs(files) do
+        local b = load_buf(f.file)
+        settle_before_edit(b)
+        snaps[#snaps + 1] = { bufnr = b, file = f.file }
+    end
     settle_before_edit(bufnr)
     local before = diag_snapshot()
     -- Whole-file snapshots of every touched file feed the undo ledger.
-    local snaps = {}
-    for _, f in ipairs(files) do
-        local okb, b = pcall(load_buf, f.file)
-        if okb then
-            snaps[#snaps + 1] = { bufnr = b, file = f.file,
-                old = vim.api.nvim_buf_get_lines(b, 0, -1, false) }
-        end
+    for _, snap in ipairs(snaps) do
+        snap.old = vim.api.nvim_buf_get_lines(snap.bufnr, 0, -1, false)
     end
     vim.lsp.util.apply_workspace_edit(edit, client.offset_encoding)
     for _, snap in ipairs(snaps) do
@@ -2085,19 +2236,42 @@ local function pattern_regex(args)
     if args.literal then
         -- \V: backslash is the only character left with a meaning in the
         -- pattern. & ~ and \ are the ones with a meaning in a replacement.
-        return "\\C\\V" .. vim.fn.escape(pattern, "\\"),
-            vim.fn.escape(replacement, "\\&~")
+        local escaped = vim.fn.escape(pattern, "\\")
+        return "\\C\\V" .. escaped,
+            vim.fn.escape(replacement, "\\&~"),
+            function(col) return "\\C\\V\\%" .. col .. "c" .. escaped end
     end
-    return "\\C\\v" .. pattern, replacement
+    -- The contract for the replacement is "\1..\9 are the groups", nothing
+    -- else: a bare & (the whole match) or ~ (the previous replacement) is
+    -- text the caller wrote, so it is escaped. Backslash sequences pass
+    -- through untouched, which keeps \1..\9, \n and \\ meaning what they do.
+    local out, i = {}, 1
+    while i <= #replacement do
+        local c = replacement:sub(i, i)
+        if c == "\\" then
+            out[#out + 1] = replacement:sub(i, i + 1)
+            i = i + 2
+        else
+            if c == "&" or c == "~" then out[#out + 1] = "\\" end
+            out[#out + 1] = c
+            i = i + 1
+        end
+    end
+    return "\\C\\v" .. pattern, table.concat(out),
+        function(col) return "\\C\\v%" .. col .. "c%(" .. pattern .. ")" end
 end
 
 -- Every match of `re` in `line`, as 0-based [start, stop) byte pairs.
-local function match_spans(re, line)
+local function match_spans(pat, line)
     local spans, from = {}, 0
     while from <= #line do
-        local s, e = re:match_str(line:sub(from + 1))
-        if not s then break end
-        s, e = from + s, from + e
+        -- matchstrpos with a count matches against the whole line from
+        -- byte `from` on, so ^, \<, > and a lookbehind still see what is
+        -- before the match. Cutting the line at `from` instead would make
+        -- ^ab match twice in abab and \<foo match in the middle of foofoo.
+        local m = vim.fn.matchstrpos(line, pat, from, 1)
+        local s, e = m[2], m[3]
+        if s < 0 then break end
         if e <= s then
             -- A zero-width match replaces nothing and would loop here
             -- forever; the pattern is not one this tool can act on.
@@ -2107,6 +2281,24 @@ local function match_spans(re, line)
         from = e
     end
     return spans, false
+end
+
+-- What the replacement expands to for the match at span [s, e) of `line`,
+-- computed against the whole line so a group, a lookaround or a \< in the
+-- pattern reads the same context it matched in. Every span is expanded
+-- against the original line, as :substitute does, so one replacement
+-- cannot change what the next one sees.
+local function expand_at(line, pat, anchored, rep, span)
+    local s, e = span[1], span[2]
+    local at = anchored(s + 1)
+    local okm, m = pcall(vim.fn.matchstrpos, line, at, s, 1)
+    if okm and m[2] == s and m[3] == e then
+        local whole = vim.fn.substitute(line, at, rep, "")
+        return whole:sub(s + 1, #whole - (#line - e))
+    end
+    -- \zs in the pattern, or one that will not take an anchor: fall back to
+    -- expanding the matched text on its own.
+    return vim.fn.substitute(line:sub(s + 1, e), pat, rep, "")
 end
 
 local function replace_pattern(args)
@@ -2128,7 +2320,7 @@ local function replace_pattern(args)
     if args.tests ~= nil and args.tests ~= "exclude" and args.tests ~= "only" then
         err("tests must be exclude or only")
     end
-    local pat, rep = pattern_regex(args)
+    local pat, rep, anchored = pattern_regex(args)
     local okr, re = pcall(vim.regex, pat)
     if not okr then
         err("the pattern does not compile: %s. It is a Vim regex in very magic mode "
@@ -2144,41 +2336,47 @@ local function replace_pattern(args)
 
     local per_file, samples = {}, {}
     local total, skipped_total, unreadable, zero_width = 0, 0, {}, false
+    local no_parser = {}
     local pending = {}
     for _, path in ipairs(files) do
         local okb, bufnr = pcall(load_buf, path)
         if not okb then
             unreadable[#unreadable + 1] = rel_path(path)
+        elseif kind and not core.has_parser(vim.bo[bufnr].filetype) then
+            -- kind= is a promise to tell a comment or a string from code,
+            -- and without a parser every hit classifies as nothing: code
+            -- would then replace inside comments and strings, and comment
+            -- or string would replace nothing at all. Say so instead.
+            no_parser[#no_parser + 1] = rel_path(path)
         else
             local old = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
             local new = {}
             local hits, skipped = 0, 0
             for i, line in ipairs(old) do
-                local spans, degenerate = match_spans(re, line)
+                local spans, degenerate = match_spans(pat, line)
                 if degenerate then zero_width = true end
                 if #spans == 0 then
                     new[i] = line
-                elseif not kind then
-                    -- No classification to do, so the whole line goes
-                    -- through Vim's own substitute: anchors, groups and
-                    -- lookaround all behave exactly as they would in the
-                    -- editor.
-                    new[i] = vim.fn.substitute(line, pat, rep, "g")
-                    hits = hits + #spans
                 else
+                    -- Every span is matched and expanded against the
+                    -- original line, the way :substitute does it, so
+                    -- anchors, \< and lookaround see their real context and
+                    -- the count is the number of replacements made.
                     local out, from = {}, 0
                     for _, span in ipairs(spans) do
-                        local at = index.classify_hit(bufnr, i, span[1] + 1)
-                        local want = kind == "code"
-                            and not (at == "comment" or at == "string")
-                            or kind == at
+                        local want = true
+                        if kind then
+                            local at = index.classify_hit(bufnr, i, span[1] + 1)
+                            want = kind == "code"
+                                and not (at == "comment" or at == "string")
+                                or kind == at
+                        end
                         out[#out + 1] = line:sub(from + 1, span[1])
-                        local text = line:sub(span[1] + 1, span[2])
                         if want then
-                            out[#out + 1] = vim.fn.substitute(text, pat, rep, "")
+                            out[#out + 1] = expand_at(line, pat, anchored, rep, span)
                             hits = hits + 1
                         else
-                            out[#out + 1] = text
+                            out[#out + 1] = line:sub(span[1] + 1, span[2])
                             skipped = skipped + 1
                         end
                         from = span[2]
@@ -2206,6 +2404,11 @@ local function replace_pattern(args)
             end
         end
     end
+    if #no_parser > 0 and #no_parser == #files - #unreadable then
+        err("kind=%s needs a treesitter parser to tell comments and strings from code, "
+            .. "and none of the files has one (%s); install_language adds it, or call "
+            .. "without kind=", kind, table.concat(no_parser, ", "))
+    end
 
     local result = {
         pattern = pattern,
@@ -2221,6 +2424,11 @@ local function replace_pattern(args)
     end
     if #unreadable > 0 then
         result.unreadable = unreadable
+    end
+    if #no_parser > 0 then
+        result.no_parser = no_parser
+        result.no_parser_note = ("kind=%s needs a treesitter parser to tell comments and strings "
+            .. "from code; these files have none and were left alone"):format(kind)
     end
     if capped > 0 then
         result.note = ("%d further files were not looked at (cap: %d); narrow with "
@@ -2249,7 +2457,9 @@ local function replace_pattern(args)
             end
         end
     end
-    settle_before_edit(pending[1].bufnr)
+    for _, p in ipairs(pending) do
+        settle_before_edit(p.bufnr)
+    end
     local before = diag_snapshot()
     for _, p in ipairs(pending) do
         vim.api.nvim_buf_set_lines(p.bufnr, 0, -1, false, p.new)
@@ -2374,6 +2584,32 @@ local function forget_buf(path)
     end
 end
 
+-- What a file operation must do before forget_buf wipes the buffer for
+-- `path`: get its unsaved changes to disk. Symbol edits made earlier in
+-- the run live in the buffer, headless or not, and a forced wipe would
+-- discard them without a word. Headless, every changed buffer is saved
+-- (a willRename edit may have touched others); in a live editor only this
+-- file's buffer is written, since the rest is the user's to save. A write
+-- that fails refuses the operation rather than losing the edit.
+local function flush_before_file_op(path, headless, what)
+    if headless then
+        local failures = save_all()
+        if #failures > 0 then
+            err("could not save before the %s: %s", what, table.concat(failures, "; "))
+        end
+    end
+    for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_loaded(bufnr) and vim.bo[bufnr].modified
+            and vim.api.nvim_buf_get_name(bufnr) == path then
+            local ok, why = write_buf(bufnr)
+            if not ok then
+                err("%s has unsaved changes that could not be written before the %s: %s",
+                    rel_path(path), what, tostring(why))
+            end
+        end
+    end
+end
+
 local function create_file(args)
     local path = resolve_new_path(args.file, "file")
     if vim.uv.fs_stat(path) then
@@ -2431,6 +2667,9 @@ local function create_file(args)
     if info.format_skipped then
         result.format_skipped = info.format_skipped
     end
+    if info.imports_note then
+        result.imports_note = info.imports_note
+    end
     return vim.tbl_extend("force", result,
         post_edit_report(bufnr, before, args.root, args.headless, opts, args.full_diagnostics))
 end
@@ -2452,13 +2691,22 @@ local function move_file(args)
     end
 
     local files = { { oldUri = file_uri(from), newUri = file_uri(to) } }
+    -- The file's own problems, loaded and settled at the old path, count as
+    -- pre-existing at the new one: the report keys diagnostics by file
+    -- name, and the move is not what put them there.
+    local from_buf = load_buf(from)
+    settle_before_edit(from_buf)
     local before = diag_snapshot()
+    local prefix = from .. "|"
+    for sig, n in pairs(vim.deepcopy(before)) do
+        if sig:sub(1, #prefix) == prefix then
+            before[to .. sig:sub(#from + 1)] = n
+        end
+    end
     -- Ask first: this is where a server rewrites the imports that name the
     -- old path. It has to happen while the file is still at the old one.
     local touched = apply_will_file_operation("workspace/willRenameFiles", files)
-    if args.headless then
-        save_all()
-    end
+    flush_before_file_op(from, args.headless, "move")
     forget_buf(from)
     local okm, e = vim.uv.fs_rename(from, to)
     if not okm then
@@ -2509,16 +2757,19 @@ local function delete_file(args)
     if stat.type == "directory" then
         err("%s is a directory; this tool deletes one file at a time", rel_path(path))
     end
-    local okr, contents = pcall(vim.fn.readfile, path, "b")
-    if not okr then
+    if not vim.uv.fs_access(path, "R") then
         err("could not read %s before deleting it", rel_path(path))
     end
 
     local files = { { uri = file_uri(path) } }
     local before = diag_snapshot()
     local touched = apply_will_file_operation("workspace/willDeleteFiles", files)
-    if args.headless then
-        save_all()
+    flush_before_file_op(path, args.headless, "delete")
+    -- Read after the flush, so undo restores the file as it was last
+    -- edited and not as it was last saved.
+    local okr, contents = pcall(vim.fn.readfile, path, "b")
+    if not okr then
+        err("could not read %s before deleting it", rel_path(path))
     end
     forget_buf(path)
     if vim.fn.delete(path) ~= 0 then
@@ -2589,7 +2840,11 @@ local function move_symbols(args)
         seen[entry.path] = true
         moving[#moving + 1] = {
             path = entry.path,
-            first = doc_block_start(from_buf, entry.first),
+            -- The whole block the declaration belongs to: its decorators
+            -- or attributes as well as its doc comment, the same top
+            -- insert_before_symbol uses, so a @Decorator or a Rust #[attr]
+            -- is not left behind pointing at nothing.
+            first = decl_block_top(from_buf, entry.first),
             last = entry.last,
         }
     end
@@ -2611,11 +2866,22 @@ local function move_symbols(args)
         blocks[#blocks + 1] = vim.api.nvim_buf_get_lines(from_buf, m.first - 1, m.last, false)
     end
 
+    -- Every refusal comes before anything is written: an existing
+    -- destination whose tail is the primary region of the request in
+    -- progress is checked here, so a refused call leaves no half-made file.
+    local exists = vim.uv.fs_stat(to_path) ~= nil
+    if exists then
+        local existing = load_buf(to_path)
+        local tail = vim.api.nvim_buf_line_count(existing)
+        local to_conflict = primary_region_conflict(existing, tail + 1, tail + 1)
+        if to_conflict then err(to_conflict) end
+    end
+
     -- A new destination needs whatever declares which module it belongs to.
     -- Only Go-style `package X` is inferred; anything else the caller supplies
     -- with header=, since guessing wrong writes a broken file.
     local created = false
-    if not vim.uv.fs_stat(to_path) then
+    if not exists then
         local header = args.header
         if header == nil then
             for _, line in ipairs(vim.list_slice(from_before, 1, 30)) do
@@ -2644,21 +2910,25 @@ local function move_symbols(args)
     local to_buf = load_buf(to_path)
     local to_before = vim.api.nvim_buf_get_lines(to_buf, 0, -1, false)
     settle_before_edit(from_buf)
+    -- The destination was loaded moments ago too; without its own wait the
+    -- problems it already had would be charged to the move.
+    settle_before_edit(to_buf)
     local before = diag_snapshot()
 
     -- Append to the destination, then delete from the source bottom upwards so
-    -- the earlier line numbers stay valid as the later ones go.
+    -- the earlier line numbers stay valid as the later ones go. An empty file
+    -- loads as one empty line; that line is replaced, not appended to, and a
+    -- separating blank goes in only after a line that has something on it.
+    local empty_dest = #to_before == 0 or (#to_before == 1 and to_before[1] == "")
     local appended = {}
     for _, block in ipairs(blocks) do
-        if #appended > 0 or #to_before > 0 then
+        if #appended > 0 or (not empty_dest and to_before[#to_before] ~= "") then
             appended[#appended + 1] = ""
         end
         vim.list_extend(appended, block)
     end
-    local at = #to_before
-    local to_conflict = primary_region_conflict(to_buf, at + 1, at + 1)
-    if to_conflict then err(to_conflict) end
-    vim.api.nvim_buf_set_lines(to_buf, at, at, false, appended)
+    local at = empty_dest and 0 or #to_before
+    vim.api.nvim_buf_set_lines(to_buf, at, empty_dest and #to_before or at, false, appended)
     for i = #moving, 1, -1 do
         vim.api.nvim_buf_set_lines(from_buf, moving[i].first - 1, moving[i].last, false, {})
     end
@@ -2700,6 +2970,9 @@ local function move_symbols(args)
     end
     if info.format_skipped then
         result.format_skipped = info.format_skipped
+    end
+    if info.imports_note then
+        result.imports_note = info.imports_note
     end
     return vim.tbl_extend("force", result,
         post_edit_report(to_buf, before, args.root, args.headless, opts, args.full_diagnostics))

@@ -288,14 +288,27 @@ func workspaceIdleTimeout() time.Duration {
 	return idle
 }
 
-// touchWorkspace marks a workspace as still in use. Called for every routed
-// call, so "idle" means what it says rather than "opened a while ago".
-func touchWorkspace(root string) {
-	if root == "" {
-		return
-	}
+// beginCall marks the workspace a session was resolved to as busy for the
+// duration of one call, and endCall releases it; both also mark it as
+// used, so "idle" means what it says rather than "opened a while ago".
+// Between the two the idle sweep leaves the workspace alone, however long
+// the call runs. The socket identifies the instance (it is unique per
+// instance), so a workspace replaced underneath a call is not miscounted.
+func beginCall(ses session) {
 	headlessMu.Lock()
-	if ws := workspaces[root]; ws != nil {
+	if ws := workspaces[ses.Root]; ws != nil && ws.Socket == ses.Socket {
+		ws.inFlight++
+		ws.lastUsed = time.Now()
+	}
+	headlessMu.Unlock()
+}
+
+func endCall(ses session) {
+	headlessMu.Lock()
+	if ws := workspaces[ses.Root]; ws != nil && ws.Socket == ses.Socket {
+		if ws.inFlight > 0 {
+			ws.inFlight--
+		}
 		ws.lastUsed = time.Now()
 	}
 	headlessMu.Unlock()
@@ -308,7 +321,8 @@ func reapIdleWorkspaces(idle time.Duration) []string {
 	headlessMu.Lock()
 	var stale []string
 	for root, ws := range liveLocked() {
-		if time.Since(ws.lastUsed) >= idle {
+		// A call in flight is use, however long ago it started.
+		if ws.inFlight == 0 && time.Since(ws.lastUsed) >= idle {
 			stale = append(stale, root)
 		}
 	}
@@ -371,9 +385,10 @@ func sweepStaleSockets() {
 		if !strings.HasSuffix(name, ".sock") {
 			continue
 		}
-		// The name is <hash of root>-<pid of the bridge that made it>.sock,
-		// so the owner is knowable without talking to the socket - which
-		// matters, because another live bridge's socket must not be touched.
+		// The name ends in -<pid of the bridge that made it>.sock (see
+		// openWorkspace), so the owner is knowable without talking to the
+		// socket - which matters, because another live bridge's socket must
+		// not be touched.
 		base := strings.TrimSuffix(name, ".sock")
 		dash := strings.LastIndexByte(base, '-')
 		if dash < 0 {

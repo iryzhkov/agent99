@@ -20,17 +20,15 @@
 local M = {}
 
 local core = require("agent99.core")
-local err, await, sleep = core.err, core.await, core.sleep
+local err, sleep = core.err, core.sleep
 local load_buf, rel_path, fresh_buf = core.load_buf, core.rel_path, core.fresh_buf
 local get_client, request, resync_open_buffers = core.get_client, core.request, core.resync_open_buffers
-local position_params, line_preview, decl_line = core.position_params, core.line_preview, core.decl_line
-local REQUEST_TIMEOUT_MS, MAX_LOCATIONS, FRESH_RETRY_MS = core.REQUEST_TIMEOUT_MS, core.MAX_LOCATIONS,
-    core.FRESH_RETRY_MS
+local position_params, line_preview = core.position_params, core.line_preview
+local MAX_LOCATIONS, FRESH_RETRY_MS = core.MAX_LOCATIONS, core.FRESH_RETRY_MS
 
 local index = require("agent99.index")
 local symbol_kind, ts_outline, symbol_index = index.symbol_kind, index.ts_outline, index.symbol_index
-local resolve_symbol, innermost_entry, annotate_locations = index.resolve_symbol, index.innermost_entry,
-    index.annotate_locations
+local annotate_locations = index.annotate_locations
 local skim, workspace_map, document_symbols = index.skim, index.workspace_map, index.document_symbols
 local workspace_symbols, ts_query, find_symbol = index.workspace_symbols, index.ts_query, index.find_symbol
 local enclosing_symbols = index.enclosing_symbols
@@ -155,11 +153,21 @@ local function quick_fix_titles(bufnr, client, d)
     pcall(function()
         lsp_diags = vim.lsp.diagnostic.from({ d })
     end)
+    -- vim.diagnostic columns are 0-based bytes; the server wants characters
+    -- in its own offset encoding, the conversion make_position does for a
+    -- requested column. Past the end of the line the byte index clamps.
+    local encoding = client.offset_encoding or "utf-16"
+    local function character(lnum, byte0)
+        local text = vim.api.nvim_buf_get_lines(bufnr, lnum, lnum + 1, false)[1] or ""
+        local okx, ch = pcall(vim.str_utfindex, text, encoding, math.min(byte0 or 0, #text), false)
+        return okx and ch or (byte0 or 0)
+    end
+    local end_lnum = d.end_lnum or d.lnum
     local ok, actions = pcall(request, client, bufnr, "textDocument/codeAction", {
         textDocument = { uri = vim.uri_from_bufnr(bufnr) },
         range = {
-            start = { line = d.lnum, character = d.col or 0 },
-            ["end"] = { line = d.end_lnum or d.lnum, character = d.end_col or (d.col or 0) },
+            start = { line = d.lnum, character = character(d.lnum, d.col) },
+            ["end"] = { line = end_lnum, character = character(end_lnum, d.end_col or d.col) },
         },
         context = { diagnostics = lsp_diags, triggerKind = 1 },
     })
@@ -197,6 +205,45 @@ local function diagnostics(args)
     -- on it.
     if #resync_open_buffers() > 0 then
         sleep(300)
+    end
+    -- A file no server will ever attach to (a filetype with no enabled LSP
+    -- config and no running client for it) gets an answer at once instead
+    -- of the attach timeout and an error: whatever a linter left in
+    -- vim.diagnostic, plus a note that no server was consulted.
+    if #vim.lsp.get_clients({ bufnr = bufnr }) == 0 then
+        local ft = vim.bo[bufnr].filetype
+        local serves = #core.enabled_lsp_configs_for(ft) > 0
+        if not serves then
+            for _, c in ipairs(vim.lsp.get_clients()) do
+                ---@diagnostic disable-next-line: undefined-field
+                local fts = (c.config or {}).filetypes
+                if vim.tbl_contains(fts or {}, ft) then
+                    serves = true
+                    break
+                end
+            end
+        end
+        if not serves then
+            local diags = vim.diagnostic.get(bufnr)
+            local out = {}
+            for _, d in ipairs(diags) do
+                out[#out + 1] = {
+                    line = d.lnum + 1,
+                    col = d.col + 1,
+                    severity = vim.diagnostic.severity[d.severity],
+                    message = d.message,
+                    source = d.source,
+                    code = d.code,
+                }
+            end
+            return {
+                count = #diags,
+                diagnostics = out,
+                note = ("no language server is enabled for filetype %s, so nothing checks this "
+                    .. "file; install_language(%q) adds one"):format(ft ~= "" and ft or "(none)",
+                    ft ~= "" and ft or vim.fn.fnamemodify(args.file, ":e")),
+            }
+        end
     end
     -- Give a freshly attached server a moment to publish.
     get_client(bufnr, "textDocument/didOpen")
@@ -513,29 +560,69 @@ local MAX_UNREFERENCED_FILES = 40
 
 local MAX_UNREFERENCED_SYMBOLS = 200
 
--- Every whole-word occurrence of `name` in the project, as file/line pairs.
--- The fallback for a file whose language has no server that answers
--- references (QML is one), which is the sweep a careful caller does by hand.
-local function textual_hits(root, name)
+-- One text search over the whole tree answers for every name at once; this
+-- bounds it, so a huge tree costs one timeout rather than one per symbol.
+local TEXT_SEARCH_TIMEOUT_MS = 30 * 1000
+
+-- Every whole-word occurrence of each of `names` in the project, as a map
+-- from name to file/line pairs, from a single rg (or grep) run. The fallback
+-- for a file whose language has no server that answers references (QML is
+-- one), which is the sweep a careful caller does by hand. nil means the
+-- search could not be run or did not finish.
+local function textual_hits(root, names)
+    if #names == 0 then
+        return {}
+    end
     local cmd
     if vim.fn.executable("rg") == 1 then
-        cmd = { "rg", "--no-heading", "--line-number", "--word-regexp",
-            "--fixed-strings", "--", name, root }
+        -- -o prints the matched word itself, which is what attributes each
+        -- hit to its name when many are searched at once. rg skips .git and
+        -- ignored files on its own.
+        cmd = { "rg", "--no-heading", "--line-number", "--only-matching",
+            "--word-regexp", "--fixed-strings" }
     elseif vim.fn.executable("grep") == 1 then
-        cmd = { "grep", "-rnwI", "--", name, root }
+        cmd = { "grep", "-rnwIoF", "--exclude-dir=.git" }
     else
         return nil
     end
-    local out = vim.fn.systemlist(cmd)
-    -- Both searchers exit 1 for "nothing matched", which is an answer.
-    if vim.v.shell_error > 1 then
+    for _, name in ipairs(names) do
+        cmd[#cmd + 1] = "-e"
+        cmd[#cmd + 1] = name
+    end
+    cmd[#cmd + 1] = "--"
+    cmd[#cmd + 1] = root
+    local result = core.await(function(resume)
+        -- The exit callback runs in a fast event context, where buffers
+        -- cannot be loaded; schedule the resume onto the main loop.
+        local ok, e = pcall(vim.system, cmd, { text = true, timeout = TEXT_SEARCH_TIMEOUT_MS },
+            vim.schedule_wrap(resume))
+        if not ok then
+            resume({ code = -1, stderr = tostring(e) })
+        end
+    end)
+    -- Both searchers exit 1 for "nothing matched", which is an answer; a
+    -- search killed at the timeout (124, SIGTERM) is not, and neither is a
+    -- searcher that failed.
+    if result.code == 124 and result.signal == 15 then
+        return nil, "timed out"
+    end
+    if result.code > 1 then
         return nil
     end
-    local hits = {}
-    for _, line in ipairs(out) do
-        local path, lnum = line:match("^(.-):(%d+):")
-        if path then
-            hits[#hits + 1] = { file = path, line = tonumber(lnum) }
+    local hits, seen = {}, {}
+    for _, name in ipairs(names) do
+        hits[name] = {}
+    end
+    for line in (result.stdout or ""):gmatch("[^\n]+") do
+        local path, lnum, name = line:match("^(.-):(%d+):(.*)$")
+        if path and hits[name] then
+            -- One hit per line and name, as a line-oriented search reports.
+            local key = name .. "\0" .. path .. "\0" .. lnum
+            if not seen[key] then
+                seen[key] = true
+                local list = hits[name]
+                list[#list + 1] = { file = path, line = tonumber(lnum) }
+            end
         end
     end
     return hits
@@ -551,10 +638,16 @@ local function name_line(lines, entry)
     -- its other uses are real references and the symbol looks alive. The
     -- last component is the one being declared here.
     local name = entry.name:match("[^%.:/]+$") or entry.name
+    -- Whole word only: "get" inside "widget" or "getter" is not the name,
+    -- and a request made there would be about the other identifier.
+    local pattern = "%f[%w_]" .. name:gsub("%W", "%%%0") .. "%f[^%w_]"
     for lnum = entry.first, math.min(entry.last, entry.first + 2) do
         local text = lines[lnum]
-        if text and text:find(name, 1, true) then
-            return lnum, name
+        local s = text and text:find(pattern)
+        if s then
+            -- The 1-based byte column too: a caller that passed only the
+            -- name would land on its first plain occurrence again.
+            return lnum, name, s
         end
     end
     return nil
@@ -576,12 +669,12 @@ local function references_outside(bufnr, path, entry, lines, client, root, cache
         return n
     end
     if client then
-        local lnum, name = name_line(lines, entry)
+        local lnum, _, col = name_line(lines, entry)
         if not lnum then
             return nil
         end
         local okp, params = pcall(position_params, bufnr, client,
-            { line = lnum, symbol = name })
+            { line = lnum, col = col })
         if not okp then
             return nil
         end
@@ -606,8 +699,11 @@ local function references_outside(bufnr, path, entry, lines, client, root, cache
                 range and (range.start.line + 1) or 0
         end)
     end
+    -- The text search ran once for every name before this loop; a name it
+    -- did not cover (a batch that failed) is searched on its own here.
     if cache[entry.name] == nil then
-        cache[entry.name] = textual_hits(root, entry.name) or false
+        local found = textual_hits(root, { entry.name })
+        cache[entry.name] = found and found[entry.name] or false
     end
     local hits = cache[entry.name]
     if hits == false then
@@ -644,6 +740,12 @@ local function unreferenced_symbols(args)
     end
     local dead, unknown, methods, cache = {}, {}, {}, {}
     local checked = 0
+    -- First pass: load every file and pick its top-level symbols, so the
+    -- names that need a text search are known before any search runs.
+    -- Top-level names only. A method is reached through its receiver, and a
+    -- zero-reference answer for one says more about the server than about
+    -- the code.
+    local work, text_names, text_seen = {}, {}, {}
     for _, f in ipairs(files) do
         local okb, bufnr = pcall(load_buf, f)
         if okb then
@@ -651,22 +753,48 @@ local function unreferenced_symbols(args)
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
             local client = core.client_for(bufnr, "textDocument/references")
             methods[client and "language server" or "text search"] = true
+            local entries = {}
             for _, e in ipairs(symbol_index(bufnr)) do
-                -- Top-level names only. A method is reached through its
-                -- receiver, and a zero-reference answer for one says more
-                -- about the server than about the code.
                 if e.name and e.name ~= "" and not e.path:find("/", 1, true)
                     and checked < MAX_UNREFERENCED_SYMBOLS then
                     checked = checked + 1
-                    local n = references_outside(bufnr, path, e, lines, client, root,
-                        cache, args.include_tests)
-                    local entry = { file = path, line = e.first, name = e.path, kind = e.kind }
-                    if n == nil then
-                        unknown[#unknown + 1] = entry
-                    elseif n == 0 then
-                        dead[#dead + 1] = entry
+                    entries[#entries + 1] = e
+                    if not client and not text_seen[e.name] then
+                        text_seen[e.name] = true
+                        text_names[#text_names + 1] = e.name
                     end
                 end
+            end
+            work[#work + 1] = { bufnr = bufnr, path = path, lines = lines, client = client, entries = entries }
+        end
+    end
+    -- One search for all the names at once, rather than one process per
+    -- symbol; a search that could not run leaves the cache empty, and each
+    -- name is then tried alone in references_outside.
+    local search_note
+    if #text_names > 0 then
+        local found, why = textual_hits(root, text_names)
+        if found then
+            for name, hits in pairs(found) do
+                cache[name] = hits
+            end
+        elseif why then
+            search_note = ("the text search %s after %d s; names it did not answer are listed under not_answered")
+                :format(why, TEXT_SEARCH_TIMEOUT_MS / 1000)
+            for _, name in ipairs(text_names) do
+                cache[name] = false
+            end
+        end
+    end
+    for _, w in ipairs(work) do
+        for _, e in ipairs(w.entries) do
+            local n = references_outside(w.bufnr, w.path, e, w.lines, w.client, root,
+                cache, args.include_tests)
+            local entry = { file = w.path, line = e.first, name = e.path, kind = e.kind }
+            if n == nil then
+                unknown[#unknown + 1] = entry
+            elseif n == 0 then
+                dead[#dead + 1] = entry
             end
         end
     end
@@ -681,6 +809,9 @@ local function unreferenced_symbols(args)
     if #unknown > 0 then
         res.not_answered = unknown
         res.not_answered_note = "no reference answer for these; they are not a finding either way"
+    end
+    if search_note then
+        res.search_note = search_note
     end
     if capped > 0 then
         res.note = ("%d further files were not checked (cap: %d)"):format(capped, MAX_UNREFERENCED_FILES)

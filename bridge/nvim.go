@@ -8,6 +8,7 @@ package main
 // escaping is needed.
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,11 @@ import (
 const (
 	nvimTimeout  = 60 * time.Second
 	pollInterval = 150 * time.Millisecond
+	// Cap on one --remote-expr round trip. Generous, because a tool that
+	// blocks the main loop briefly (a synchronous git or rg call in Lua)
+	// must not be mistaken for a wedged instance; but bounded, so that a
+	// wedged instance cannot hold the caller forever.
+	remoteExprTimeout = 20 * time.Second
 )
 
 // Tools allowed to run longer than nvimTimeout: installs download and compile.
@@ -39,11 +45,23 @@ var toolTimeouts = map[string]time.Duration{
 }
 
 func remoteExpr(sock, expr string) (string, error) {
-	cmd := exec.Command("nvim", "--server", sock, "--remote-expr", expr)
+	// One round trip is bounded on its own. The tools that take minutes
+	// run asynchronously behind Agent99RpcStart and are waited for by the
+	// poll loop in nvimCall, so a single --remote-expr that does not come
+	// back within this is an instance whose main loop is wedged, and
+	// nothing that waited longer (nvimCall's deadline, stopWorkspace's
+	// kill fallback, the signal handler) would ever have returned.
+	ctx, cancel := context.WithTimeout(context.Background(), remoteExprTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "nvim", "--server", sock, "--remote-expr", expr)
 	var out, errb strings.Builder
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("nvim RPC failed: no answer from %s within %s (is the instance wedged?)",
+				sock, remoteExprTimeout)
+		}
 		detail := strings.TrimSpace(errb.String())
 		if detail == "" {
 			detail = strings.TrimSpace(out.String())

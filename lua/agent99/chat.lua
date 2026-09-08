@@ -71,7 +71,7 @@ function M.send(text)
         end)
     end
     state.session = state.session
-        or (os.date("%Y%m%d-%H%M%S") .. "-s" .. math.random(1000, 9999))
+        or (os.date("%Y%m%d-%H%M%S") .. "-s" .. require("agent99.history").nonce())
     local prompt, ctx_buf = chat_context(text)
     local buf = ctx_buf or vim.api.nvim_get_current_buf()
     request.start(buf, nil, nil, text, {

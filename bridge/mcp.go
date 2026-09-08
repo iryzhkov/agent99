@@ -307,6 +307,10 @@ func dispatchMCPTool(name string, arguments map[string]any) (map[string]any, str
 	if err != nil {
 		return textResult("Error: "+err.Error(), true), ""
 	}
+	// Busy from here until the reply, so the idle sweep cannot close the
+	// workspace under a long call; touched again on the way out either way.
+	beginCall(ses)
+	defer endCall(ses)
 	out, err := callTool(name, arguments, ses)
 	if err != nil {
 		return textResult("Error: "+err.Error(), true), ses.Root
@@ -322,7 +326,6 @@ func dispatchMCPTool(name string, arguments map[string]any) (map[string]any, str
 		}
 	}
 	noteCall(name, ses)
-	touchWorkspace(ses.Root)
 	// Which workspace answered is only in question when several are open,
 	// and then it is worth a line: a misrouted call is otherwise invisible.
 	if len(openRoots()) > 1 {

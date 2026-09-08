@@ -89,7 +89,17 @@ local function new_state()
         output_bytes = 0,
         output_cursor = 0,  -- lines already shown in a reply
         output_dropped = 0, -- lines that fell off the front of the ring
-        breakpoints = {},   -- ledger: { bufnr, line, file }
+        -- Ledger of the agent's breakpoints: { bufnr, sign_id, line, file,
+        -- result }. The sign is nvim-dap's own record, and it moves with
+        -- buffer edits; `line` is the last place it was seen and is
+        -- re-read from the sign before use (see ledger_line). `result` is
+        -- the adapter's last answer for it, keyed here rather than in
+        -- nvim-dap's store, which loses it when the adapter moves a
+        -- breakpoint to another line.
+        breakpoints = {},
+        children = {},      -- child sessions the adapter opened (js-debug)
+        notices = {},       -- vim.notify text nvim-dap emitted while starting
+        adapter_ready = false, -- a spawned server adapter is up and listening
         fingerprints = {},  -- file -> disk fingerprint at launch
         waiter = nil,       -- { tool, since, resume }
         stop = nil,         -- last stopped-event body
@@ -140,8 +150,10 @@ local function push_output_chunk(text, tag)
         partial[tag] = text
         return
     end
-    for line in text:sub(1, last_nl - 1):gmatch("[^\n]*") do
-        if line ~= "" then push_output(line, tag) end
+    -- Blank lines are output too (a program's empty println), so split
+    -- rather than match non-empty runs.
+    for _, line in ipairs(vim.split(text:sub(1, last_nl - 1), "\n", { plain = true })) do
+        push_output(line, tag)
     end
     local rest = text:sub(last_nl + 1)
     partial[tag] = rest ~= "" and rest or nil
@@ -207,7 +219,9 @@ local function wake(kind, body)
 end
 
 -- Block the tool until the next stop/exit/failure or the timeout. Returns
--- "stopped" | "exited" | "failed" | "timeout". Only one tool may wait at a
+-- "stopped" | "exited" | "failed" | "timeout", or "initialized" while a
+-- launch claims its session and "ended" when debug_stop or a relaunch
+-- tore the session down under the waiter. Only one tool may wait at a
 -- time; the second one is told who is already waiting.
 local function wait_event(tool, ms)
     if state.waiter then
@@ -281,6 +295,10 @@ end
 -- runs the program in a child session opened by a startDebugging request).
 local function our_session(session)
     if state.session == nil or session == nil then return false end
+    if session == state.session or state.children[session] then return true end
+    -- Fall back to the parent chain for a child seen before it was
+    -- recorded; nvim-dap clears `parent` when the child closes, so the
+    -- children table above is what a termination listener relies on.
     local s = session
     for _ = 1, 8 do
         if s == state.session then return true end
@@ -314,6 +332,9 @@ local function session_ended(reason)
     end
 end
 
+-- Defined with the breakpoint ledger below; the listeners need them first.
+local record_bp_results, update_bp_result
+
 local function install_listeners(dap)
     if listeners_installed then return end
     listeners_installed = true
@@ -326,6 +347,11 @@ local function install_listeners(dap)
             state.session = session
             state.claiming = false
             wake("initialized")
+        elseif session ~= state.session and our_session(session) then
+            -- A child the adapter opened for the program (js-debug):
+            -- remember it here, because nvim-dap drops its `parent` link
+            -- as it closes, before the termination listener runs.
+            state.children[session] = true
         end
     end
     L.after.event_stopped[key] = function(session, body)
@@ -345,6 +371,7 @@ local function install_listeners(dap)
         if session ~= state.session then
             -- A child (the program) ended; the root adapter session may
             -- linger. The exit path closes it once the reply is built.
+            state.children[session] = nil
             state.child_ended = true
             wake("exited", { terminated = true })
             return
@@ -365,13 +392,34 @@ local function install_listeners(dap)
         end
     end
     L.after.attach[key] = L.after.launch[key]
-    -- Every OutputEvent lands in the ring buffer, never in the REPL.
+    -- The adapter's verdict on each breakpoint, kept on the ledger entry
+    -- (see record_bp_results): nvim-dap only records it when the adapter
+    -- kept the requested line.
+    L.after.setBreakpoints[key] = function(session, e, response, payload)
+        if our_session(session) then
+            record_bp_results(e, response, payload)
+        end
+    end
+    L.after.event_breakpoint[key] = function(session, body)
+        if our_session(session) and body and body.reason == "changed" and body.breakpoint then
+            update_bp_result(body.breakpoint)
+        end
+    end
+    -- Every OutputEvent of our session lands in the ring buffer, never in
+    -- the REPL; other sessions keep whatever handler was there before.
+    local previous_on_output = dap.defaults.fallback.on_output
     dap.defaults.fallback.on_output = function(session, body)
         if not body or body.category == "telemetry" then return end
-        if state.session == nil or our_session(session) then
+        -- While a launch is claiming its session, output from any session
+        -- but the one that just ended is the new adapter's.
+        local ours = our_session(session)
+            or (state.session == nil and state.claiming and session ~= state.finished)
+        if ours then
             local tag = body.category == "stderr" and "" or
                 (body.category == "console" and "[adapter] " or "")
             push_output_chunk(body.output, tag)
+        elseif previous_on_output then
+            previous_on_output(session, body)
         end
     end
     -- Sessions the user starts in embedded mode are adopted on demand
@@ -524,6 +572,10 @@ BUILTIN.delve = {
             spawn_server_adapter(dlv, { "dap", "-l", "127.0.0.1:0" }, config.cwd or root,
                 "DAP server listening at: (%S+)", "[dlv] ",
                 function(host, port)
+                    -- Delve is up; what follows (go build, then the
+                    -- launch response and `initialized`) can take longer
+                    -- than the adapter start budget, see start_session.
+                    state.adapter_ready = true
                     callback({ type = "server", host = host, port = port })
                 end,
                 function(why)
@@ -1097,47 +1149,130 @@ local function bp_module()
     return require("dap.breakpoints")
 end
 
+-- nvim-dap keeps breakpoints as signs in this group; a sign moves with
+-- the buffer's edits, so it is the only durable handle on a breakpoint.
+local BP_SIGN_GROUP = "dap_breakpoints"
+
+-- The line the sign of ledger entry `b` sits on now, or nil when the sign
+-- is gone (removed by the user, or its buffer wiped). Refreshes b.line.
+local function ledger_line(b)
+    if not b.sign_id or not vim.api.nvim_buf_is_valid(b.bufnr) then return nil end
+    local ok, placed = pcall(vim.fn.sign_getplaced, b.bufnr, { group = BP_SIGN_GROUP, id = b.sign_id })
+    if not ok then return nil end
+    local sign = placed[1] and placed[1].signs and placed[1].signs[1]
+    if not sign then return nil end
+    b.line = sign.lnum
+    return sign.lnum
+end
+
+-- The id of nvim-dap's sign at `line` (at most one: set replaces).
+local function sign_at(bufnr, line)
+    local ok, placed = pcall(vim.fn.sign_getplaced, bufnr, { group = BP_SIGN_GROUP, lnum = line })
+    if not ok then return nil end
+    local sign = placed[1] and placed[1].signs and placed[1].signs[1]
+    return sign and sign.id or nil
+end
+
+-- Drop the entries whose sign nvim-dap no longer has.
+local function ledger_prune()
+    local kept = {}
+    for _, b in ipairs(state.breakpoints) do
+        if ledger_line(b) then kept[#kept + 1] = b end
+    end
+    state.breakpoints = kept
+end
+
+-- The entry whose sign is on `line` of `bufnr` now.
 local function ledger_find(bufnr, line)
     for i, b in ipairs(state.breakpoints) do
-        if b.bufnr == bufnr and b.line == line then return i, b end
+        if b.bufnr == bufnr and ledger_line(b) == line then return i, b end
     end
     return nil
 end
 
--- nvim-dap's record for a breakpoint (state has id/verified/line after
--- the adapter answered).
-local function bp_record(bufnr, line)
-    local per_buf = bp_module().get(bufnr)[bufnr] or {}
-    for _, bp in ipairs(per_buf) do
-        if bp.line == line then return bp end
+-- Keep the adapter's answer to a setBreakpoints request on the entries
+-- it concerns. The request names the buffer by path and lists lines in
+-- the order the response answers them (the protocol guarantees the
+-- order); an entry is matched by the line its sign is on now, which is
+-- the line the request carried a moment ago.
+record_bp_results = function(e, response, payload)
+    local path = payload and payload.source and payload.source.path
+    if not path then return end
+    local wanted = payload.breakpoints or {}
+    local got = response and response.breakpoints or {}
+    for i, req in ipairs(wanted) do
+        for _, b in ipairs(state.breakpoints) do
+            if b.file == path and ledger_line(b) == req.line then
+                local r = got[i]
+                if e then
+                    b.result = {
+                        requested_line = req.line,
+                        verified = false,
+                        message = tostring(e.message or e),
+                    }
+                elseif r then
+                    b.result = {
+                        requested_line = req.line,
+                        id = r.id,
+                        verified = r.verified == true,
+                        line = r.line,
+                        message = r.message,
+                    }
+                end
+            end
+        end
     end
-    return nil
+end
+
+-- A `breakpoint` event with reason "changed": the adapter verified or
+-- moved one it had answered before.
+update_bp_result = function(bp)
+    if bp.id == nil then return end
+    for _, b in ipairs(state.breakpoints) do
+        local r = b.result
+        if r and r.id == bp.id then
+            if bp.verified ~= nil then r.verified = bp.verified == true end
+            if bp.line then r.line = bp.line end
+            r.message = bp.message
+        end
+    end
 end
 
 local function describe_bp(b, next_id)
-    local rec = bp_record(b.bufnr, b.line)
-    local out = { file = b.file, line = b.line }
+    local cur = ledger_line(b) or b.line
+    local out = { file = b.file, line = cur }
     if b.condition then out.condition = b.condition end
     if b.hit_condition then out.hit_condition = b.hit_condition end
     if b.log_message then out.log_message = b.log_message end
-    if rec and rec.state then
-        out.id = rec.state.id
-        out.verified = rec.state.verified == true
-        if rec.state.line and rec.state.line ~= b.line then
-            out.requested_line = b.line
-            out.line = rec.state.line
+    local r = b.result
+    if r then
+        out.id = r.id
+        out.verified = r.verified == true
+        if r.line and r.line ~= r.requested_line then
+            out.requested_line = r.requested_line
+            out.line = r.line
         end
-        if rec.state.message and rec.state.message ~= "" then out.note = rec.state.message end
+        local notes = {}
+        if cur ~= r.requested_line then
+            notes[#notes + 1] = ("the buffer changed since this breakpoint was sent at line %d; "
+                .. "the running program still has it there"):format(r.requested_line)
+        end
+        if r.message and r.message ~= "" then notes[#notes + 1] = r.message end
+        if #notes > 0 then out.note = table.concat(notes, "; ") end
     elseif state.session then
         out.verified = false
     else
         out.verified = "pending (sent at launch)"
     end
-    if not out.id then out.id = next_id end
+    -- Before the adapter answered, the ledger position stands in for an id;
+    -- an answer without one (a rejected breakpoint) gets none, so it is
+    -- never confused with a neighbour's adapter id.
+    if not r then out.id = next_id end
     return out
 end
 
 local function list_breakpoints()
+    ledger_prune()
     local out = {}
     for i, b in ipairs(state.breakpoints) do
         out[#out + 1] = describe_bp(b, i)
@@ -1180,7 +1315,8 @@ end
 -- Remove every breakpoint the agent placed, leaving the user's alone.
 local function clear_own_breakpoints()
     for _, b in ipairs(state.breakpoints) do
-        pcall(bp_module().remove, b.bufnr, b.line)
+        local line = ledger_line(b)
+        if line then pcall(bp_module().remove, b.bufnr, line) end
     end
     state.breakpoints = {}
 end
@@ -1333,7 +1469,7 @@ local function format_stack(frames, root, max, all_frames)
     return out
 end
 
-local function annotate_frame(frame, root)
+local function annotate_frame(frame)
     local path = frame_file(frame)
     local info = { file = path, line = frame.line, name = frame.name }
     if not path or not file_exists(path) then
@@ -1473,7 +1609,7 @@ local function stop_reply(session, root)
     end
     local frames = st.stackFrames
     local top = frames[1]
-    local info, bufnr = annotate_frame(top, root)
+    local info, bufnr = annotate_frame(top)
     reply.frame = info
     reply.source = source_window(bufnr, top.line)
     if state.variables_mode ~= "none" then
@@ -1545,9 +1681,16 @@ local function outcome_reply(kind, root, timeout_note)
     elseif kind == "failed" then
         local why = state.launch_error or "adapter failure"
         local tail = output_tail(10)
+        local request_kind = state.request or "launch"
+        local notices = #state.notices > 0 and ("\nnvim-dap: " .. table.concat(state.notices, " | ")) or ""
+        -- The session is dead; the breakpoints stay for the next attempt.
         M.shutdown()
-        err("%s failed: %s%s", state.request or "launch", why,
+        err("%s failed: %s%s%s", request_kind, why, notices,
             #tail > 0 and ("\nadapter output: " .. table.concat(tail, " | ")) or "")
+    elseif kind == "ended" then
+        -- debug_stop (or a relaunch) ended the session while this tool
+        -- was waiting; the stop tears the state down itself.
+        return { state = "exited", reason = "ended by debug_stop", output_new = output_new() }
     end
     return running_reply(timeout_note)
 end
@@ -1671,11 +1814,14 @@ local function start_session(dap, adapter_name, adapter, config, args, root, req
     local keep_bps = state.breakpoints
     local keep_track, keep_mode = state.track, state.variables_mode
     local keep_last = { state.last_config, state.last_launch_args, state.last_adapter, state.last_dap_type }
+    local finished = state.finished
     state = new_state()
     state.breakpoints = keep_bps
     state.track, state.variables_mode = keep_track, keep_mode
     state.last_config, state.last_launch_args = keep_last[1], keep_last[2]
     state.last_adapter, state.last_dap_type = keep_last[3], keep_last[4]
+    -- The previous session may still be closing; nothing of it is ours.
+    state.finished = finished
     session_options(args)
     state.origin = "agent"
     state.request = request_kind
@@ -1683,6 +1829,8 @@ local function start_session(dap, adapter_name, adapter, config, args, root, req
     state.config = config
     state.launch_args = args
     state.started = now()
+    ledger_prune()
+    for _, b in ipairs(state.breakpoints) do b.result = nil end
     state.had_breakpoints = #state.breakpoints > 0
     touch()
     record_fingerprints(args.file)
@@ -1702,21 +1850,65 @@ local function start_session(dap, adapter_name, adapter, config, args, root, req
     state.dap_type = type_name
     state.claiming = true
     local wait_ms = clamp_wait(args.wait_ms)
+    -- nvim-dap reports a spawn failure or an adapter that exits early
+    -- through vim.notify, which a headless instance shows nobody; keep
+    -- that text for the error while the adapter starts.
+    local notices, notify_saved = state.notices, vim.notify
+    local function notify_capture(msg, level, opts)
+        if type(msg) == "string" then
+            notices[#notices + 1] = msg
+            if #notices > 10 then table.remove(notices, 1) end
+        end
+        return notify_saved(msg, level, opts)
+    end
+    vim.notify = notify_capture
+    local function restore_notify()
+        if vim.notify == notify_capture then vim.notify = notify_saved end
+    end
     local ok_run, run_err = pcall(dap.run, config, { new = true })
     if not ok_run then
+        restore_notify()
         state.claiming = false
         err("could not start the adapter: %s", tostring(run_err))
     end
-    -- Phase 1: the adapter must come up and send `initialized` within
-    -- ADAPTER_START_MS, whatever the caller's wait; a missing binary or a
-    -- wrong version shows up here, with the adapter's own output.
+    -- An executable adapter is spawned before dap.run returns; when the
+    -- spawn failed there is no session to wait for, and the reason went
+    -- to vim.notify.
+    if type(adapter) == "table" and adapter.type == "executable" and not adapter.enrich_config then
+        local s = dap.session()
+        if s == nil or s.closed or s == state.finished then
+            restore_notify()
+            M.shutdown()
+            err("could not start the %s adapter: %s", adapter_name,
+                #notices > 0 and table.concat(notices, " | ") or "nvim-dap created no session")
+        end
+    end
+    -- Phase 1: the adapter must come up and send `initialized`. The budget
+    -- is ADAPTER_START_MS of silence, whatever the caller's wait: a
+    -- missing binary or a wrong version shows up here, with the adapter's
+    -- own output. A server adapter this module spawned and saw listening
+    -- (Delve, whose `go build` runs before it answers the launch), or any
+    -- adapter still producing output, is alive and keeps the phase going,
+    -- up to the caller's wait.
     local tool = "debug_" .. request_kind
-    local kind = wait_event(tool, ADAPTER_START_MS)
+    local phase_deadline = now() + math.max(ADAPTER_START_MS, wait_ms)
+    local kind
+    while true do
+        local seen = #state.output + state.output_dropped
+        kind = wait_event(tool, math.min(ADAPTER_START_MS, phase_deadline - now()))
+        if kind ~= "timeout" then break end
+        local alive = state.adapter_ready or (#state.output + state.output_dropped) > seen
+        if not alive or now() >= phase_deadline then break end
+    end
+    restore_notify()
     if kind == "timeout" then
         local tail = table.concat(output_tail(10), " | ")
+        local waited = math.floor((now() - state.started) / 1000)
+        -- The session is dead; the breakpoints stay for the next attempt.
         M.shutdown()
-        err("the %s adapter did not initialize within %d s%s", adapter_name,
-            ADAPTER_START_MS / 1000, tail ~= "" and (": " .. tail) or "")
+        err("the %s adapter did not initialize within %d s%s%s", adapter_name, waited,
+            #notices > 0 and ("; nvim-dap: " .. table.concat(notices, " | ")) or "",
+            tail ~= "" and (": " .. tail) or "")
     end
     -- Phase 2: the first stop or exit, within the caller's wait.
     if kind == "initialized" then
@@ -1772,6 +1964,8 @@ local function launch(args)
             err("nothing to relaunch: no previous debug_launch in this workspace")
         end
         if state.session and not state.session.closed and state.exit == nil then
+            -- End the live session; its breakpoints carry over (shutdown
+            -- only forgets them when debug_stop asks).
             M.shutdown()
         end
         local merged = vim.tbl_extend("force", prev, { wait_ms = args.wait_ms, again = nil })
@@ -1829,6 +2023,9 @@ local function attach(args)
         if #candidates == 0 then err("no nvim-dap attach configuration named %q", args.config) end
         local cfg = evaluate_user_config(candidates[1])
         local adapter = dap.adapters[cfg.type]
+        if not adapter then
+            err("configuration %q references adapter %q which is not defined", cfg.name or "?", tostring(cfg.type))
+        end
         return start_session(dap, cfg.type, adapter, cfg, args, root, "attach", cfg.type)
     end
     local spec, bin = pick_adapter(dap, args, root, "attach")
@@ -1868,14 +2065,32 @@ end
 
 -- End the session: terminate what we launched, disconnect from what we
 -- attached to or the user started. Never raises.
-function M.shutdown(force)
+function M.shutdown(force, forget_breakpoints)
     local s = state.session
     local dap = has_dap()
     if not s or not dap then
+        -- Nothing claimed yet: a launch that never got `initialized`, or a
+        -- spawn that failed. A session nvim-dap did create for our
+        -- configuration must not be claimed later, nor left running.
+        if dap and state.claiming then
+            local pending = dap.session()
+            if pending and not pending.closed and pending ~= state.finished
+                and pending.config and pending.config.type == state.dap_type then
+                pcall(pending.close, pending)
+            end
+        end
+        state.claiming = false
         kill_adapter_proc("sigterm")
+        wake("ended")
+        finish_session()
+        if forget_breakpoints then clear_own_breakpoints() end
         return { stopped = false }
     end
     local result = { stopped = true }
+    -- A tool waiting on this session (debug_wait, or a step) is told the
+    -- session ended rather than left waiting for an event that will now
+    -- go to the waiter below.
+    wake("ended")
     if not s.closed then
         local terminate = state.origin == "agent" and state.request == "launch" or force
         pcall(function() s.adapter.options = { disconnect_timeout_sec = 2 } end)
@@ -1924,7 +2139,9 @@ function M.shutdown(force)
     result.output_tail = output_tail(20)
     local origin = state.origin
     finish_session()
-    if origin == "agent" then
+    -- The breakpoints outlive the session for a relaunch or a failed
+    -- start; only debug_stop forgets them, and only the agent's own.
+    if forget_breakpoints and origin == "agent" then
         clear_own_breakpoints()
     end
     return result
@@ -1981,7 +2198,25 @@ local function debug_stop(args)
         return { stopped = false, note = "no debug session" }
     end
     touch()
-    return M.shutdown(args.force == true)
+    return M.shutdown(args.force == true, true)
+end
+
+-- The program is about to run: forget the stop and the thread and frame
+-- that came with it, so the "is it running?" guards see a running program
+-- until the next stopped event.
+local function clear_stop(session)
+    state.stop = nil
+    state.current_thread = nil
+    state.current_frame_id = nil
+    -- nvim-dap does the same before its own continue/step requests
+    -- (clear_running); a resume request sent by us leaves it in place,
+    -- and the guards above fall back to it.
+    if session then
+        local tid = session.stopped_thread_id
+        session.stopped_thread_id = nil
+        local thread = tid and session.threads and session.threads[tid]
+        if thread then thread.stopped = false end
+    end
 end
 
 local function debug_continue(args)
@@ -2001,18 +2236,21 @@ local function debug_continue(args)
             err("to must be an object with file and line or name_path")
         end
         local bufnr, path, line = resolve_line(to)
-        if not bp_record(bufnr, line) then
+        if not sign_at(bufnr, line) then
             bp_module().set({}, bufnr, line)
             bp_buffers[bufnr] = true
-            temp_bp = { bufnr = bufnr, line = line, file = path }
+            -- Held by sign id like a ledger entry: an edit above it while
+            -- the program runs moves the sign, and the removal follows it.
+            temp_bp = { bufnr = bufnr, line = line, file = path, sign_id = sign_at(bufnr, line) }
             sync_breakpoints(s)
         end
     end
-    state.stop = nil
+    clear_stop(s)
     request(s, "continue", { threadId = thread })
     local kind = wait_event("debug_continue", clamp_wait(args.wait_ms))
     if temp_bp then
-        pcall(bp_module().remove, temp_bp.bufnr, temp_bp.line)
+        local at = ledger_line(temp_bp)
+        if at then pcall(bp_module().remove, temp_bp.bufnr, at) end
         if state.session and not state.session.closed then sync_breakpoints(state.session) end
     end
     return outcome_reply(kind, root)
@@ -2033,12 +2271,13 @@ local function debug_step(args)
         "the program is running, so there is nothing to step; debug_wait(pause_after=true) stops it first")
     end
     local count = math.max(1, math.min(tonumber(args.count) or 1, 50))
-    local wait_ms = clamp_wait(args.wait_ms)
+    -- wait_ms is the budget for the whole run of steps, not for each.
+    local deadline = now() + clamp_wait(args.wait_ms)
     local kind
     for _ = 1, count do
-        state.stop = nil
+        clear_stop(s)
         request(s, command, { threadId = thread, granularity = "statement" })
-        kind = wait_event("debug_step", wait_ms)
+        kind = wait_event("debug_step", math.max(0, deadline - now()))
         if kind ~= "stopped" then break end
         thread = state.stop and state.stop.threadId or thread
     end
@@ -2083,30 +2322,40 @@ local function debug_breakpoint(args)
     if not args.file then err("missing required argument: file") end
     local bufnr, path, line = resolve_line(args)
     local file = path
+    ledger_prune()
     if args.remove then
+        -- Matched where the sign is now, not where it was placed: edits
+        -- above it since then have moved it.
         local idx = ledger_find(bufnr, line)
         if not idx then
             err("no agent breakpoint at %s:%d (the user's breakpoints are left alone)", I().rel_path(file), line)
         end
         table.remove(state.breakpoints, idx)
-        pcall(bp_module().remove, bufnr, line)
+        local ok, removed = pcall(bp_module().remove, bufnr, line)
         local s = state.session
         if s and not s.closed then sync_breakpoints(s) end
-        return { removed = true, file = file, line = line }
+        return { removed = ok and removed == true, file = file, line = line }
     end
     local opts = {}
     if args.condition then opts.condition = args.condition end
     if args.hit_condition then opts.hit_condition = args.hit_condition end
     if args.log_message then opts.log_message = args.log_message end
     bp_buffers[bufnr] = true
+    -- Find the entry before nvim-dap's set replaces the sign (a new id).
+    local idx, entry = ledger_find(bufnr, line)
     bp_module().set({ condition = opts.condition, hit_condition = opts.hit_condition, log_message = opts.log_message },
         bufnr, line)
-    local idx, entry = ledger_find(bufnr, line)
+    local sign_id = sign_at(bufnr, line)
+    if not sign_id then
+        err("nvim-dap did not place a breakpoint at %s:%d", I().rel_path(file), line)
+    end
     if not entry then
         entry = { bufnr = bufnr, line = line, file = file }
         state.breakpoints[#state.breakpoints + 1] = entry
         idx = #state.breakpoints
     end
+    entry.sign_id = sign_id
+    entry.result = nil
     entry.condition, entry.hit_condition, entry.log_message = opts.condition, opts.hit_condition, opts.log_message
     if state.session and state.fingerprints[file] == nil and file_exists(file) then
         state.fingerprints[file] = I().disk_fingerprint(file)
@@ -2127,6 +2376,7 @@ end
 
 local function debug_breakpoints(args)
     need_dap()
+    ledger_prune()
     if args.clear then
         local n = #state.breakpoints
         clear_own_breakpoints()
@@ -2332,7 +2582,20 @@ local function install_debugger(args)
     local pkg
     local okp = pcall(function() pkg = registry.get_package(package) end)
     if not okp or not pkg then
-        I().await(function(resume) pcall(registry.refresh, function() resume() end) end)
+        -- The registry may be stale or not loaded yet; refresh it, with a
+        -- bound because the refresh fetches over the network and a
+        -- synchronous throw would otherwise never resume.
+        local timer = uv.new_timer()
+        local refreshed, why = I().await(function(resume)
+            timer:start(60000, 0, vim.schedule_wrap(function()
+                resume(false, "Mason registry refresh did not finish within 60 s")
+            end))
+            local okr, rerr = pcall(registry.refresh, function() resume(true) end)
+            if not okr then resume(false, "Mason registry refresh failed: " .. tostring(rerr)) end
+        end)
+        timer:stop()
+        timer:close()
+        if not refreshed then out.refresh_error = why end
         okp = pcall(function() pkg = registry.get_package(package) end)
     end
     if not okp or not pkg then

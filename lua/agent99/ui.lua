@@ -92,6 +92,32 @@ function M.stream_text(chunk)
     scroll_to_bottom()
 end
 
+--- Position in the conversation pane (its line count), for rewind. nil when
+--- the pane does not exist.
+function M.mark()
+    if not (state.out_buf and vim.api.nvim_buf_is_valid(state.out_buf)) then
+        return nil
+    end
+    return vim.api.nvim_buf_line_count(state.out_buf)
+end
+
+--- Drop everything appended since `mark`: the bridge discards a streamed turn
+--- it found degenerate and retries, and the discarded text must not stay in
+--- the pane ahead of the retry.
+function M.rewind(mark)
+    if not (mark and state.out_buf and vim.api.nvim_buf_is_valid(state.out_buf)) then
+        return
+    end
+    local count = vim.api.nvim_buf_line_count(state.out_buf)
+    if mark >= count then
+        return
+    end
+    vim.bo[state.out_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(state.out_buf, mark, count, false, {})
+    vim.bo[state.out_buf].modifiable = false
+    scroll_to_bottom()
+end
+
 --- Wipe the conversation pane back to the welcome text. Pane content only —
 --- resetting the transcript itself is chat_reset's job, which calls this.
 function M.clear()

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,8 +22,12 @@ import (
 const (
 	maxToolOutputChars = 30000
 	maxGrepLines       = 200
-	maxListFiles       = 500
-	maxReadLines       = 2000
+	// How many searcher output lines are read past the cap before the
+	// search is stopped: enough to count what a truncation note reports,
+	// not enough to let a pattern like "." read a whole tree.
+	maxGrepScan  = 20000
+	maxListFiles = 500
+	maxReadLines = 2000
 )
 
 var lspToolNames = func() map[string]bool {
@@ -247,6 +252,8 @@ func runGrep(ses session, args map[string]any) (string, error) {
 	} else {
 		searchDir, searchTarget = "", target
 	}
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var cmd *exec.Cmd
 	if _, err := exec.LookPath("rg"); err == nil {
 		// --sort path costs rg its parallelism but makes the output
@@ -259,48 +266,107 @@ func runGrep(ses session, args map[string]any) (string, error) {
 			cargs = append(cargs, "-g", glob)
 		}
 		cargs = append(cargs, "-e", pattern, searchTarget)
-		cmd = exec.Command("rg", cargs...)
+		cmd = exec.CommandContext(ctxCancel, "rg", cargs...)
 	} else {
 		cargs := []string{"-rnHIE", ctxArg}
 		if glob != "" {
 			cargs = append(cargs, "--include="+glob)
 		}
 		cargs = append(cargs, "-e", pattern, searchTarget)
-		cmd = exec.Command("grep", cargs...)
+		cmd = exec.CommandContext(ctxCancel, "grep", cargs...)
 	}
 	cmd.Dir = searchDir
-	out, err := cmd.Output()
+	var stderr tailBuffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		// Exit code 1 just means "no matches" for both rg and grep.
-		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
-			return "(no matches)", nil
-		}
 		return "", fmt.Errorf("grep failed: %v", err)
 	}
-	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
-	if searchDir != "" {
-		absolutizeGrepPaths(lines, searchDir)
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("grep failed: %v", err)
 	}
-	// Path-based, so it is exact and costs nothing: no classifier involved,
-	// and it happens before truncation so the cap applies to hits the caller
-	// actually asked for.
-	var testsFiltered int
-	if tests == "exclude" || tests == "only" {
-		kept := lines[:0]
-		for _, l := range lines {
-			isTest := testPathRe.MatchString(grepHitPath(l, searchDir))
-			if (tests == "only") == isTest {
-				kept = append(kept, l)
-			} else {
-				testsFiltered++
+	// The output is read as it comes and kept only up to the cap: a broad
+	// pattern over a large tree produces megabytes that would otherwise be
+	// buffered whole before being thrown away. Past the cap the rest is
+	// counted (bounded by maxGrepScan, after which the searcher is killed)
+	// so the truncation note can say how much was left out.
+	//
+	// The tests= filter is path-based, so it is exact and costs nothing:
+	// no classifier involved, and it happens before the cap so that the cap
+	// applies to hits the caller actually asked for. rg's "--" separators
+	// between context groups are not hits: they are passed through, never
+	// counted, and collapsed where the filter emptied a group.
+	var lines []string
+	var testsFiltered, truncated, scanned int
+	filtering := tests == "exclude" || tests == "only"
+	capped := false
+	reader := bufio.NewReader(stdout)
+	for {
+		l, rerr := reader.ReadString('\n')
+		if l == "" && rerr != nil {
+			break
+		}
+		l = strings.TrimRight(l, "\n")
+		scanned++
+		if l == "--" {
+			if len(lines) > 0 && lines[len(lines)-1] != "--" && len(lines) < maxGrepLines {
+				lines = append(lines, l)
+			}
+		} else {
+			if searchDir != "" {
+				l = absolutizeGrepPath(l, searchDir)
+			}
+			// Context lines travel with their hit but are not hits: the
+			// counts in the notes are of hits only.
+			path, isHit := grepHitPath(l, searchDir)
+			keep := !filtering || (tests == "only") == testPathRe.MatchString(path)
+			switch {
+			case !keep:
+				if isHit {
+					testsFiltered++
+				}
+			case len(lines) < maxGrepLines:
+				lines = append(lines, l)
+			case isHit:
+				truncated++
 			}
 		}
-		lines = kept
+		if rerr != nil {
+			break
+		}
+		if scanned >= maxGrepScan {
+			capped = true
+			cancel()
+			break
+		}
 	}
-	var truncated int
-	if len(lines) > maxGrepLines {
-		truncated = len(lines) - maxGrepLines
-		lines = lines[:maxGrepLines]
+	if len(lines) > 0 && lines[len(lines)-1] == "--" {
+		lines = lines[:len(lines)-1]
+	}
+	waitErr := cmd.Wait()
+	if capped {
+		// The searcher was stopped, so its exit status says nothing.
+		waitErr = nil
+	}
+	var notes []string
+	if waitErr != nil {
+		// Exit code 1 just means "no matches" for both rg and grep. Code 2
+		// is an error - a bad regex, an unreadable path - which may still
+		// have come after matches; those are kept and the error becomes a
+		// note, so the caller sees both.
+		ee, isExit := waitErr.(*exec.ExitError)
+		if isExit && ee.ExitCode() == 1 && len(lines) == 0 {
+			return "(no matches)", nil
+		}
+		detail := stderr.String()
+		if detail == "" {
+			detail = waitErr.Error()
+		}
+		if len(lines) == 0 {
+			return "", fmt.Errorf("grep failed: %s", detail)
+		}
+		notes = append(notes, "... (the search also reported an error: "+
+			strings.ReplaceAll(detail, "\n", "; ")+")")
 	}
 	drop, unclassified := annotateGrepHits(ses, lines, blame, kind)
 	if len(drop) > 0 {
@@ -312,16 +378,24 @@ func runGrep(ses session, args map[string]any) (string, error) {
 		}
 		lines = kept
 	}
-	var notes []string
-	if truncated > 0 {
+	if capped {
+		notes = append(notes, fmt.Sprintf("... (more than %d further matches not shown; narrow with path=, glob= or a tighter pattern)", truncated))
+	} else if truncated > 0 {
 		notes = append(notes, fmt.Sprintf("... (%d more matches not shown; narrow with path=, glob= or a tighter pattern)", truncated))
 	}
 	if testsFiltered > 0 {
-		notes = append(notes, fmt.Sprintf("... (%d hits in test files left out by tests=%s)", testsFiltered, tests))
+		where := "in test files"
+		if tests == "only" {
+			where = "outside test files"
+		}
+		notes = append(notes, fmt.Sprintf("... (%d hits %s left out by tests=%s)", testsFiltered, where, tests))
 	}
-	if unclassified > 0 {
+	if unclassified > 0 && kind != "" {
 		notes = append(notes, fmt.Sprintf("... (%d hits could not be classified and so are not shown; "+
 			"drop kind= to see them)", unclassified))
+	} else if unclassified > 0 {
+		notes = append(notes, fmt.Sprintf("... (%d hits are shown unannotated: the classifier stops after "+
+			"the first files; narrow with path= or glob= to annotate them)", unclassified))
 	}
 	if len(lines) == 0 && len(notes) == 0 {
 		return "(no matches)", nil
@@ -335,36 +409,47 @@ func runGrep(ses session, args map[string]any) (string, error) {
 // instead would cut "/tmp/agent99-headless-7wwbv/proj/x.go:2:..." down to
 // "/tmp/agent99", which is a directory name away from being a real bug in
 // any repository checked out under a hyphenated path.
-var grepHitPathRe = regexp.MustCompile(`^(.*?)[:-]\d+[:-]`)
+//
+// The groups are path, separator, line number, separator: a hit has ":" for
+// both separators, a context line "-".
+var grepHitPathRe = regexp.MustCompile(`^(.*?)([:-])(\d+)([:-])`)
+
+// editorUnreachable tells a transport failure (nothing answers on the
+// socket, or nothing answered in time) from an error the tool itself
+// returned. The first makes every further call pointless; the second is
+// about one call only.
+func editorUnreachable(err error) bool {
+	msg := err.Error()
+	return strings.HasPrefix(msg, "nvim RPC failed") || strings.HasPrefix(msg, "timed out after") ||
+		strings.HasPrefix(msg, "no Neovim to talk to")
+}
 
 // The path part of a searcher output line, relative to root, for filters that
 // work on paths. Stripping root first keeps the pattern away from whatever
 // the temporary or checkout directory happens to be called.
-func grepHitPath(line, root string) string {
+func grepHitPath(line, root string) (path string, isHit bool) {
 	rest := line
 	if root != "" && strings.HasPrefix(rest, root+"/") {
 		rest = rest[len(root)+1:]
 	}
 	if m := grepHitPathRe.FindStringSubmatch(rest); m != nil {
-		return m[1]
+		return m[1], m[2] == ":" && m[4] == ":"
 	}
-	return rest
+	return rest, false
 }
 
 // Put the search root back in front of the paths the searcher printed. It
 // ran with the root as its working directory (so that globs are
 // root-relative), which makes every hit relative; the annotator and the
 // agent both want a path they can open from anywhere.
-func absolutizeGrepPaths(lines []string, root string) {
-	for i, l := range lines {
-		if l == "" || l == "--" || strings.HasPrefix(l, "/") {
-			continue
-		}
-		// Plain concatenation, not filepath.Join: the rest of the line is
-		// matched source text, and cleaning it would rewrite any "//" or
-		// "/./" the code happens to contain.
-		lines[i] = strings.TrimSuffix(root, "/") + "/" + strings.TrimPrefix(l, "./")
+func absolutizeGrepPath(l, root string) string {
+	if l == "" || l == "--" || strings.HasPrefix(l, "/") {
+		return l
 	}
+	// Plain concatenation, not filepath.Join: the rest of the line is
+	// matched source text, and cleaning it would rewrite any "//" or
+	// "/./" the code happens to contain.
+	return strings.TrimSuffix(root, "/") + "/" + strings.TrimPrefix(l, "./")
 }
 
 var testPathRe = regexp.MustCompile(`(^|/)(tests?|spec)(/|$)|_test\.|_spec\.|\.test\.|\.spec\.`)
@@ -457,29 +542,35 @@ func annotateGrepHits(ses session, lines []string, blame bool, kindFilter string
 	byFile := map[string][]hit{}
 	var order []string
 	for i, l := range lines {
-		p1 := strings.Index(l, ":")
-		if p1 <= 0 {
+		// The path ends at the first "<sep><number><sep>" (grepHitPathRe),
+		// and only a hit has ":" on both sides of the number; a context line
+		// has "-". Splitting on the first two ":" instead would read a
+		// context line whose text holds "12:30:00" or "foo.go:12:" as a hit
+		// at a file that does not exist. The root is taken off before the
+		// match, as grepHitPath does, so a "-7-" in the checkout's own path
+		// cannot pass for a context line's separator.
+		prefix, rel := "", l
+		if ses.Root != "" && strings.HasPrefix(l, ses.Root+"/") {
+			prefix, rel = ses.Root+"/", l[len(ses.Root)+1:]
+		}
+		m := grepHitPathRe.FindStringSubmatch(rel)
+		if m == nil || m[2] != ":" || m[4] != ":" || m[1] == "" {
 			continue
 		}
-		p2 := strings.Index(l[p1+1:], ":")
-		if p2 <= 0 {
+		file := prefix + m[1]
+		lineNo, err := strconv.Atoi(m[3])
+		if err != nil || lineNo <= 0 {
 			continue
 		}
-		lineNo := 0
-		if _, err := fmt.Sscanf(l[p1+1:p1+1+p2], "%d", &lineNo); err != nil || lineNo <= 0 {
-			continue
-		}
-		rest := l[p1+1+p2+1:]
+		rest := rel[len(m[0]):]
 		// rg --column emits path:line:col:text; take the column if present.
 		col := 0
 		if p3 := strings.Index(rest, ":"); p3 > 0 {
-			if _, err := fmt.Sscanf(rest[:p3], "%d", &col); err == nil && col > 0 {
+			if n, err := strconv.Atoi(rest[:p3]); err == nil && n > 0 {
+				col = n
 				rest = rest[p3+1:]
-			} else {
-				col = 0
 			}
 		}
-		file := l[:p1]
 		if len(byFile[file]) == 0 {
 			order = append(order, file)
 		}
@@ -494,11 +585,21 @@ func annotateGrepHits(ses session, lines []string, blame bool, kindFilter string
 	if kindFilter != "" {
 		maxFiles, maxHits = 40, 400
 	}
+	// Hits the classifier never saw cannot answer a kind= filter either
+	// way; under a filter they go, and the caller is told how many.
+	leaveUnclassified := func(files []string) {
+		for _, rest := range files {
+			unclassified += len(byFile[rest])
+			if kindFilter != "" {
+				for _, h := range byFile[rest] {
+					drop[h.idx] = true
+				}
+			}
+		}
+	}
 	for fi, file := range order {
 		if fi >= maxFiles || annotated >= maxHits {
-			for _, rest := range order[fi:] {
-				unclassified += len(byFile[rest])
-			}
+			leaveUnclassified(order[fi:])
 			return drop, unclassified
 		}
 		var want, cols []any
@@ -511,11 +612,16 @@ func annotateGrepHits(ses session, lines []string, blame bool, kindFilter string
 		res, err := nvimCall(ses.Socket, "enclosing_symbols",
 			map[string]any{"file": file, "lines": want, "cols": cols})
 		if err != nil {
-			// Editor unreachable; leave the rest plain too.
-			for _, rest := range order[fi:] {
-				unclassified += len(byFile[rest])
+			if editorUnreachable(err) {
+				// Every further call would fail the same way; leave the
+				// rest plain too.
+				leaveUnclassified(order[fi:])
+				return drop, unclassified
 			}
-			return drop, unclassified
+			// This file only (gone since the search, no parser): the
+			// others still get their turn.
+			leaveUnclassified(order[fi : fi+1])
+			continue
 		}
 		var ages map[int]string
 		if blame {
@@ -765,9 +871,12 @@ func callTool(name string, args map[string]any, ses session) (string, error) {
 			args = resolved
 		}
 		switch name {
+		// Every tool that takes glob= expands it against args.root on the
+		// Lua side (replace_pattern and unreferenced_symbols included), and
+		// every edit tool needs it for its post-edit report.
 		case "ts_query", "find_symbol", "workspace_map", "workspace_symbols", "install_language",
 			"replace_symbol_body", "replace_symbol_lines", "insert_after_symbol", "insert_before_symbol", "undo_edit", "rename_symbol", "check_project",
-			"create_file", "move_file", "delete_file", "move_symbols":
+			"create_file", "move_file", "delete_file", "move_symbols", "replace_pattern", "unreferenced_symbols":
 			resolved := map[string]any{}
 			for k, v := range args {
 				resolved[k] = v

@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -47,6 +48,11 @@ type headlessWorkspace struct {
 	// lastUsed is when a call was last routed here, which is what the idle
 	// sweep in lifecycle.go measures. Guarded by headlessMu.
 	lastUsed time.Time
+	// inFlight counts the calls running here right now. A workspace with
+	// one is in use whatever lastUsed says: check_project can run for ten
+	// minutes, and the idle sweep must not close it from under that call.
+	// Guarded by headlessMu.
+	inFlight int
 }
 
 func (w *headlessWorkspace) session() session {
@@ -56,6 +62,9 @@ func (w *headlessWorkspace) session() session {
 var (
 	headlessMu sync.Mutex
 	workspaces = map[string]*headlessWorkspace{}
+	// instanceSeq numbers the instances this bridge has started, for their
+	// socket names.
+	instanceSeq atomic.Int64
 )
 
 func maxWorkspaces() int {
@@ -283,8 +292,15 @@ func openWorkspace(root string) (*headlessWorkspace, error) {
 	if err != nil {
 		return nil, err
 	}
+	// <hash of root>-<instance number>-<bridge pid>.sock. The instance
+	// number keeps the name unique across reopenings of the same root: an
+	// idle sweep unlocks before its stopWorkspace runs, and a call in that
+	// window auto-opens a new instance whose socket must not be the one the
+	// old instance is about to unlink. The pid stays last, which is where
+	// sweepStaleSockets reads it.
 	sum := sha1.Sum([]byte(abs))
-	sock := filepath.Join(dir, fmt.Sprintf("%s-%d.sock", hex.EncodeToString(sum[:6]), os.Getpid()))
+	sock := filepath.Join(dir, fmt.Sprintf("%s-%d-%d.sock",
+		hex.EncodeToString(sum[:6]), instanceSeq.Add(1), os.Getpid()))
 	os.Remove(sock)
 
 	args := []string{"--headless", "--listen", sock,
@@ -385,27 +401,46 @@ func closeAllWorkspaces() []string {
 // stopWorkspace ends one instance. The caller has already taken it out of
 // the map.
 func stopWorkspace(ws *headlessWorkspace) {
+	// The socket name is unique to this instance (see openWorkspace), so
+	// removing it can never unlink the socket of a newer instance that
+	// reopened the same root while this one was on its way out.
+	defer os.Remove(ws.Socket)
 	select {
 	case <-ws.done:
-		os.Remove(ws.Socket)
 		return
 	default:
 	}
-	// A debug session's adapter and debuggee are grandchildren of this
-	// process; end them before the instance goes, so close_workspace never
-	// leaves a program running under a debugger nobody can reach.
-	if debugEnabled() {
-		remoteExpr(ws.Socket, "luaeval('"+headlessDebugStopLua+"')")
-	}
-	// Ask nicely so buffers and LSP clients shut down, then force it.
-	remoteExpr(ws.Socket, "execute('qa!')")
-	select {
-	case <-ws.done:
-	case <-time.After(headlessStopTimeout):
+	// Ask nicely so buffers and LSP clients shut down, then force it. The
+	// asking happens off to the side: on a wedged instance each remote
+	// expression runs to its own timeout, and the kill below must still
+	// come on schedule rather than after all of them.
+	asked := make(chan struct{})
+	go func() {
+		defer close(asked)
+		// A debug session's adapter and debuggee are grandchildren of this
+		// process; end them before the instance goes, so close_workspace
+		// never leaves a program running under a debugger nobody can reach.
+		if debugEnabled() {
+			remoteExpr(ws.Socket, "luaeval('"+headlessDebugStopLua+"')")
+		}
+		remoteExpr(ws.Socket, "execute('qa!')")
+	}()
+	kill := func() {
 		ws.cmd.Process.Kill()
 		<-ws.done
 	}
-	os.Remove(ws.Socket)
+	select {
+	case <-ws.done:
+	case <-asked:
+		select {
+		case <-ws.done:
+		case <-time.After(headlessStopTimeout):
+			kill()
+		}
+	case <-time.After(remoteExprTimeout):
+		// The instance is not even answering the request to quit.
+		kill()
+	}
 }
 
 // Lua expression that ends the agent's debug session, if any; errors are
