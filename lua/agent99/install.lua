@@ -124,61 +124,64 @@ end
 -- call. Keyed by root, and persisted under Neovim's state directory: a
 -- workspace is replaced whenever a session moves to another repository,
 -- and a command remembered last week should not have to be given again.
-local check_override = {}
+local check_override
 
-local function check_store_path()
-    local dir = vim.fn.stdpath("state") .. "/agent99"
-    vim.fn.mkdir(dir, "p")
-    return dir .. "/check_commands.json"
-end
-
--- The store as it is on disk right now, keyed by root. Roots that are gone
--- (scratch checkouts, test copies) are dropped here, so the file never
--- grows without bound.
-local function read_check_store()
-    local data = {}
-    local ok, lines = pcall(vim.fn.readfile, check_store_path())
-    if not ok or #lines == 0 then return data end
-    local okd, decoded = pcall(vim.json.decode, table.concat(lines, "\n"))
-    if okd and type(decoded) == "table" then
-        for root, cmds in pairs(decoded) do
-            if type(cmds) == "table" and vim.fn.isdirectory(root) == 1 then
-                data[root] = cmds
+-- A store of commands remembered per root (check_project's check, run_tests'
+-- runner), persisted under the state directory so a later session finds
+-- them. Returns the in-memory table, filled from disk at creation, plus a
+-- save for one root.
+--
+-- The file is shared by every Neovim instance on the machine, and each
+-- holds its own copy of it from creation, so writing that copy back whole
+-- would drop whatever another instance remembered since. save re-reads
+-- the file first and replaces only this root's entry: a read-modify-write
+-- with no lock, so two saves in the same instant can still race, but the
+-- window is one write rather than a whole session. Entries other instances
+-- added are taken into memory on the way, so a later call sees them too.
+-- Roots that are gone (scratch checkouts, test copies) are dropped on
+-- read, so the file never grows without bound.
+local function command_store(name)
+    local function path()
+        local dir = vim.fn.stdpath("state") .. "/agent99"
+        vim.fn.mkdir(dir, "p")
+        return dir .. "/" .. name .. ".json"
+    end
+    local function read()
+        local data = {}
+        local ok, lines = pcall(vim.fn.readfile, path())
+        if not ok or #lines == 0 then return data end
+        local okd, decoded = pcall(vim.json.decode, table.concat(lines, "\n"))
+        if okd and type(decoded) == "table" then
+            for root, cmds in pairs(decoded) do
+                if type(cmds) == "table" and vim.fn.isdirectory(root) == 1 then
+                    data[root] = cmds
+                end
             end
         end
+        return data
     end
-    return data
-end
-
-local function load_check_overrides()
-    for root, cmds in pairs(read_check_store()) do
-        check_override[root] = cmds
-    end
-end
-
--- Persist the command remembered for one root. The file is shared by every
--- Neovim instance on the machine, and each holds its own copy of it from
--- module load, so writing that copy back whole would drop whatever another
--- instance remembered since. Re-read the file first and replace only this
--- root's entry: a read-modify-write with no lock, so two saves in the same
--- instant can still race, but the window is one write rather than a whole
--- session. Entries other instances added are taken into memory on the way,
--- so a later call here sees them too.
-local function save_check_overrides(root)
-    local data = read_check_store()
-    for other, cmds in pairs(data) do
-        if other ~= root and check_override[other] == nil then
-            check_override[other] = cmds
+    local override = read()
+    local function save(root)
+        local data = read()
+        for other, cmds in pairs(data) do
+            if other ~= root and override[other] == nil then
+                override[other] = cmds
+            end
+        end
+        data[root] = override[root]
+        local okj, text = pcall(vim.json.encode, data)
+        if okj then
+            pcall(vim.fn.writefile, { text }, path())
         end
     end
-    data[root] = check_override[root]
-    local okj, text = pcall(vim.json.encode, data)
-    if okj then
-        pcall(vim.fn.writefile, { text }, check_store_path())
-    end
+    return override, save
 end
 
-load_check_overrides()
+local check_store_save
+check_override, check_store_save = command_store("check_commands")
+local function save_check_overrides(root)
+    check_store_save(root)
+end
 local function check_project(args)
     local root = args.root
     if type(root) ~= "string" or root == "" then
@@ -901,6 +904,7 @@ local function install_language(args)
     return result
 end
 M.check_project = check_project
+M.command_store = command_store
 M.workspace_support = workspace_support
 M.install_language = install_language
 

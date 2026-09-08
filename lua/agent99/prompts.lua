@@ -43,6 +43,10 @@ local TOOL_GUIDE = {
     "Never use the symbol edit tools on the selected region itself: the",
     "selection is changed only through your <replacement> reply.",
     "code_actions/apply_code_action apply the editor's own quick fixes.",
+    "Verify with check_project (the project's static check, diffed against a",
+    "baseline) and run_tests (the test runner, failures named with their test",
+    "symbol, reruns report what started or stopped failing) rather than a",
+    "shell: both know the project's own commands and report only what changed.",
 }
 
 M.CHAT_SYSTEM = table.concat({

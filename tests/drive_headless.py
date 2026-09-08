@@ -1300,6 +1300,54 @@ def group_files(c):
         b.call("close_workspace", {"root": goroot})
 
 
+def group_tests(c):
+    """run_tests: the runner is guessed, failures come back with their test
+    symbol, and a rerun reports what changed against the baseline."""
+    b, work = c.b, c.work
+    if not shutil.which("go"):
+        return
+    goroot = os.path.join(work, "gotests")
+    os.makedirs(goroot)
+    with open(os.path.join(goroot, "go.mod"), "w") as f:
+        f.write("module scratch\n\ngo 1.22\n")
+    with open(os.path.join(goroot, "calc.go"), "w") as f:
+        f.write("package scratch\n\nfunc Add(a, b int) int { return a + b }\n\n"
+                "func Mul(a, b int) int { return a*b + 1 }\n")
+    with open(os.path.join(goroot, "calc_test.go"), "w") as f:
+        f.write("package scratch\n\nimport \"testing\"\n\n"
+                "func TestAdd(t *testing.T) {\n\tif Add(2, 2) != 4 {\n\t\tt.Fatal(\"add\")\n\t}\n}\n\n"
+                "func TestMul(t *testing.T) {\n\tif got := Mul(3, 3); got != 9 {\n"
+                "\t\tt.Fatalf(\"Mul(3,3) = %d, want 9\", got)\n\t}\n}\n")
+    b.call("open_workspace", {"root": goroot})
+    res = b.call("run_tests", {"workspace": goroot})
+    fails = res.get("failures", [])
+    check("run_tests guesses go test and parses the failure",
+          res.get("command") == "go test ./..." and res.get("guessed") is True
+          and len(fails) == 1 and fails[0].get("test") == "TestMul"
+          and fails[0].get("file") == "calc_test.go" and fails[0].get("line") == 13
+          and fails[0].get("symbol") == "TestMul" and "baseline" in res, res)
+    res = b.call("run_tests", {"workspace": goroot, "filter": "TestAdd"})
+    check("run_tests filter narrows to one test",
+          "-run 'TestAdd'" in res.get("command", "") and res.get("exit") == 0
+          and res.get("summary", "").startswith("all passing"), res)
+    # Fix the bug through the tools; the rerun reports the test as fixed.
+    b.call("replace_symbol_lines", {
+        "file": os.path.join(goroot, "calc.go"), "name_path": "Mul",
+        "match": "func Mul(a, b int) int { return a*b + 1 }",
+        "text": "func Mul(a, b int) int { return a * b }",
+    })
+    res = b.call("run_tests", {"workspace": goroot})
+    check("run_tests reports the fixed test against the baseline",
+          res.get("exit") == 0 and res.get("fixed") == ["TestMul"]
+          and res.get("new_failures") == [] and "1 fixed" in res.get("summary", ""), res)
+    res = b.call("run_tests", {"workspace": goroot, "command": "go test -count=1 ./...", "remember": True})
+    check("run_tests remembers an explicit command", "remembered" in res, res)
+    res = b.call("run_tests", {"workspace": goroot})
+    check("run_tests uses the remembered command",
+          res.get("command") == "go test -count=1 ./..." and res.get("guessed") is None, res)
+    b.call("close_workspace", {"root": goroot})
+
+
 def group_lifecycle(c):
     """The headless instance ends with the workspace and with the server."""
     b, root, work = c.b, c.root, c.work
@@ -1332,6 +1380,7 @@ GROUPS = [
     ("verdict", group_verdict),
     ("search", group_search),
     ("files", group_files),
+    ("tests", group_tests),
     ("lifecycle", group_lifecycle),
 ]
 

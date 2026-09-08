@@ -875,7 +875,7 @@ func callTool(name string, args map[string]any, ses session) (string, error) {
 		// Lua side (replace_pattern and unreferenced_symbols included), and
 		// every edit tool needs it for its post-edit report.
 		case "ts_query", "find_symbol", "workspace_map", "workspace_tree", "workspace_symbols", "install_language",
-			"replace_symbol_body", "replace_symbol_lines", "insert_after_symbol", "insert_before_symbol", "undo_edit", "rename_symbol", "check_project",
+			"replace_symbol_body", "replace_symbol_lines", "insert_after_symbol", "insert_before_symbol", "undo_edit", "rename_symbol", "check_project", "run_tests",
 			"create_file", "move_file", "delete_file", "move_symbols", "replace_pattern", "unreferenced_symbols":
 			resolved := map[string]any{}
 			for k, v := range args {

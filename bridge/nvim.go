@@ -34,6 +34,7 @@ var toolTimeouts = map[string]time.Duration{
 	"install_language": 15 * time.Minute,
 	"install_debugger": 15 * time.Minute,
 	"check_project":    10 * time.Minute,
+	"run_tests":        15 * time.Minute,
 	// Debugger tools that wait for the program: the Lua side clamps its
 	// own wait to well under this so it always answers first.
 	"debug_launch":   5 * time.Minute,

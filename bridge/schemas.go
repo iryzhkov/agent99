@@ -259,6 +259,29 @@ var lspTools = []tool{
 		},
 	},
 	{
+		Name: "run_tests",
+		Description: "Run the project's tests from the root and answer with what failed, not a page of " +
+			"output: each failure with its test name, file, line and the test symbol it sits in " +
+			"(find_symbol reads it by name_path), the runner's pass/fail counts, and after the first " +
+			"call in a root only which tests started or stopped failing since the last run. Without " +
+			"arguments it uses the command remembered for this root, AGENT99_TEST, post_edit.test, or " +
+			"a guess (a Makefile test target, go test, pytest, the package.json test script, cargo test, " +
+			"busted). path= narrows to a directory or file and filter= to a test name where the runner " +
+			"can (the guess is used for those). command= runs your own, and remember=true keeps it for " +
+			"this root across sessions.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":     map[string]any{"type": "string", "description": "Directory or test file to limit the run to (relative to the root)."},
+				"filter":   map[string]any{"type": "string", "description": "Test name (or pattern, in the runner's syntax) to run alone: go -run, pytest -k, jest -t, cargo's positional filter."},
+				"command":  map[string]any{"type": "string", "description": "Test command to run instead of the default (cwd = root)."},
+				"remember": map[string]any{"type": "boolean", "description": "Keep command= for later run_tests calls in this root, across sessions."},
+				"reset":    map[string]any{"type": "boolean", "description": "Record a fresh baseline from this run instead of comparing."},
+			},
+			"required": []string{},
+		},
+	},
+	{
 		Name: "check_project",
 		Description: "Run the project's whole-project check from the root. The first call in a " +
 			"root records a baseline; later calls report only new and resolved lines. Use " +

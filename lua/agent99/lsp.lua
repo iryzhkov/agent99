@@ -31,6 +31,7 @@ local symbol_kind, ts_outline, symbol_index = index.symbol_kind, index.ts_outlin
 local annotate_locations = index.annotate_locations
 local skim, workspace_map, document_symbols = index.skim, index.workspace_map, index.document_symbols
 local workspace_tree = index.workspace_tree
+local run_tests = require("agent99.testrun").run_tests
 local workspace_symbols, ts_query, find_symbol = index.workspace_symbols, index.ts_query, index.find_symbol
 local enclosing_symbols = index.enclosing_symbols
 
@@ -876,6 +877,7 @@ local dispatch_table = {
     skim = skim,
     workspace_map = workspace_map,
     workspace_tree = workspace_tree,
+    run_tests = run_tests,
     workspace_support = workspace_support,
     install_language = install_language,
     ts_query = ts_query,

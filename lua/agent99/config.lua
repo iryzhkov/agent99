@@ -149,6 +149,12 @@ M.defaults = {
         -- project's marker files (go.mod, Cargo.toml, tsconfig.json, ...).
         check = nil,
         check_timeout_ms = 5 * 60 * 1000,
+        -- Test runner for the run_tests tool (cwd = root), same rules as
+        -- check: a shell command, or nil to guess from the project's files
+        -- (a Makefile test target, go.mod, pytest, package.json scripts.test,
+        -- Cargo.toml, .busted). $AGENT99_TEST overrides the guess too.
+        test = nil,
+        test_timeout_ms = 10 * 60 * 1000,
     },
 
     ui = {

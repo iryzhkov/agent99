@@ -19,7 +19,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$PATH:$HOME/.local/share/nvim/mason/bin"
 
 ALL_SUITES="unit mcp headless multi debug"
-HEADLESS_GROUPS="workspace index edit verdict search files lifecycle"
+HEADLESS_GROUPS="workspace index edit verdict search files tests lifecycle"
 HEADLESS_ARGS=""
 if [ $# -eq 0 ]; then
     SUITES="$ALL_SUITES"
@@ -100,6 +100,7 @@ trap cleanup EXIT
 # mapping the ledger records.
 if want unit; then
     nvim --clean --headless -u "$REPO/tests/minimal_init.lua" -l "$REPO/tests/unit_edit.lua"
+    nvim --clean --headless -u "$REPO/tests/minimal_init.lua" -l "$REPO/tests/unit_testrun.lua"
 fi
 
 cd "$REPO/tests/testproj"
