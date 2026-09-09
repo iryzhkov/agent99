@@ -611,48 +611,48 @@ local function workspace_support(args)
             -- what says none" never learned they were covered.
             not_probed[#not_probed + 1] = ("%s (%d)"):format(ft, by_ft[ft])
         else
-        local parser = has_parser(ft)
-        local configs = enabled_lsp_configs_for(ft)
-        -- What could run this language under a debugger, so a client
-        -- learns the option exists even when the debug tools are off.
-        -- Probed before the server starts: for Java the probe also adds
-        -- the java-debug bundle to the jdtls config, which only counts
-        -- for a client that has not started yet.
-        local debugger
-        if not DATA_FILETYPES[ft] then
-            local okd, dbg = pcall(function()
-                return require("agent99.dap").debugger_for(ft, root)
-            end)
-            if okd then debugger = dbg end
-        end
-        local clients = {}
-        if #configs > 0 then
-            local okb, bufnr = pcall(load_buf, root .. "/" .. sample[ft])
-            if okb then
-                local deadline = vim.uv.now() + SUPPORT_ATTACH_MS
-                while vim.uv.now() < deadline do
-                    for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
-                        clients[#clients + 1] = c.name
+            local parser = has_parser(ft)
+            local configs = enabled_lsp_configs_for(ft)
+            -- What could run this language under a debugger, so a client
+            -- learns the option exists even when the debug tools are off.
+            -- Probed before the server starts: for Java the probe also adds
+            -- the java-debug bundle to the jdtls config, which only counts
+            -- for a client that has not started yet.
+            local debugger
+            if not DATA_FILETYPES[ft] then
+                local okd, dbg = pcall(function()
+                    return require("agent99.dap").debugger_for(ft, root)
+                end)
+                if okd then debugger = dbg end
+            end
+            local clients = {}
+            if #configs > 0 then
+                local okb, bufnr = pcall(load_buf, root .. "/" .. sample[ft])
+                if okb then
+                    local deadline = vim.uv.now() + SUPPORT_ATTACH_MS
+                    while vim.uv.now() < deadline do
+                        for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
+                            clients[#clients + 1] = c.name
+                        end
+                        if #clients > 0 then break end
+                        sleep(100)
                     end
-                    if #clients > 0 then break end
-                    sleep(100)
                 end
             end
-        end
-        local entry = {
-            filetype = ft,
-            files = by_ft[ft],
-            treesitter_parser = parser,
-            lsp = #clients > 0 and table.concat(clients, ",") or "none",
-            debugger = debugger,
-        }
-        if #clients == 0 and #configs > 0 then
-            entry.lsp = "none (configured: " .. table.concat(configs, ",") .. ", did not attach)"
-        end
-        if not parser and #clients == 0 and not DATA_FILETYPES[ft] then
-            blind[#blind + 1] = ft
-        end
-        out[#out + 1] = entry
+            local entry = {
+                filetype = ft,
+                files = by_ft[ft],
+                treesitter_parser = parser,
+                lsp = #clients > 0 and table.concat(clients, ",") or "none",
+                debugger = debugger,
+            }
+            if #clients == 0 and #configs > 0 then
+                entry.lsp = "none (configured: " .. table.concat(configs, ",") .. ", did not attach)"
+            end
+            if not parser and #clients == 0 and not DATA_FILETYPES[ft] then
+                blind[#blind + 1] = ft
+            end
+            out[#out + 1] = entry
         end
     end
     local notes = {}

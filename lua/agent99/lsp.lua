@@ -800,8 +800,11 @@ end
 -- those and nothing can delete them, so they are noise in this list.
 local function anonymous(entry)
     local name = entry.name or ""
+    -- Anchored: a server's placeholder for an anonymous function is called
+    -- `callback`, but `handle_callback` is a function somebody wrote and can
+    -- delete, and the unanchored match dropped it from the list unchecked.
     return name == "" or name:find("^<") ~= nil or name:find("%(%)") ~= nil
-        or name:find("callback") ~= nil or name:find("^line%d+$") ~= nil
+        or name:match("^callback%d*$") ~= nil or name:find("^line%d+$") ~= nil
 end
 
 local function entry_point(entry, path)

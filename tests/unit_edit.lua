@@ -185,6 +185,55 @@ check("a .qml file is not a JavaScript library",
     core.dialect_note(named_buffer("/tmp/agent99-unit/Panel.qml",
         { ".pragma library" })) == nil)
 
+-- reindented_kept_line: the guard that keeps an import pass from rewriting a
+-- file's indentation. It has to fire on the pass that re-indents the lines it
+-- kept, and stay quiet on the pass that only adds or removes imports - a file
+-- where one text sits at two depths (`}` in every Go, TypeScript and C file
+-- there is) must not read as re-indented.
+local go_before = {
+    "package main",
+    "",
+    "import (",
+    "\t\"fmt\"",
+    ")",
+    "",
+    "func a() {",
+    "\tif true {",
+    "\t\tfmt.Println(\"x\")",
+    "\t}",
+    "}",
+}
+local go_after = vim.deepcopy(go_before)
+table.insert(go_after, 5, "\t\"os\"")
+check("an import added leaves the kept lines alone",
+    edit.reindented_kept_line(go_before, go_after) == nil,
+    edit.reindented_kept_line(go_before, go_after))
+
+local ts_before = {
+    "import { a } from \"./a\";",
+    "import {",
+    "  b,",
+    "} from \"./b\";",
+    "",
+    "export function f() {",
+    "  return a;",
+    "}",
+}
+local ts_after = vim.deepcopy(ts_before)
+ts_after[3] = "    b,"
+check("a re-indented import block is caught",
+    edit.reindented_kept_line(ts_before, ts_after) == "b,",
+    edit.reindented_kept_line(ts_before, ts_after))
+
+-- The guard reads lines rather than syntax, so the fixture is lines: a text
+-- the pass removed one of cannot be paired occurrence by occurrence, and
+-- pairing it anyway would call an untouched line below it re-indented.
+local dropped_before = { "keep", "\tdrop", "}", "\t}", "\t\tdrop" }
+local dropped_after = { "keep", "}", "\t}", "\t\tdrop" }
+check("a text the pass removed a line of is left unpaired",
+    edit.reindented_kept_line(dropped_before, dropped_after) == nil,
+    edit.reindented_kept_line(dropped_before, dropped_after))
+
 if failures > 0 then
     io.stdout:write(("unit_edit: %d failed\n"):format(failures))
     vim.cmd("cquit 1")

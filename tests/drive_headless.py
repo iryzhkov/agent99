@@ -1411,6 +1411,15 @@ def group_ambiguity(c):
     except RuntimeError as e:
         check("a line that declares nothing is refused",
               "declared on line 3" in str(e) and "line 2" in str(e), e)
+    # The same key, on the tool the refusal is most often raised by: it used
+    # to read an undocumented `declared_on` and ignore the `line=` its own
+    # error message asked for.
+    res = b.call("replace_symbol_lines", {
+        "file": pair, "name_path": "push", "line": 2,
+        "first_line": 2, "last_line": 2, "text": "        return item, 3"})
+    text = open(pair).read()
+    check("line= picks the declaration for replace_symbol_lines too",
+          "return item, 3" in text and text.count("return item") == 2, (res, text))
     os.remove(pair)
 
 
@@ -1425,11 +1434,21 @@ def group_multifile(c):
         with open(path, "w") as f:
             f.write("local M = {}\n\nfunction M.run()\n    return 1\nend\n\nreturn M\n")
         made.append(path)
+    # dry_run has to reach the tool itself: the files= pre-pass probes each
+    # file with it before writing any of them, and an insert that ignored the
+    # flag wrote the text once for the probe and once for the edit.
+    res = b.call("insert_before_symbol", {
+        "files": made, "name_path": "M.run", "text": "--- Runs it.\n", "dry_run": True})
+    check("a dry run over several files writes none of them",
+          all("--- Runs it." not in open(p).read() for p in made), res)
     res = b.call("insert_before_symbol", {
         "files": made, "name_path": "M.run", "text": "--- Runs it.\n"})
     check("insert_before_symbol edits every file it is given",
           res.get("files") == 2 and len(res.get("reports", [])) == 2
           and all("--- Runs it." in open(p).read() for p in made), res)
+    check("it inserts the text once, not once per pass",
+          all(open(p).read().count("--- Runs it.") == 1 for p in made),
+          [open(p).read() for p in made])
     res = b.call("replace_symbol_body", {
         "files": made, "name_path": "M.run",
         "body": "function M.run()\n    return 2\nend"})
@@ -1515,6 +1534,11 @@ def group_polish(c):
     b, root = c.b, c.root
 
     reset(c)
+    # The function holds a nested block on purpose, so the file has a `}` at
+    # two depths: the guard that keeps the import pass from re-indenting the
+    # lines it kept read that as a re-indentation and reverted every import
+    # pass in every Go, TypeScript and Lua file there is. A flat fixture
+    # cannot see it.
     goimp = os.path.join(root, "importer.go")
     with open(goimp, "w") as f:
         f.write("package sample\n"
@@ -1524,14 +1548,24 @@ def group_polish(c):
                 ")\n"
                 "\n"
                 "func use() string {\n"
-                "\treturn strings.ToUpper(\"x\")\n"
+                "\tif true {\n"
+                "\t\treturn strings.ToUpper(\"x\")\n"
+                "\t}\n"
+                "\treturn \"\"\n"
                 "}\n")
     before_imp = open(goimp).read()
     res = b.call("replace_symbol_body", {
         "file": goimp, "name_path": "use",
-        "body": "func use() string {\n\treturn fmt.Sprintf(\"%s\", strings.ToUpper(\"x\"))\n}"})
-    if "organized imports" not in (res.get("polished") or ""):
-        print("SKIP import-polish undo check: no import organizer ran")
+        "body": "func use() string {\n\tif true {\n"
+                "\t\treturn fmt.Sprintf(\"%s\", strings.ToUpper(\"x\"))\n"
+                "\t}\n\treturn \"\"\n}"})
+    if res.get("imports_note"):
+        # A refusal here is the bug, not a reason to skip: the pass ran and
+        # was taken back.
+        check("the import polish is not refused over a re-indentation it did not do",
+              False, res.get("imports_note"))
+    elif "organized imports" not in (res.get("polished") or ""):
+        print("SKIP import-polish undo check: no import organizer ran (gopls missing?)")
     else:
         check("the import polish added the import it needed",
               "fmt" in open(goimp).read(), res)

@@ -408,7 +408,11 @@ func runGrep(ses session, args map[string]any) (string, error) {
 	// files as if they held a NUL byte and the search had been incomplete.
 	if len(lines) == 0 && len(stoppedEarly) == 0 && testsFiltered == 0 && truncated == 0 &&
 		!asText && usedRg {
-		stoppedEarly = append(stoppedEarly, textOnlyMatches(pattern, glob, searchDir, searchTarget)...)
+		// The targets the first pass was given, not the path it scoped
+		// itself to: a files=-scoped search that found nothing named the
+		// whole tree's binary-looking files as though the caller had asked
+		// about them.
+		stoppedEarly = append(stoppedEarly, textOnlyMatches(pattern, glob, searchDir, searchTargets)...)
 	}
 	waitErr := cmd.Wait()
 	if capped {
@@ -509,12 +513,13 @@ func rel(root, path string) string {
 // a NUL byte, which the searcher skips or stops at. Run only for a search
 // that came back empty, where the alternative is answering "(no matches)"
 // about a file full of them.
-func textOnlyMatches(pattern, glob, dir, target string) []string {
+func textOnlyMatches(pattern, glob, dir string, targets []string) []string {
 	args := []string{"--text", "--files-with-matches", "-m", "1", "-S"}
 	if glob != "" {
 		args = append(args, "-g", glob)
 	}
-	args = append(args, "-e", pattern, target)
+	args = append(args, "-e", pattern)
+	args = append(args, targets...)
 	cmd := exec.Command("rg", args...)
 	cmd.Dir = dir
 	out, err := cmd.Output()

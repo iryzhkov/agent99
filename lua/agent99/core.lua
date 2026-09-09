@@ -214,8 +214,13 @@ function M.save_all()
                     -- Changed underneath us: reload rather than discard, so
                     -- the next read sees what is actually there.
                     pcall(vim.api.nvim_buf_call, b, function() vim.cmd("silent edit!") end)
-                else
-                    pcall(vim.api.nvim_buf_delete, b, { force = true })
+                elseif pcall(vim.api.nvim_buf_delete, b, { force = true }) then
+                    -- Say so: the text is gone from the editor as well as
+                    -- from the disk, and every undo_edit entry that names
+                    -- this buffer now answers "its buffer is gone".
+                    failures[#failures] = why .. " - the unsaved text was dropped with the "
+                        .. "buffer, so it is in neither the editor nor the file, and undo_edit "
+                        .. "cannot reach the edits recorded against it"
                 end
             end
         end

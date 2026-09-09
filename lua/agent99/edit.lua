@@ -185,11 +185,52 @@ local function ledger_absorb(bufnr, before_lines, after_lines)
     end
 end
 
--- Run the server's source.organizeImports action on the buffer. Returns
--- true when an action was applied.
 -- Defined below, next to the format pass that shares them.
 local indent_profile
 
+-- The line an import pass kept and re-indented, or nil when it re-indented
+-- nothing. Organizing imports adds, removes and reorders lines; it has no
+-- business changing the indentation of the ones it keeps, and tsserver
+-- rewrote a 2-space import block to 4 on every edit of every file, which no
+-- format setting switches off because this pass is not the format pass.
+--
+-- Lines are paired by their own text, occurrence by occurrence: the k-th
+-- line reading `}` before the pass is the k-th one after it, so long as the
+-- pass neither added nor removed a line of that text. A text whose count
+-- changed cannot be paired and is left alone, which is the churn the pass is
+-- entitled to. Judging each line against the first occurrence of its text
+-- instead read a file with `}` at two depths - every Go, TypeScript and Lua
+-- file there is - as a re-indentation, and reverted an import pass that had
+-- changed nothing but the imports.
+local function reindented_kept_line(before_lines, after_lines)
+    local function indents_by_text(lines)
+        local by_text = {}
+        for _, l in ipairs(lines) do
+            local text = vim.trim(l)
+            if text ~= "" then
+                local seen = by_text[text] or {}
+                seen[#seen + 1] = l:match("^[ \t]*")
+                by_text[text] = seen
+            end
+        end
+        return by_text
+    end
+    local was, now = indents_by_text(before_lines), indents_by_text(after_lines)
+    for text, indents in pairs(was) do
+        local after_indents = now[text]
+        if after_indents and #after_indents == #indents then
+            for k, indent in ipairs(indents) do
+                if after_indents[k] ~= indent then
+                    return text
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Run the server's source.organizeImports action on the buffer. Returns
+-- true when an action was applied.
 local function organize_imports(bufnr)
     local client = client_for(bufnr, "textDocument/codeAction")
     if not client then return false end
@@ -236,42 +277,10 @@ local function organize_imports(bufnr)
     if applied then
         -- The same guard the format pass has: a server that re-indents to a
         -- width the file does not use turns every edit into a whole-file
-        -- diff. tsserver rewrote a 2-space import block to 4 spaces on every
-        -- edit of every file, which no `format` setting could switch off
-        -- because this pass is not the format pass.
+        -- diff, and undo_edit runs this pass again after restoring, so even
+        -- a correct undo put the rewrite back.
         local after_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-        -- Judged over what the pass actually changed, as the format pass is:
-        -- handing it the whole file compares the file with itself.
-        local first_diff, last_diff
-        for i = 1, math.max(#before_lines, #after_lines) do
-            if before_lines[i] ~= after_lines[i] then
-                first_diff = first_diff or i
-                last_diff = i
-            end
-        end
-        -- Organizing imports adds, removes and reorders lines; it has no
-        -- business re-indenting the ones it keeps. tsserver rewrites a
-        -- 2-space import block to 4 on every edit of the file, which no
-        -- format setting switches off because this pass is not the format
-        -- pass - and undo_edit runs it again afterwards, so even a correct
-        -- undo put the rewrite back. A line whose text is unchanged and
-        -- whose indentation is not is the signature of that.
-        local indent_of = {}
-        for _, l in ipairs(before_lines) do
-            local text = vim.trim(l)
-            if text ~= "" and indent_of[text] == nil then
-                indent_of[text] = l:match("^[ \t]*")
-            end
-        end
-        local reindented
-        for _, l in ipairs(after_lines) do
-            local text = vim.trim(l)
-            local was = text ~= "" and indent_of[text] or nil
-            if was and was ~= l:match("^[ \t]*") then
-                reindented = text
-                break
-            end
-        end
+        local reindented = reindented_kept_line(before_lines, after_lines)
         if reindented then
             vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, before_lines)
             return false, ("the imports were left as they were: organizing them re-indented "
@@ -1902,7 +1911,10 @@ local function edit_chunks(args)
     -- only hint that the key was dropped.
     local KNOWN = {
         first_line = true, last_line = true, text = true, expect = true,
-        match = true, absolute = true, name_path = true, declared_on = true,
+        match = true, absolute = true, name_path = true, line = true,
+        -- The name this key had before it was `line` everywhere, still taken
+        -- so a caller that learned it does not have to unlearn it.
+        declared_on = true,
     }
     local out = {}
     for i, c in ipairs(chunks) do
@@ -1913,7 +1925,7 @@ local function edit_chunks(args)
                         .. "(the call's file=). Several files take one call each.", i)
                 end
                 err("chunk %d: unknown key %q; a chunk takes first_line, last_line, match, "
-                    .. "text, expect, absolute and name_path", i, tostring(k))
+                    .. "text, expect, absolute, name_path and line", i, tostring(k))
             end
         end
         local first, last = tonumber(c.first_line), tonumber(c.last_line)
@@ -2051,7 +2063,7 @@ local function replace_symbol_lines(args)
                 b, entry = resolve_symbol(args.file, c.name_path, function(buf, tied)
                     picked = pick_tied_symbol(buf, tied, c)
                     return picked
-                end, tonumber(c.declared_on or args.declared_on))
+                end, tonumber(c.line or c.declared_on or args.line or args.declared_on))
                 bufnr = bufnr or b
                 if not picked then
                     entries[c.name_path] = entry
@@ -2507,6 +2519,16 @@ local function insert_symbol_tool(where)
         end
         local conflict = primary_region_conflict(bufnr, row + 1, row + 1)
         if conflict then err(conflict) end
+        -- Checked before it is written, like every other edit tool: files=
+        -- probes each file with dry_run before it writes any of them, and a
+        -- tool that ignores the flag inserted the text once for the probe
+        -- and once for the edit, in every file it was given.
+        if args.dry_run then
+            return vim.tbl_extend("force",
+                { file = rel_path(vim.api.nvim_buf_get_name(bufnr)) },
+                preview_diff({}, lines, ("%s %s"):format(where, entry.path),
+                    ("+%d,%d"):format(row + 1, #lines)))
+        end
         settle_before_edit(bufnr)
         local before = diag_snapshot()
         vim.api.nvim_buf_set_lines(bufnr, row, row, false, lines)
@@ -3837,6 +3859,9 @@ local function move_symbols(args)
 end
 M.post_edit_options = post_edit_options
 M.organize_imports = organize_imports
+-- Exported for tests/unit_edit.lua: the guard that keeps an import pass from
+-- re-indenting the lines it kept.
+M.reindented_kept_line = reindented_kept_line
 M.polish_after_edit = polish_after_edit
 M.diag_snapshot = diag_snapshot
 M.settle_before_edit = settle_before_edit

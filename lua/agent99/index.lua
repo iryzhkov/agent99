@@ -1696,6 +1696,15 @@ end
 -- Defined below, next to the merge that also uses it.
 local statement_end
 
+-- The symbol kinds a language server reports by the range of the name alone,
+-- so that a value spanning several lines arrives one line long: pyright
+-- answers that way for every module-level constant. A function or a class
+-- that comes back one line long really is one line, and must not be widened.
+local WIDEN_TO_STATEMENT = {
+    Variable = true, Constant = true, Field = true, Property = true,
+    Object = true, Array = true, EnumMember = true,
+}
+
 local function lsp_index(bufnr)
     local okc, client = pcall(get_client, bufnr, "textDocument/documentSymbol", 2000)
     if not okc then
@@ -1723,7 +1732,14 @@ local function lsp_index(bufnr)
                 -- function - a module of constants, the case this is for -
                 -- has no treesitter entries at all and takes the server's
                 -- list unmerged.
-                if first == last then
+                --
+                -- Only for the kinds a server reports by the range of their
+                -- name: a value whose text spans lines. Widening whatever
+                -- else comes back one line long would take a symbol out to
+                -- the statement around it - a loop variable to its whole
+                -- loop - and an edit addressed to the symbol would then
+                -- write over that statement.
+                if first == last and WIDEN_TO_STATEMENT[kind] then
                     last = statement_end(bufnr, first)
                 end
                 entries[#entries + 1] = {
@@ -1812,7 +1828,6 @@ local function merge_lsp_only_symbols(entries, bufnr)
     end
     for _, e in ipairs(from_lsp) do
         if not covered[key(e)] and not declared[same_decl(e)] then
-
             entries[#entries + 1] = e
             covered[key(e)] = true
             declared[same_decl(e)] = true
