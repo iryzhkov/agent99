@@ -111,15 +111,31 @@ def main():
         except RuntimeError as e:
             check("unknown workspace= is refused", "no open workspace at" in str(e), e)
 
-        # The last call went to beta, so a relative path resolves there.
-        # (Replies carry paths relative to their own root, so the workspace
-        # line above the result is what says where the call landed.)
-        reply = b.rpc("tools/call", {"name": "find_symbol", "arguments": {
-            "file": "lua/testproj/util.lua", "name": "M.greet"}})
-        text = reply["result"]["content"][0]["text"]
-        check("relative path follows the active workspace",
-              text.startswith("workspace: " + beta + "\n") and '"count": 1' in text,
-              text[:200])
+        # A relative path means "in the workspace this call is routed to",
+        # which answers nothing while several are open - and replies print
+        # relative paths, so feeding one back used to land in another
+        # workspace and report the file missing there. Refused now.
+        try:
+            b.call("find_symbol", {"file": "lua/testproj/util.lua", "name": "M.greet"})
+            check("a relative path with several workspaces open is refused",
+                  False, "call succeeded")
+        except RuntimeError as e:
+            check("a relative path with several workspaces open is refused",
+                  "no absolute path and no workspace=" in str(e)
+                  and alpha in str(e) and beta in str(e), e)
+        # With workspace= it is unambiguous again.
+        res = b.call("find_symbol", {"file": "lua/testproj/util.lua", "name": "M.greet",
+                                     "workspace": beta})
+        check("a relative path with workspace= resolves", res.get("count") == 1, res)
+        # A call with no path at all is refused for the same reason: a grep
+        # answered "(no matches)" from another agent's checkout.
+        try:
+            b.call("check_project", {})
+            check("a path-less call with several workspaces open is refused",
+                  False, "call succeeded")
+        except RuntimeError as e:
+            check("a path-less call with several workspaces open is refused",
+                  "nothing to route it by" in str(e), e)
 
         # One call works in one workspace: a move across them is refused
         # rather than half-done.
@@ -142,8 +158,11 @@ def main():
             "match": '    return "hello, " .. name', "text": '    return "hi, " .. name'})
         check("edit lands in alpha", 'return "hi, "' in open(util_of(alpha)).read(), res)
         b.call("find_symbol", {"file": util_of(beta), "name": "M.greet"})
-        res = b.call("undo_edit", {})
-        check("undo follows the edited workspace, not the last read",
+        # workspace= is required now: the sticky "last edited" pointer lives
+        # in the server, which several agents share, so it can point at
+        # somebody else's repository.
+        res = b.call("undo_edit", {"workspace": alpha})
+        check("undo follows the workspace it is given, not the last read",
               len(res.get("undone", [])) == 1
               and 'return "hello, " .. name' in open(util_of(alpha)).read()
               and 'return "hi, "' not in open(util_of(beta)).read(), res)

@@ -931,6 +931,41 @@ local dispatch_table = {
     verdict_carry = function() return {} end,
 }
 
+-- Every tool that writes, wrapped once here rather than guarded in each of
+-- them: a path outside the workspace the call was routed to is refused
+-- before anything is opened. Reading outside stays allowed; see
+-- core.assert_writable for why.
+local WRITE_TOOLS = {
+    replace_symbol_body = true, replace_symbol_lines = true,
+    insert_after_symbol = true, insert_before_symbol = true, insert_lines = true,
+    create_file = true, move_file = true, delete_file = true,
+    move_symbols = true, replace_pattern = true,
+}
+
+for name in pairs(WRITE_TOOLS) do
+    local fn = dispatch_table[name]
+    if fn then
+        dispatch_table[name] = function(args)
+            args = args or {}
+            local paths = {}
+            for _, key in ipairs({ "file", "from", "to" }) do
+                if type(args[key]) == "string" and args[key] ~= "" then
+                    paths[#paths + 1] = args[key]
+                end
+            end
+            for _, f in ipairs(args.files or {}) do
+                if type(f) == "string" and f ~= "" then
+                    paths[#paths + 1] = f
+                end
+            end
+            for _, p in ipairs(paths) do
+                core.assert_writable(p, args.root, name)
+            end
+            return fn(args)
+        end
+    end
+end
+
 -- Turn absolute "file" fields (and changed_files lists) into paths relative
 -- to the working directory before the result leaves the editor.
 local function relativize(value, key)

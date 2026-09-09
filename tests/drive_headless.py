@@ -977,6 +977,26 @@ def group_edit(c):
         check("insert_lines refuses a line past the end", False, "call succeeded")
     except RuntimeError as e:
         check("insert_lines refuses a line past the end", "outside the file" in str(e), e)
+    # A write outside the workspace is refused before anything is opened.
+    # Reaching /etc/hosts through a project's workspace applied the text to a
+    # buffer, and only file permissions kept it off the disk.
+    outside = os.path.join(work, "outside.txt")
+    with open(outside, "w") as f:
+        f.write("untouched\n")
+    for tool, args in (("insert_lines", {"file": outside, "at": "end", "text": "x"}),
+                       ("create_file", {"file": os.path.join(work, "new.txt"), "text": "x"}),
+                       ("delete_file", {"file": outside}),
+                       ("replace_pattern", {"files": [outside], "pattern": "untouched",
+                                            "replacement": "touched", "literal": True})):
+        try:
+            b.call(tool, args)
+            check("%s refuses a path outside the workspace" % tool, False, "call succeeded")
+        except RuntimeError as e:
+            check("%s refuses a path outside the workspace" % tool,
+                  "outside the workspace" in str(e), e)
+    with open(outside) as f:
+        check("the file outside the workspace is untouched", f.read() == "untouched\n", None)
+    os.remove(outside)
     b.call("undo_edit", {"all": True})
 
     # insert_before lands above the doc comment, not between it and the

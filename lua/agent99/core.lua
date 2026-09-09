@@ -204,6 +204,19 @@ function M.save_all()
             local ok, why = write_buf(b)
             if not ok then
                 failures[#failures + 1] = why
+                -- A buffer that cannot be written stays modified, and every
+                -- later call reports the same failure again - one unwritable
+                -- file made a whole session read as broken, with no tool to
+                -- clear it. Report it once, then drop the buffer: the edit is
+                -- lost either way, and holding it helps nobody. A file the
+                -- editor itself owns is never dropped.
+                if disk_moved_on(b, vim.api.nvim_buf_get_name(b)) then
+                    -- Changed underneath us: reload rather than discard, so
+                    -- the next read sees what is actually there.
+                    pcall(vim.api.nvim_buf_call, b, function() vim.cmd("silent edit!") end)
+                else
+                    pcall(vim.api.nvim_buf_delete, b, { force = true })
+                end
             end
         end
     end
@@ -480,6 +493,42 @@ local function load_buf(file)
         sync_buf(bufnr, path)
     end
     return bufnr, path
+end
+
+-- Refuse to write outside the workspace the call was routed to. Reading a
+-- file elsewhere is ordinary - a dependency under ~/go/pkg/mod, a header in
+-- /usr/include - and stays allowed; writing one is not, and nothing checked
+-- it: `insert_lines(file="/etc/hosts", workspace=<a project>)` applied the
+-- text to a buffer, and only Unix permissions kept it off the disk. On a
+-- server shared by several agents the same hole reaches another agent's
+-- checkout.
+local function assert_writable(path, root, what)
+    if type(root) ~= "string" or root == "" then
+        return
+    end
+    local target = vim.fn.fnamemodify(path, ":p")
+    local real_root = vim.uv.fs_realpath(root) or root
+    -- The file may not exist yet (create_file, a move destination); resolve
+    -- the closest ancestor that does, the way the router does.
+    local probe, rest = target, ""
+    while true do
+        local resolved = vim.uv.fs_realpath(probe)
+        if resolved then
+            target = rest == "" and resolved or (resolved .. "/" .. rest)
+            break
+        end
+        local parent = vim.fn.fnamemodify(probe, ":h")
+        if parent == probe then break end
+        rest = rest == "" and vim.fn.fnamemodify(probe, ":t")
+            or (vim.fn.fnamemodify(probe, ":t") .. "/" .. rest)
+        probe = parent
+    end
+    if target == real_root or target:sub(1, #real_root + 1) == real_root .. "/" then
+        return
+    end
+    err("%s is outside the workspace %s, and %s writes only inside it. Open a workspace at "
+        .. "that root to edit there (one call works in one workspace).",
+        target, real_root, what or "this tool")
 end
 
 -- A .js file in a QML project is not the JavaScript a TypeScript server
@@ -822,5 +871,6 @@ M.expand_glob = expand_glob
 M.has_parser = has_parser
 M.client_for = client_for
 M.dialect_note = dialect_note
+M.assert_writable = assert_writable
 
 return M

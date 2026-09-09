@@ -9,6 +9,7 @@ local M = {}
 local core = require("agent99.core")
 local index = require("agent99.index")
 local err, await, sleep, load_buf, rel_path = core.err, core.await, core.sleep, core.load_buf, core.rel_path
+local assert_writable = core.assert_writable
 local get_client, request, client_for, write_buf = core.get_client, core.request, core.client_for, core.write_buf
 local make_position, resync_open_buffers, save_all = core.make_position, core.resync_open_buffers, core.save_all
 local notify_watched_files, dialect_note = core.notify_watched_files, core.dialect_note

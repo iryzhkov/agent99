@@ -235,6 +235,32 @@ func resolveSession(name string, args map[string]any) (session, error) {
 			return ws.session(), nil
 		}
 	}
+	// With several open, guessing is worse than refusing. The sticky
+	// pointers live in this process, and one server is shared by every agent
+	// talking to it, so "where the last call of this kind went" can be
+	// another agent's repository: a grep with no path answered "(no matches)"
+	// from someone else's checkout, and a pattern replace with a relative
+	// glob would have rewritten it. The one exception is a code action,
+	// which is tied to the workspace that issued its token.
+	if name == "apply_code_action" {
+		if ws := workspaceAt(stickyRoot(stickyAction)); ws != nil {
+			return ws.session(), nil
+		}
+	}
+	// An absolute path in no workspace at all - a dependency under
+	// ~/go/pkg/mod, a system header - is a read of something outside the
+	// project, and it goes to the active instance as it always has (writing
+	// there is refused on the Lua side). What is refused is a call with
+	// nothing absolute to go on: no path, or only relative ones, which mean
+	// "in the workspace this call is routed to" and so answer nothing.
+	if len(roots) > 1 && len(argPaths(args)) == 0 {
+		return session{}, fmt.Errorf("%s named no absolute path and no workspace=, and %d "+
+			"workspaces are open (%s), so there is nothing to route it by - a relative path "+
+			"means \"in whichever workspace this lands in\". Pass workspace=<root>, or an "+
+			"absolute path. The server will not guess with several open, because the guess "+
+			"can be another agent's repository",
+			name, len(roots), strings.Join(roots, ", "))
+	}
 	for _, root := range []string{stickyRoot(stickyFor(name)), stickyRoot(stickyActive), roots[0]} {
 		if ws := workspaceAt(root); ws != nil {
 			return ws.session(), nil
