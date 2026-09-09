@@ -235,6 +235,179 @@ local function notify_changed_files(paths)
     notify_watched_files(changes)
 end
 
+-- ---------------------------------------------------------------------------
+-- Files that appeared or vanished behind the servers' backs.
+--
+-- Neovim registers no file watcher for the servers on Linux (the capability
+-- is off by default there), so a file that another tool writes into the tree
+-- reaches a server only when a buffer for it is opened. A Go file written
+-- with a plain Write tool defines a name that gopls goes on calling undefined
+-- in every other file of the package, while the build passes; the error is
+-- then "pre-existing" on every later edit, and the caller learns to distrust
+-- the diagnostics. This is the watcher the servers do not have: a listing of
+-- every project directory, refreshed by directory mtime (which moves when an
+-- entry is added or removed), and a didChangeWatchedFiles created/deleted
+-- notification for the difference.
+local TREE_SKIP_DIRS = { [".git"] = true, [".hg"] = true, [".svn"] = true, node_modules = true }
+-- Notifications per resync past which the scan stops: a build that dropped
+-- a thousand files into the tree is not something to relay file by file.
+local TREE_MAX_CHANGES = 500
+
+-- root -> { [dir] = { mtime = "sec.nsec", files = { name = true } } }
+local tree_seen = {}
+-- Wall-clock second this module loaded, which is before any server started:
+-- a file younger than that at baseline time is one the servers may have
+-- missed, and telling them again about one they knew costs nothing.
+local session_started = os.time()
+
+local function dir_mtime(dir)
+    local st = vim.uv.fs_stat(dir)
+    if not st or st.type ~= "directory" then return nil end
+    return ("%d.%d"):format(st.mtime.sec, st.mtime.nsec)
+end
+
+-- Plain entries of `dir`: file names as a set, subdirectory paths as a list.
+-- Hidden entries and the directories nobody wants a server to load are left
+-- out; symlinks count as files, which is what a server would see too.
+local function list_dir(dir)
+    local files, subdirs = {}, {}
+    local handle = vim.uv.fs_scandir(dir)
+    if not handle then return files, subdirs end
+    while true do
+        local name, kind = vim.uv.fs_scandir_next(handle)
+        if not name then break end
+        if name:sub(1, 1) ~= "." then
+            if kind == "directory" then
+                if not TREE_SKIP_DIRS[name] then
+                    subdirs[#subdirs + 1] = dir .. "/" .. name
+                end
+            else
+                files[name] = true
+            end
+        end
+    end
+    return files, subdirs
+end
+
+-- Is `dir` (absolute, under `root`) one git ignores? A new directory is rare
+-- enough that a subprocess per one is fine, and it keeps a build output
+-- directory from being listed and relayed file by file.
+local function git_ignored(root, dir)
+    vim.fn.system({ "git", "-C", root, "check-ignore", "-q", dir })
+    return vim.v.shell_error == 0
+end
+
+-- First sight of the tree: the project's files (git-aware where there is a
+-- git) grouped by directory, with each directory's mtime. Files younger than
+-- this session are relayed as created, since a server that started before
+-- them has no other way to hear of them.
+local function tree_baseline(root)
+    local seen = {}
+    for _, rel in ipairs(project_files(root)) do
+        -- The globpath fallback of project_files knows no ignore rules and
+        -- would hand over node_modules; keep the tree to what a server loads.
+        local skipped = false
+        for name in pairs(TREE_SKIP_DIRS) do
+            if rel:find("^" .. name .. "/") or rel:find("/" .. name .. "/") then
+                skipped = true
+                break
+            end
+        end
+        if not skipped then
+            local abs = root .. "/" .. rel
+            local dir = vim.fs.dirname(abs)
+            local entry = seen[dir]
+            if not entry then
+                entry = { mtime = dir_mtime(dir), files = {} }
+                seen[dir] = entry
+            end
+            entry.files[vim.fs.basename(abs)] = true
+        end
+    end
+    if not seen[root] then
+        seen[root] = { mtime = dir_mtime(root), files = {} }
+    end
+    local young = {}
+    for dir, entry in pairs(seen) do
+        -- A directory whose mtime predates the session gained nothing since.
+        local st = vim.uv.fs_stat(dir)
+        if st and st.mtime.sec >= session_started then
+            for name in pairs(entry.files) do
+                local fst = vim.uv.fs_stat(dir .. "/" .. name)
+                if fst and fst.mtime.sec >= session_started then
+                    young[#young + 1] = dir .. "/" .. name
+                end
+            end
+        end
+    end
+    return seen, young
+end
+
+-- Files with a loaded buffer reached their server through didOpen already
+-- (that is how create_file and move_file introduce theirs), so the scan has
+-- nothing to add about them.
+local function has_loaded_buffer(path)
+    local bufnr = vim.fn.bufnr(path)
+    return bufnr > 0 and vim.api.nvim_buf_is_loaded(bufnr)
+end
+
+-- Compare every known directory with the disk and relay the difference to
+-- the servers. Returns the paths relayed (created and deleted alike), so a
+-- caller can give the servers a moment to react.
+local function resync_tree(root)
+    local seen = tree_seen[root]
+    local changes, relayed = {}, {}
+    local function relay(path, kind)
+        if #relayed >= TREE_MAX_CHANGES then return end
+        changes[#changes + 1] = { uri = vim.uri_from_fname(path), type = kind }
+        relayed[#relayed + 1] = path
+    end
+    if not seen then
+        local young
+        seen, young = tree_baseline(root)
+        tree_seen[root] = seen
+        for _, path in ipairs(young) do
+            if not has_loaded_buffer(path) then relay(path, 1) end
+        end
+        notify_watched_files(changes)
+        return relayed
+    end
+    local dirs = vim.tbl_keys(seen)
+    local i = 0
+    while i < #dirs and #relayed < TREE_MAX_CHANGES do
+        i = i + 1
+        local dir = dirs[i]
+        local entry = seen[dir]
+        local mtime = dir_mtime(dir)
+        if not mtime then
+            -- The directory is gone, and every file it held with it.
+            for name in pairs(entry.files) do relay(dir .. "/" .. name, 3) end
+            seen[dir] = nil
+        elseif mtime ~= entry.mtime then
+            local files, subdirs = list_dir(dir)
+            for name in pairs(files) do
+                if not entry.files[name] and not has_loaded_buffer(dir .. "/" .. name) then
+                    relay(dir .. "/" .. name, 1)
+                end
+            end
+            for name in pairs(entry.files) do
+                if not files[name] then relay(dir .. "/" .. name, 3) end
+            end
+            entry.files, entry.mtime = files, mtime
+            -- A directory that is new to the listing is walked in full,
+            -- unless git ignores it (a build output directory, typically).
+            for _, sub in ipairs(subdirs) do
+                if not seen[sub] and not git_ignored(root, sub) then
+                    seen[sub] = { mtime = "", files = {} }
+                    dirs[#dirs + 1] = sub
+                end
+            end
+        end
+    end
+    notify_watched_files(changes)
+    return relayed
+end
+
 -- Bring every buffer back in line with disk and tell the servers what moved.
 --
 -- Run before an edit is judged, because the judgement is about more than the
@@ -257,6 +430,11 @@ local function resync_open_buffers()
         end
     end
     notify_changed_files(changed)
+    -- Files that appeared or vanished are the other half of the same
+    -- picture, and the servers have no watcher of their own to see them.
+    for _, path in ipairs(resync_tree(vim.fn.getcwd())) do
+        changed[#changed + 1] = path
+    end
     return changed
 end
 

@@ -398,6 +398,9 @@ local function run_tests(args)
     local lines = text ~= "" and vim.split(text, "\n", { plain = true }) or {}
     local timed_out = result.code == 124 and result.signal == 15
 
+    -- A test run is one more way files appear (generated code, fixtures);
+    -- the servers hear of them here rather than at the next edit.
+    core.resync_open_buffers()
     local failures, broken = parse_failures(runner, lines)
     annotate(root, failures)
     local passed, failed = parse_counts(lines)

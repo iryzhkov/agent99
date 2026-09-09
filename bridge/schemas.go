@@ -224,7 +224,7 @@ var lspTools = []tool{
 				},
 				"chunks": map[string]any{
 					"type":        "array",
-					"description": "Several non-overlapping replacements in the same file, instead of the single-edit fields. Each chunk may name its own symbol (name_path) and addresses its lines by match, or by first_line/last_line (relative to that symbol as it is now, or absolute). Offsets and expect texts are checked together and the call is refused as a whole if any fails; what the new text means is checked afterwards by the language server, like any edit.",
+					"description": "Several non-overlapping replacements in the same file, instead of the single-edit fields. Each chunk may name its own symbol (name_path) and addresses its lines by match, or by first_line/last_line (relative to that symbol as it is now, or absolute). The call's name_path is the default for every chunk that names none, so a chunk for a region outside it (a const block, an import) needs its own name_path, or none with absolute=true; a match found once outside the scoping symbol is applied there and reported under relocated. Offsets and expect texts are checked together and the call is refused as a whole if any fails; what the new text means is checked afterwards by the language server, like any edit.",
 					"items": map[string]any{
 						"type": "object",
 						"properties": map[string]any{

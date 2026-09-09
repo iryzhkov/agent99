@@ -289,6 +289,23 @@ local function check_project(args)
             exit, failed = result.code, one
         end
     end
+    -- The check may have generated files, and the servers have no watcher
+    -- to see them; the resync is what turns a stale "undefined" into a
+    -- clean bill. Then, a clean check next to a server still holding errors
+    -- is worth one line: the caller is about to be told to trust one of
+    -- them and should know which.
+    if #core.resync_open_buffers() > 0 then sleep(300) end
+    local server_errors = {}
+    if exit == 0 and not timed_out then
+        for _, d in ipairs(vim.diagnostic.get(nil)) do
+            local name = vim.api.nvim_buf_get_name(d.bufnr)
+            if d.severity == vim.diagnostic.severity.ERROR
+                and name:sub(1, #root + 1) == root .. "/" then
+                server_errors[#server_errors + 1] = ("%s:%d: %s"):format(
+                    rel_path(name), d.lnum + 1, vim.split(d.message, "\n", { plain = true })[1])
+            end
+        end
+    end
     local out = {
         command = #cmds == 1 and cmd or nil,
         commands = #cmds > 1 and cmds or nil,
@@ -316,6 +333,20 @@ local function check_project(args)
             .. "configuration), and remember=true makes it the default for this root "
             .. "for the rest of the session."
         out.about_this_command = guess_note
+    end
+    if #server_errors > 0 then
+        local shown = vim.list_slice(server_errors, 1, 5)
+        if #server_errors > 5 then
+            shown[#shown + 1] = ("… +%d more"):format(#server_errors - 5)
+        end
+        out.server_disagrees = {
+            note = ("the check passed, but the language server still reports %d error%s "
+                .. "in this root. The check is the ground truth for what it covers; the "
+                .. "server may be behind (its view of the tree was just refreshed) or "
+                .. "looking at another build configuration."):format(
+                #server_errors, #server_errors == 1 and "" or "s"),
+            errors = shown,
+        }
     end
     local key = root .. "\0" .. cmd
     local base = check_baseline[key]

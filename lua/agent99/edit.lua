@@ -895,9 +895,18 @@ end
 -- After a report on bufnr went out, remember what it showed so anything
 -- the server adds afterwards can be told apart and delivered.
 local function watch_after_report(bufnr, root, names, opts, label)
+    -- The report just accounted for every buffer's diagnostics (new errors
+    -- elsewhere, the ones that went away), so what the other watched
+    -- buffers show now is no longer "late" for their own reports.
+    local now = vim.uv.now()
+    for b, w in pairs(watched) do
+        if b ~= bufnr and vim.api.nvim_buf_is_valid(b) then
+            w.after, w.reported_at = buf_snapshot(b), now
+        end
+    end
     if not bufnr then return end
     watched[bufnr] = {
-        reported_at = vim.uv.now(), after = buf_snapshot(bufnr),
+        reported_at = now, after = buf_snapshot(bufnr),
         names = names or {}, root = root, label = label,
         settle_ms = opts.settle_ms, wait_ms = opts.wait_ms,
     }
@@ -1072,9 +1081,11 @@ end
 -- bufnr is nil after delete_file: there is no buffer left to report on, but
 -- the project-wide diagnostic diff below is exactly what the caller wants
 -- to see (what did removing this file break?), so the report still runs.
--- Signatures of the pre-existing diagnostics as last reported, so the next
--- report can say "no change" instead of listing them again.
-local last_prior_key = nil
+-- Signatures of the pre-existing diagnostics as last reported, with their
+-- counts, so the next report names only what is new to the list. The hint
+-- about full_diagnostics goes out once per session.
+local last_prior_sigs = {}
+local preexisting_hinted = false
 
 -- ctx (optional): label = what the edit was, for the deferred and late
 -- reports; since/acks/names = the barrier already sent, when resolving a
@@ -1134,15 +1145,13 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     -- Diff against the snapshot: consume matching signatures as
     -- pre-existing, the rest are new; leftovers in the snapshot were fixed.
     local remaining = vim.deepcopy(before or {})
-    local new_here, new_elsewhere, preexisting_here = {}, {}, {}
+    local new_here, new_elsewhere, prior_items = {}, {}, {}
     local preexisting = { errors = 0, warnings = 0 }
-    local prior_sigs = {}
     for _, d in ipairs(vim.diagnostic.get(nil)) do
         if d.severity <= vim.diagnostic.severity.WARN then
             local sig = diag_signature(d)
             if (remaining[sig] or 0) > 0 then
                 remaining[sig] = remaining[sig] - 1
-                prior_sigs[#prior_sigs + 1] = sig
                 if d.severity == vim.diagnostic.severity.ERROR then
                     preexisting.errors = preexisting.errors + 1
                 else
@@ -1150,12 +1159,13 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
                 end
                 -- A count alone does not answer the question the caller
                 -- actually has, which is whether any of these are in the
-                -- code being edited. The ones elsewhere in the project stay
-                -- a count; these get named.
-                if d.bufnr == bufnr then
-                    preexisting_here[#preexisting_here + 1] = ("%s line %d: %s"):format(
-                        vim.diagnostic.severity[d.severity], d.lnum + 1, d.message)
-                end
+                -- code being edited, and which of them are new to the list.
+                prior_items[#prior_items + 1] = {
+                    sig = sig, here = d.bufnr == bufnr,
+                    text = ("%s %s:%d: %s"):format(vim.diagnostic.severity[d.severity],
+                        vim.fn.fnamemodify(vim.api.nvim_buf_get_name(d.bufnr), ":."),
+                        d.lnum + 1, d.message),
+                }
             elseif d.bufnr == bufnr then
                 new_here[#new_here + 1] = ("%s line %d: %s"):format(
                     vim.diagnostic.severity[d.severity], d.lnum + 1, d.message)
@@ -1213,35 +1223,50 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     if preexisting.errors > 0 then prior[#prior + 1] = preexisting.errors .. " errors" end
     if preexisting.warnings > 0 then prior[#prior + 1] = preexisting.warnings .. " warnings" end
     -- The pre-existing set rarely changes between two edits, and repeating
-    -- it costs tokens on every reply for no decision. Remember what was
-    -- reported and say "no change" until it differs; full_diagnostics
-    -- asks for the list again.
-    table.sort(prior_sigs)
-    local key = table.concat(prior_sigs, "\n")
+    -- it costs tokens on every reply for no decision. What the last reply
+    -- listed is remembered per signature: an entry new to the list (an
+    -- error the caller's own earlier edit introduced, pre-existing now) is
+    -- named, the rest is a count, and a list with nothing new is one short
+    -- line. full_diagnostics lists everything again. The ones in the edited
+    -- file come first either way.
+    table.sort(prior_items, function(a, b)
+        if a.here ~= b.here then return a.here end
+        return a.text < b.text
+    end)
+    local seen_now = {}
+    for _, item in ipairs(prior_items) do seen_now[item.sig] = (seen_now[item.sig] or 0) + 1 end
     if #prior > 0 then
-        if key == last_prior_key and not full then
-            report.preexisting = "no change since the last reply (full_diagnostics=true lists them)"
-        else
-            local elsewhere = (preexisting.errors + preexisting.warnings) - #preexisting_here
-            report.preexisting = table.concat(prior, " and ") .. " were there before the edit (unchanged)"
-            if #preexisting_here > 0 then
-                if #preexisting_here > PREEXISTING_LISTED then
-                    local extra = #preexisting_here - PREEXISTING_LISTED
-                    preexisting_here = vim.list_slice(preexisting_here, 1, PREEXISTING_LISTED)
-                    preexisting_here[#preexisting_here + 1] =
-                        ("… +%d more already in this file"):format(extra)
-                end
-                report.preexisting_in_this_file = preexisting_here
-                if elsewhere > 0 then
-                    report.preexisting = report.preexisting
-                        .. ("; the other %d are in files this edit did not touch"):format(elsewhere)
-                end
-            elseif elsewhere > 0 then
-                report.preexisting = report.preexisting .. "; none of them in this file"
+        local listed, here, entered = {}, 0, 0
+        local budget = vim.deepcopy(last_prior_sigs)
+        for _, item in ipairs(prior_items) do
+            if item.here then here = here + 1 end
+            local known = (budget[item.sig] or 0) > 0
+            if known then budget[item.sig] = budget[item.sig] - 1 else entered = entered + 1 end
+            if full or not known then listed[#listed + 1] = item.text end
+        end
+        local elsewhere = #prior_items - here
+        local where = here == 0 and "none of them in this file"
+            or ("%d in this file, %d elsewhere"):format(here, elsewhere)
+        if full or entered > 0 then
+            report.preexisting = ("%s were there before the edit (%s); %s"):format(
+                table.concat(prior, " and "), where,
+                full and "all listed" or ("%d new to this list since the last reply"):format(entered))
+            if #listed > PREEXISTING_LISTED then
+                local extra = #listed - PREEXISTING_LISTED
+                listed = vim.list_slice(listed, 1, PREEXISTING_LISTED)
+                listed[#listed + 1] = ("… +%d more"):format(extra)
             end
+            report[full and "preexisting_list" or "preexisting_new_to_list"] = listed
+        else
+            report.preexisting = ("%s were there before the edit (%s), none new to this list"):format(
+                table.concat(prior, " and "), where)
+        end
+        if not preexisting_hinted then
+            report.preexisting = report.preexisting .. "; full_diagnostics=true lists them all"
+            preexisting_hinted = true
         end
     end
-    last_prior_key = key
+    last_prior_sigs = seen_now
     if fixed > 0 then
         report.fixed = fixed .. " diagnostics from before the edit are gone"
     end
@@ -1790,13 +1815,20 @@ local function replace_symbol_lines(args)
             local where = scope == "symbol" and c.entry.path
                 or rel_path(vim.api.nvim_buf_get_name(bufnr))
             if at and scope == "file" then
-                -- Found, but not in the symbol the caller named. Saying where
-                -- it actually sits beats the bounds error this would become
-                -- further down, which only says the lines are outside.
+                -- Found, but not in the symbol the caller named: the call's
+                -- name_path scopes every chunk that names none, and a chunk
+                -- meant for the const block above the function lands here.
+                -- The text is in exactly one place, so it is applied there,
+                -- and the reply says so; a bounds error here would send the
+                -- caller off to do this same search by hand.
                 local abs = c.entry.first + at - 1
-                err("chunk %d: the match text is not in %s; it is at buffer lines %d-%d. "
-                    .. "Name the symbol that holds it, or omit name_path and use absolute=true",
-                    c.index, c.entry.path, abs, abs + n - 1)
+                c.outside = { named = c.entry.path, abs_first = abs, abs_last = abs + n - 1 }
+                if not entries[false] then
+                    entries[false] = { first = 1, last = vim.api.nvim_buf_line_count(bufnr),
+                        path = rel_path(vim.api.nvim_buf_get_name(bufnr)), whole = true }
+                end
+                c.entry = entries[false]
+                at = abs
             end
             if not at then
                 if count == 0 then
@@ -1824,6 +1856,11 @@ local function replace_symbol_lines(args)
             c.last = c.last - c.entry.first + 1
         end
         local floor = (c.match ~= nil or c.absolute) and (1 - doc_lines) or 1
+        if c.outside then
+            -- Re-scoped to the whole file above; the symbol's bounds no
+            -- longer apply, and its doc comment is not a floor either.
+            span, floor, doc_lines = c.entry.last, 1, 0
+        end
         if c.first < floor or c.last < c.first or c.last > span then
             err("chunk %d: lines %s-%s are outside the symbol %s, which spans %d-%d (%d lines%s)",
                 c.index, tostring(c.first + c.entry.first - 1), tostring(c.last + c.entry.first - 1),
@@ -2030,6 +2067,26 @@ local function replace_symbol_lines(args)
                 lines = ("%d-%d"):format(c.first, c.last), replaced_text = c.old }
         end
         result.replaced_chunks = echo
+    end
+    -- Chunks whose match text was outside the symbol they were scoped to.
+    local outside = {}
+    for _, c in ipairs(chunks) do
+        if c.outside then
+            outside[#outside + 1] = {
+                chunk = c.index,
+                named = c.outside.named,
+                applied_at = ("buffer lines %d-%d, outside %s"):format(
+                    c.outside.abs_first, c.outside.abs_last, c.outside.named),
+            }
+        end
+    end
+    if #outside > 0 then
+        result.relocated = result.relocated or {}
+        vim.list_extend(result.relocated, outside)
+        result.relocated_note = ((result.relocated_note and (result.relocated_note .. " ") or "")
+            .. "%d chunk(s) matched text outside the symbol they were scoped to (the call's "
+            .. "name_path is the default for every chunk that names none); the text was in "
+            .. "exactly one place, so the edit was applied there."):format(#outside)
     end
     return result
 end

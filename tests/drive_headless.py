@@ -579,6 +579,31 @@ def group_edit(c):
           "tostring(name):lower()" not in text and '.. "!"' not in text
           and "    name = tostring(name)\n" in text
           and len(res.get("relocated", [])) == 2, res)
+    # The call's name_path scopes every chunk that names none. A chunk
+    # whose match text sits outside that symbol, in exactly one place in
+    # the file (the module header here, a const block in Go), is applied
+    # there and reported as relocated rather than refused.
+    res = b.call("replace_symbol_lines", {
+        "file": util, "name_path": "M.shout",
+        "chunks": [
+            {"match": "local M = {}", "text": "local M = {} -- module"},
+            {"match": "return string.upper(M.greet(name))",
+             "text": "    return string.upper(M.greet(name)) -- loud"},
+        ],
+    })
+    text = open(util).read()
+    check("a chunk matched outside its symbol is applied where the text is",
+          "local M = {} -- module" in text and "-- loud" in text
+          and any("outside M.shout" in r.get("applied_at", "") for r in res.get("relocated", []))
+          and "scoped to" in res.get("relocated_note", ""), res)
+    b.call("replace_symbol_lines", {
+        "file": util,
+        "chunks": [
+            {"match": "local M = {} -- module", "text": "local M = {}"},
+            {"match": "return string.upper(M.greet(name)) -- loud",
+             "text": "    return string.upper(M.greet(name))"},
+        ],
+    })
 
     # Text-keyed: match names the lines, no arithmetic; refused when the
     # text is absent or ambiguous.
@@ -793,17 +818,17 @@ def group_edit(c):
           and moves[0].get("applied_at") == "buffer lines 11-11, outside M.greet", res)
 
     reset(c)
-    # Same for match=, except that the text is not moved to; the caller is
-    # told where it actually sits, rather than that it is nowhere.
-    try:
-        b.call("replace_symbol_lines", {
-            "file": util, "name_path": "M.greet",
-            "match": "return string.upper(M.greet(name))", "text": "x",
-        })
-        check("match names the symbol the text is really in", False, "call succeeded")
-    except RuntimeError as e:
-        check("match names the symbol the text is really in",
-              "not in M.greet" in str(e) and "buffer lines 11-11" in str(e), e)
+    # Same for match=: text found once outside the named symbol is edited
+    # where it is, and the reply says the symbol it was not in.
+    res = b.call("replace_symbol_lines", {
+        "file": util, "name_path": "M.greet",
+        "match": "return string.upper(M.greet(name))", "text": "    return M.greet(name):upper()",
+    })
+    moves = res.get("relocated", [])
+    check("match found outside the symbol is applied where the text is",
+          "return M.greet(name):upper()" in open(util).read()
+          and len(moves) == 1 and moves[0].get("named") == "M.greet"
+          and moves[0].get("applied_at") == "buffer lines 11-11, outside M.greet", res)
 
     reset(c)
     # replace_pattern: the same change in many places, where a rename does
@@ -887,13 +912,16 @@ def group_verdict(c):
         "text": "    name = tostring(name)",
     })
     check("preexisting diagnostics reported as unchanged",
-          res2.get("preexisting") is None or "no change" in res2.get("preexisting"), res2)
+          res2.get("preexisting") is None or "none new to this list" in res2.get("preexisting"), res2)
+    check("an unchanged list is not listed again",
+          "preexisting_new_to_list" not in res2 and "preexisting_list" not in res2, res2)
     res3 = b.call("replace_symbol_lines", {
         "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
         "text": "    name = tostring(name)", "full_diagnostics": True,
     })
     check("full_diagnostics lists them again",
-          res3.get("preexisting") is None or "no change" not in res3.get("preexisting"), res3)
+          res3.get("preexisting") is None
+          or ("all listed" in res3.get("preexisting") and isinstance(res3.get("preexisting_list"), list)), res3)
 
     # A fresh editor, not just fresh files: the undo checks below count what
     # the ledger holds, and the timings compare edits made in one session.
@@ -930,6 +958,16 @@ def group_verdict(c):
     check("post-edit separates pre-existing",
           res.get("diagnostics_after") == "no new errors or warnings"
           and "1 warnings" in res.get("preexisting", ""), res)
+    # The error the earlier edit planted is new to the pre-existing list,
+    # so it is named this once (with its file), and not on the next reply.
+    check("an entry new to the list is named once",
+          any("nme" in d and "util" in d for d in res.get("preexisting_new_to_list", [])), res)
+    res = b.call("replace_symbol_lines", {
+        "file": util, "name_path": "M.shout", "first_line": 2, "last_line": 2,
+        "text": '    return string.upper(M.greet(name)) -- again',
+    })
+    check("then it is a count",
+          "none new to this list" in res.get("preexisting", "") and "preexisting_new_to_list" not in res, res)
     res = b.call("replace_symbol_lines", {
         "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
         "text": '    return "hello, " .. tostring(name)',
@@ -1297,6 +1335,33 @@ def group_files(c):
         check("a created Go file is analyzed by gopls",
               isinstance(after, list)
               and any("accumulate" in line for line in after), res)
+        # A Go file written by another tool (a plain Write, a heredoc) is
+        # one no server hears of: Neovim registers no file watcher on
+        # Linux, so gopls goes on calling the name it defines undefined
+        # while the build passes. The resync before an edit is judged has
+        # to relay the new file, or the error stays "pre-existing" forever.
+        res = b.call("replace_symbol_lines", {
+            "file": os.path.join(goroot, "main.go"), "name_path": "main",
+            "match": '\tfmt.Println("debugproj: start")',
+            "text": '\tfmt.Println("debugproj: start", localHostName())',
+        })
+        after = res.get("diagnostics_after")
+        check("a use before the definition is an error",
+              isinstance(after, list) and any("localHostName" in line for line in after), res)
+        with open(os.path.join(goroot, "host.go"), "w") as f:
+            f.write("package main\n\nimport \"os\"\n\nfunc localHostName() string {\n"
+                    "\th, _ := os.Hostname()\n\treturn h\n}\n")
+        res = b.call("replace_symbol_lines", {
+            "file": os.path.join(goroot, "main.go"), "name_path": "main",
+            "match": '\tfmt.Fprintln(os.Stderr, "debugproj: stderr line")',
+            "text": '\tfmt.Fprintln(os.Stderr, "debugproj: stderr line 2")',
+        })
+        check("a file written by another tool reaches the server",
+              "fixed" in res
+              and not any("localHostName" in d for d in res.get("preexisting_new_to_list", [])), res)
+        diags = b.call("diagnostics", {"file": os.path.join(goroot, "main.go")})
+        check("and the stale error is gone",
+              not any("localHostName" in d.get("message", "") for d in diags.get("diagnostics", [])), diags)
         b.call("close_workspace", {"root": goroot})
 
 
