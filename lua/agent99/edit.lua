@@ -2026,9 +2026,19 @@ local function replace_symbol_lines(args)
                     :format(s.want_n, s.c.first, s.c.last, s.c.entry.path, #s.c.old,
                         vim.inspect(s.want), vim.inspect(s.have))
                 if s.head then
+                    local t = relocated[s.c] or narrow[s.c]
+                    local fits = t ~= nil and #s.c.new_lines <= (t.last_line - t.first_line + 1)
                     lines[#lines + 1] = ("lines %d-%d do start with that text, so the numbers are right and "
-                            .. "expect= is short: quote all %d lines in expect=, or replace only the %d it "
-                            .. "covers."):format(s.c.first, s.c.last, #s.c.old, s.want_n)
+                            .. "expect= is short: quote all %d lines in expect=%s."):format(
+                            s.c.first, s.c.last, #s.c.old,
+                            fits and (", or replace only the %d it covers"):format(s.want_n) or "")
+                    if not fits then
+                        lines[#lines + 1] = ("the %d line(s) of text sent with this call were written for "
+                            .. "the whole range, so replacing only the %d line(s) the expect covers is not "
+                            .. "offered: it would leave the other %d below the new text, which is the "
+                            .. "duplication this refusal is for."):format(
+                            #s.c.new_lines, s.want_n, #s.c.old - s.want_n)
+                    end
                 elseif s.at then
                     local abs = s.c.entry.first + s.at - 1
                     lines[#lines + 1] = ("the expected text is %d line(s) at buffer lines %d-%d, which is not "
@@ -2082,17 +2092,31 @@ local function replace_symbol_lines(args)
         -- Narrowing to the lines the expect text covers is a real intention
         -- (a caller who miscounted the last line), just not one to guess at:
         -- offered here, applied only when it is chosen.
-        local targeted, all_targeted = {}, true
+        -- Narrowing to the lines the expect text covers is offered only when
+        -- the text sent with the call fits there. Text written for the whole
+        -- range, dropped onto the one line that was quoted, leaves the rest of
+        -- the range below it - the duplication this refusal exists to prevent,
+        -- reached by taking the fix it offered. Every agent that took that
+        -- action in testing hit exactly that, so it is withheld rather than
+        -- labelled: for such a call, applying at the requested lines is the
+        -- action that matches what the text was written for.
+        local targeted, all_targeted, all_fit = {}, true, true
         for _, s in ipairs(stale) do
-            targeted[s.c] = relocated[s.c] or narrow[s.c]
-            if not targeted[s.c] then all_targeted = false end
+            local t = relocated[s.c] or narrow[s.c]
+            targeted[s.c] = t
+            if not t then
+                all_targeted = false
+            elseif #s.c.new_lines > (t.last_line - t.first_line + 1) then
+                all_fit = false
+            end
         end
-        if not everywhere and all_targeted then
+        if not everywhere and all_targeted and all_fit then
             local title = "replace only the lines each chunk's expect text covers"
             if #stale == 1 then
-                local t = targeted[stale[1].c]
-                local abs_first = stale[1].c.entry.first + t.first_line - 1
-                local abs_last = stale[1].c.entry.first + t.last_line - 1
+                local c = stale[1].c
+                local t = targeted[c]
+                local abs_first = c.entry.first + t.first_line - 1
+                local abs_last = c.entry.first + t.last_line - 1
                 title = ("replace only the %d line(s) the expect text covers (buffer lines %d-%d)"):format(
                     abs_last - abs_first + 1, abs_first, abs_last)
             end

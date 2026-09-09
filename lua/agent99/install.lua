@@ -133,22 +133,33 @@ local function guess_check_command(root)
     -- breakage is load-time - a require of a module that moved, an API that
     -- was removed, a plugin spec the manager rejects - which no static
     -- checker sees and which `luac -p` above cannot: those files parse
-    -- perfectly. init.lua alone is not the signal, since a Lua library has
-    -- one too; a config also carries the manager's lockfile or a runtime
-    -- directory Neovim itself loads.
-    if vim.fn.executable("nvim") == 1 and has("init.lua")
-        and (has("lazy-lock.json") or has("after") or has("plugin")) then
-        -- A first start can install plugins, and a config that prompts is a
-        -- start that never ends; the check_project timeout would take five
-        -- minutes to say so.
-        local prefix = vim.fn.executable("timeout") == 1 and "timeout 60 " or ""
-        add(prefix .. "nvim --headless -u init.lua -c 'messages' -c 'qa!'",
-            "the Neovim config is checked by starting it with this init and printing "
-            .. ":messages: that catches a load-time error (a require of a module that "
-            .. "moved, a removed API) which no static check sees. It says nothing about "
-            .. "code that only runs on a command, a keymap or a filetype, and Neovim "
-            .. "prints a startup error while still exiting 0, so read the new lines "
-            .. "rather than the exit code.")
+    -- perfectly.
+    --
+    -- Only when the root IS the configuration this Neovim loads. Starting
+    -- `nvim -u <root>/init.lua` anywhere else sources that init but leaves
+    -- every `require` and every plugin/ and after/plugin/ script resolving
+    -- out of stdpath("config"), because a plugin manager rebuilds
+    -- 'runtimepath' from there during startup: the check would run the
+    -- machine's own configuration, and report a broken copy clean. There is
+    -- no honest command for a configuration checked out somewhere else, so
+    -- none is guessed - the Lua syntax check above still covers it.
+    if vim.fn.executable("nvim") == 1 and has("init.lua") then
+        local real_root = vim.uv.fs_realpath(root)
+        local real_config = vim.uv.fs_realpath(vim.fn.stdpath("config"))
+        if real_root and real_config and real_root == real_config then
+            -- A first start can install plugins, and a config that prompts is
+            -- a start that never ends; the check_project timeout would take
+            -- five minutes to say so.
+            local prefix = vim.fn.executable("timeout") == 1 and "timeout 60 " or ""
+            add(prefix .. "nvim --headless -c 'messages' -c 'qa!'",
+                "the configuration is checked by starting Neovim on it and printing "
+                .. ":messages, which catches the load-time error (a require of a module "
+                .. "that moved, a removed API) that no static check sees. It covers "
+                .. "init.lua and every plugin/ and after/plugin/ script Neovim sources, "
+                .. "says nothing about code that only runs on a command, a keymap or a "
+                .. "filetype, and Neovim prints a startup error while still exiting 0, "
+                .. "so read the new lines rather than the exit code.")
+        end
     end
     return guesses
 end

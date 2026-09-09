@@ -743,11 +743,46 @@ def group_edit(c):
               "expect covers 1 line(s)" in str(e) and "cover 3" in str(e)
               and "do start with that text" in str(e)
               and open(util).read() == before_short and token is not None, e)
+        # Text written for the whole range cannot go on the one line the
+        # expect covers without leaving the rest of the range below it, so
+        # the narrowing is not offered at all - only the requested lines.
+        check("narrowing is withheld when the text was written for the range",
+              "were written for the whole range" in str(e)
+              and "quote all 3 lines in expect=." in str(e)
+              and "1 = apply at the requested lines anyway" in str(e), e)
         if token:
             res = b.call("apply_code_action", {"token": token.group(1), "index": 1})
-            check("the refusal offers the narrowing it would not do on its own",
+            text_now = open(util).read()
+            check("the offered action applies the text to the whole range",
+                  res.get("replaced") == "lines 1-3 of M.greet"
+                  and 'return "hi, " .. name' in text_now
+                  and 'return "hello, " .. name' not in text_now
+                  and text_now.count("function M.greet(name)") == 1, res)
+
+    reset(c)
+    # A short expect whose replacement does fit the lines it covers is the
+    # honest miscount: the narrowing is offered there, and applying it
+    # leaves the rest of the range alone.
+    try:
+        b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet", "first_line": 1, "last_line": 3,
+            "expect": "function M.greet(name)",
+            "text": "function M.greet(name) -- greets",
+        })
+        check("a short expect with fitting text is refused too", False, "call succeeded")
+    except RuntimeError as e:
+        token = re.search(r"token=(\d+)", str(e))
+        check("a short expect with fitting text is refused too",
+              "expect covers 1 line(s)" in str(e)
+              and "or replace only the 1 it covers" in str(e)
+              and "1 = replace only the 1 line(s)" in str(e), e)
+        if token:
+            res = b.call("apply_code_action", {"token": token.group(1), "index": 1})
+            text_now = open(util).read()
+            check("the narrowing is offered when the text fits, and keeps the rest",
                   res.get("replaced") == "lines 1-1 of M.greet"
-                  and 'return "hi, " .. name' in open(util).read(), res)
+                  and "function M.greet(name) -- greets" in text_now
+                  and 'return "hello, " .. name' in text_now, res)
 
     reset(c)
     # insert_lines: main.lua starts with a bare require, so there is no

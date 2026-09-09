@@ -47,25 +47,37 @@ local function any(list, text)
     return false
 end
 
--- A Neovim configuration: init.lua next to the runtime directories Neovim
--- itself loads. Its real breakage is load-time, so the guess starts Neovim
--- with that init on top of the syntax check every Lua project gets.
-local config_root = scratch({
+-- The configuration this Neovim actually loads is checked by starting
+-- Neovim on it: its real breakage is load-time, and no static check sees it.
+local this_config = vim.fn.stdpath("config")
+if vim.fn.executable("nvim") == 0 or vim.uv.fs_stat(this_config .. "/init.lua") == nil then
+    io.stdout:write("skip  no init.lua at " .. this_config .. "\n")
+else
+    local own = commands(this_config)
+    check("the loaded configuration is checked by starting Neovim",
+        any(own, "nvim --headless") and any(own, "messages") and not any(own, "-u init.lua"), own)
+    check("it still gets the Lua syntax check",
+        any(own, "luac") or any(own, "luacheck"), own)
+end
+
+-- A configuration-shaped tree that is NOT the one Neovim loads: starting
+-- `nvim -u <root>/init.lua` there sources that init, but every require and
+-- every plugin/after script still resolves out of stdpath("config"), so the
+-- check would run the machine's own configuration and call a broken copy
+-- clean. No nvim command is guessed for it.
+local copy_root = scratch({
     ["init.lua"] = 'require("user.options")',
     ["lua/user/options.lua"] = "return {}",
     ["after/plugin/theme.lua"] = 'vim.cmd("colorscheme default")',
+    ["lazy-lock.json"] = "{}",
 })
-local config_cmds = commands(config_root)
-check("a Neovim config is checked by starting Neovim",
-    vim.fn.executable("nvim") == 0
-    or (any(config_cmds, "nvim --headless -u init.lua") and any(config_cmds, "messages")),
-    config_cmds)
-check("a Neovim config still gets the Lua syntax check",
-    any(config_cmds, "luac") or any(config_cmds, "luacheck"), config_cmds)
-vim.fn.delete(config_root, "rf")
+local copy_cmds = commands(copy_root)
+check("a configuration copy is not started as a config", not any(copy_cmds, "nvim --headless"), copy_cmds)
+check("a configuration copy still gets the Lua syntax check",
+    any(copy_cmds, "luac") or any(copy_cmds, "luacheck"), copy_cmds)
+vim.fn.delete(copy_root, "rf")
 
--- A Lua library with an init.lua of its own is not a configuration, and
--- starting Neovim with it as the init would prove nothing about it.
+-- A Lua library with an init.lua of its own is not a configuration either.
 local lib_root = scratch({
     ["init.lua"] = "return require('lib.core')",
     ["lua/lib/core.lua"] = "return {}",
