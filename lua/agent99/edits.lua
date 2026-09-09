@@ -118,6 +118,13 @@ function M.undo_last(n, skip)
         elseif not (e.bufnr and vim.api.nvim_buf_is_valid(e.bufnr)) then
             why = "its buffer is gone"
         else
+            -- Against the file as it is now, not as the editor last read it:
+            -- a region changed on disk went undetected, the undo wrote over
+            -- it in the buffer, and only the save refused - by which point
+            -- the ledger entry was gone and the hand edit with it.
+            pcall(function()
+                require("agent99.core").resync_buf(e.bufnr)
+            end)
             local now = vim.api.nvim_buf_get_lines(e.bufnr,
                 e.first - 1, e.first - 1 + e.new_count, false)
             if not vim.deep_equal(now, e.new_lines or {}) then
@@ -133,11 +140,34 @@ function M.undo_last(n, skip)
             -- ones. They are not made safer by it, so each is still checked.
             dropped[#dropped + 1] = { file = e.file, name_path = e.name_path, why = why }
             current[#current] = nil
+            -- Dropping is not undoing: the step the caller asked for is still
+            -- owed, and the next entry belongs to it.
+            step_group = nil
             goto continue
         end
         if not e.file_op then
             vim.api.nvim_buf_set_lines(e.bufnr, e.first - 1, e.first - 1 + e.new_count,
                 false, e.old_lines)
+        end
+        -- Written first, dropped from the ledger only once it is safely on
+        -- disk: a failed save used to consume the entry, so the edit stayed
+        -- in the file with nothing left to undo it with.
+        local saved, save_why = true, nil
+        if e.bufnr and vim.api.nvim_buf_is_valid(e.bufnr) then
+            local okw, res = pcall(function()
+                return require("agent99.core").write_buf(e.bufnr)
+            end)
+            saved = okw and res ~= false
+            if not saved then save_why = "the file changed on disk since; nothing was written" end
+        end
+        if not saved then
+            -- Put the buffer back the way it was and keep the entry.
+            if not e.file_op then
+                vim.api.nvim_buf_set_lines(e.bufnr, e.first - 1,
+                    e.first - 1 + #(e.old_lines or {}), false, e.new_lines or {})
+            end
+            refused[#refused + 1] = { file = e.file, name_path = e.name_path, why = save_why }
+            break
         end
         undone[#undone + 1] = e
         current[#current] = nil

@@ -215,6 +215,12 @@ check("go: a filter that matched nothing, with no test having run, is recognised
     testrun.ran_nothing(lines([==[
 testing: warning: no tests to run
 ?   	github.com/x/cmd/tool	[no test files]]==])) == true, "not matched")
+check("go: a filter that matched nothing is recognised even when packages report ok",
+    testrun.ran_nothing(lines([==[
+testing: warning: no tests to run
+PASS
+ok  	github.com/x/internal/compat	0.002s [no tests to run]
+ok  	github.com/x/internal/policy	0.001s [no tests to run]]==])) == true, "not matched")
 check("unittest: NO TESTS RAN is recognised",
     testrun.ran_nothing(lines([[
 ----------------------------------------------------------------------

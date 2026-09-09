@@ -726,7 +726,24 @@ local function references_outside(bufnr, path, entry, lines, client, root, cache
         if hits == false then
             return nil
         end
-        return counts(hits, function(hit) return hit.file, hit.line end)
+        -- A mention in prose is not a use. The text search knows nothing
+        -- about comments, so a function named in a doc comment anywhere in
+        -- the tree, or inside a string literal, counted as referenced -
+        -- which is most functions worth deleting. The classifier grep uses
+        -- settles it; a hit it cannot classify counts, as before.
+        local code_hits = {}
+        for _, hit in ipairs(hits) do
+            local okb, hbuf = pcall(load_buf, hit.file)
+            local kind = nil
+            if okb then
+                local oke, k = pcall(index.classify_hit, hbuf, hit.line, hit.col or 1, nil)
+                kind = oke and k or nil
+            end
+            if kind ~= "comment" and kind ~= "string" then
+                code_hits[#code_hits + 1] = hit
+            end
+        end
+        return counts(code_hits, function(hit) return hit.file, hit.line end)
     end
     if client then
         local lnum, _, col = name_line(lines, entry)
@@ -992,7 +1009,7 @@ local dispatch_table = {
         -- used in 6, and rename_symbol went on to break the other 3. The
         -- caveat belongs here, where the answer is read, not only in the
         -- reply to open_workspace.
-        local missing = core.deps_missing(args.root)
+        local missing = core.deps_missing(args.root or vim.fn.getcwd())
         if missing then
             result.may_be_incomplete = "the language server cannot resolve this project's "
                 .. "imports (" .. missing .. ") so references from other packages are missing "
@@ -1078,6 +1095,20 @@ for name in pairs(PER_FILE_TOOLS) do
             if type(args.file) == "string" and args.file ~= "" then
                 core.err("give file or files, not both")
             end
+            -- Every file is checked before any of them is written: an edit
+            -- over three files that failed on the second used to leave the
+            -- first one changed, with nothing in the error to say so.
+            for _, f in ipairs(files) do
+                if type(f) ~= "string" or f == "" then
+                    core.err("files must be an array of paths")
+                end
+                local probe = vim.tbl_extend("force", args, { file = f, files = nil, dry_run = true })
+                local ok, res = pcall(fn, probe)
+                if not ok then
+                    core.err("%s: %s", core.rel_path(f),
+                        tostring(res):gsub("^[^:]*:%d+: ", ""))
+                end
+            end
             local reports = {}
             require("agent99.edits").as_one_step(function()
                 for _, f in ipairs(files) do
@@ -1109,6 +1140,9 @@ for name in pairs(WRITE_TOOLS) do
                 if type(args[key]) == "string" and args[key] ~= "" then
                     paths[#paths + 1] = args[key]
                 end
+            end
+            if args.files ~= nil and type(args.files) ~= "table" then
+                core.err("files must be an array of paths, not a %s", type(args.files))
             end
             for _, f in ipairs(args.files or {}) do
                 if type(f) == "string" and f ~= "" then

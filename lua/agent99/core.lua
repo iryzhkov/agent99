@@ -855,6 +855,15 @@ M.mark_synced = mark_synced
 M.disk_moved_on = disk_moved_on
 M.sync_buf = sync_buf
 M.write_buf = write_buf
+
+-- Re-read a buffer from disk when the file changed underneath it. undo_edit
+-- checks the region it is about to restore against this, so a change made
+-- outside the tools is seen before it is written over.
+function M.resync_buf(bufnr)
+    local path = vim.api.nvim_buf_get_name(bufnr)
+    if path == "" or not vim.api.nvim_buf_is_valid(bufnr) then return end
+    sync_buf(bufnr, path)
+end
 M.notify_changed_files = notify_changed_files
 M.notify_watched_files = notify_watched_files
 M.resync_open_buffers = resync_open_buffers

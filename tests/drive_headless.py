@@ -1451,6 +1451,29 @@ def group_multifile(c):
     except RuntimeError as e:
         check("a file without the symbol is named",
               "alpha.lua" in str(e) and "no symbol named" in str(e), e)
+    # A file that lacks the symbol refuses the whole call: the files before
+    # it in the list must not be left edited.
+    with open(made[0]) as f:
+        first_before = f.read()
+    third = os.path.join(root, "lua", "testproj", "gamma.lua")
+    with open(third, "w") as f:
+        f.write("local M = {}\n\nreturn M\n")
+    try:
+        b.call("replace_symbol_body", {
+            "files": [made[0], third], "name_path": "M.run",
+            "body": "function M.run()\n    return 3\nend"})
+        check("a partly-applicable multi-file edit is refused whole", False, "call succeeded")
+    except RuntimeError as e:
+        with open(made[0]) as f:
+            check("a partly-applicable multi-file edit is refused whole",
+                  "gamma.lua" in str(e) and f.read() == first_before, e)
+    os.remove(third)
+    try:
+        b.call("replace_symbol_body", {"files": "not-an-array", "name_path": "M.run", "body": "x",
+                                       "workspace": root})
+        check("a files= that is not an array is refused", False, "call succeeded")
+    except RuntimeError as e:
+        check("a files= that is not an array is refused", "must be an array" in str(e), e)
     b.call("undo_edit", {"all": True})
     for p in made:
         os.path.exists(p) and os.remove(p)
@@ -1983,6 +2006,30 @@ def group_files(c):
     check("undo_edit removes a destination the move created",
           not os.path.exists(split), os.path.exists(split) and open(split).read())
     os.path.exists(split) and os.remove(split)
+
+    # A move into another package must not carry the source's package line:
+    # it produced a file that cannot compile, and the errors were reported
+    # as pre-existing.
+    godir = os.path.join(root, "gopkg")
+    os.makedirs(godir, exist_ok=True)
+    with open(os.path.join(godir, "go.mod"), "w") as f:
+        f.write("module sample\n\ngo 1.22\n")
+    src = os.path.join(godir, "a", "src.go")
+    os.makedirs(os.path.dirname(src), exist_ok=True)
+    with open(src, "w") as f:
+        f.write("package apkg\n\nfunc Helper() int {\n\treturn 1\n}\n")
+    dstdir = os.path.join(godir, "b")
+    os.makedirs(dstdir, exist_ok=True)
+    with open(os.path.join(dstdir, "existing.go"), "w") as f:
+        f.write("package bpkg\n\nfunc Other() int {\n\treturn 2\n}\n")
+    dst = os.path.join(dstdir, "moved.go")
+    res = b.call("move_symbols", {"from": src, "to": dst, "names": ["Helper"]})
+    with open(dst) as f:
+        head = f.read().split("\n")[0]
+    check("a move into another package takes that package's name",
+          head == "package bpkg", (res, head))
+    b.call("undo_edit", {"count": 1})
+    shutil.rmtree(godir, ignore_errors=True)
 
     # A Lua module ends with `return M`; appending below it is a syntax
     # error, and the move did that every time.

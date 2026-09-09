@@ -249,18 +249,34 @@ local function organize_imports(bufnr)
                 last_diff = i
             end
         end
-        -- Only the indentation half of the format guard: adding an import
-        -- adds a string literal, so the string-literal half of it would
-        -- refuse every organize pass that did its job.
-        local file_indent = indent_profile(before_lines)
-        local region = first_diff
-            and indent_profile(vim.list_slice(after_lines, first_diff, last_diff)) or nil
-        if file_indent.step and region and region.step and region.levels > 1
-            and region.step ~= file_indent.step then
+        -- Organizing imports adds, removes and reorders lines; it has no
+        -- business re-indenting the ones it keeps. tsserver rewrites a
+        -- 2-space import block to 4 on every edit of the file, which no
+        -- format setting switches off because this pass is not the format
+        -- pass - and undo_edit runs it again afterwards, so even a correct
+        -- undo put the rewrite back. A line whose text is unchanged and
+        -- whose indentation is not is the signature of that.
+        local indent_of = {}
+        for _, l in ipairs(before_lines) do
+            local text = vim.trim(l)
+            if text ~= "" and indent_of[text] == nil then
+                indent_of[text] = l:match("^[ \t]*")
+            end
+        end
+        local reindented
+        for _, l in ipairs(after_lines) do
+            local text = vim.trim(l)
+            local was = text ~= "" and indent_of[text] or nil
+            if was and was ~= l:match("^[ \t]*") then
+                reindented = text
+                break
+            end
+        end
+        if reindented then
             vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, before_lines)
-            return false, ("the imports were left as they were: organizing them re-indented in "
-                .. "steps of %d in a %d-space file, which would have rewritten the block"):format(
-                region.step, file_indent.step)
+            return false, ("the imports were left as they were: organizing them re-indented "
+                .. "lines it did not otherwise change (%q), which would have rewritten the "
+                .. "block in a width this file does not use"):format(reindented:sub(1, 40))
         end
         ledger_absorb(bufnr, before_lines, after_lines)
     end
@@ -2626,11 +2642,13 @@ local function undo_edit(args)
         result.dropped_note = "skip=true: these entries could not be undone and were forgotten, "
             .. "so the ones under them could be reached. What they wrote is still in the file."
     end
-    if #refused > 0 then
+    if #refused > 0 and #dropped == 0 then
         result.refused = refused
         result.refused_note = "the entries under this one were left alone, because undoing them "
             .. "over a region that has changed would clobber it. Fix that region by hand, or "
             .. "pass skip=true to forget this entry and undo the rest."
+    elseif #refused > 0 then
+        result.refused = refused
     end
     if last_bufnr then
         local opts = post_edit_options()
@@ -2708,8 +2726,14 @@ local function rename_symbol(args)
     local total = 0
     for _, f in ipairs(files) do total = total + f.edits end
     if args.dry_run then
+        -- The dry run is the call made to decide whether to trust the
+        -- rename, so it is the one that most needs the caveat.
+        local missing_dry = core.deps_missing(args.root or vim.fn.getcwd())
         return { dry_run = true, new_name = new_name, files = files,
             total_edits = total, file_operations = #file_ops > 0 and file_ops or nil,
+            may_be_incomplete = missing_dry and ("the language server cannot resolve this "
+                .. "project's imports (" .. missing_dry .. ") so call sites in other packages "
+                .. "are missing from this list; grep for the name to see them") or nil,
             note = "nothing applied; call again without dry_run to rename" }
     end
     -- Every touched file is loaded before anything is applied. load_buf
@@ -3644,6 +3668,25 @@ local function move_symbols(args)
     local created_op
     if not exists then
         local header = args.header
+        if header == nil then
+            -- The destination directory's own package first: copying the
+            -- source's `package archive` into a `package fs` directory
+            -- writes a file that cannot compile, and the errors were then
+            -- reported as pre-existing. A sibling in the destination
+            -- directory says what the package is called there.
+            local dir = vim.fn.fnamemodify(to_path, ":h")
+            for _, sibling in ipairs(vim.fn.globpath(dir, "*", true, true)) do
+                if header == nil and sibling ~= to_path and sibling:sub(-3) == ".go" then
+                    local okr, lines = pcall(vim.fn.readfile, sibling, "", 30)
+                    for _, line in ipairs(okr and lines or {}) do
+                        if line:match("^package%s+%S") then
+                            header = line
+                            break
+                        end
+                    end
+                end
+            end
+        end
         if header == nil then
             for _, line in ipairs(vim.list_slice(from_before, 1, 30)) do
                 if line:match("^package%s+%S") then

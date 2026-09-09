@@ -291,8 +291,16 @@ local function ran_nothing(lines)
     -- passing suite as "no tests ran".
     local ran, none = false, false
     for _, l in ipairs(lines) do
+        -- `ok pkg 0.004s [no tests to run]` is a package that ran nothing;
+        -- counting it as evidence made a filter matching no test read as
+        -- "all passing" - the inverse of the bug this check is for.
+        if l:find("[no tests to run]", 1, true) or l:find("[no test files]", 1, true) then
+            goto next_line
+        end
+        -- A bare "PASS" is printed by a Go test binary even when the filter
+        -- matched nothing, so it is not evidence that a test ran.
         if l:match("^ok%s+%S") or l:match("^%-%-%- PASS") or l:match("^%-%-%- FAIL")
-            or l:match("^PASS") or l:match("^FAIL%s") or l:match("^Ran [1-9]%d* tests?")
+            or l:match("^FAIL%s") or l:match("^Ran [1-9]%d* tests?")
             or l:match("%d+ passed") or l:match("%d+ failed") or l:match("^OK$") then
             ran = true
         end
@@ -300,6 +308,7 @@ local function ran_nothing(lines)
             or l:match("no tests ran") or l:match("collected 0 items") then
             none = true
         end
+        ::next_line::
     end
     return none and not ran
 end

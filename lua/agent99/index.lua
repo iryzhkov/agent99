@@ -2198,6 +2198,9 @@ local function resolve_symbol(file, name_path, pick, at_line)
                 if i > 5 then break end
                 where[#where + 1] = ("%s at line %d"):format(c.entry.path, c.entry.first)
             end
+            if #candidates > 5 then
+                where[#where + 1] = ("and %d more"):format(#candidates - 5)
+            end
             err("no symbol named %q declared on line %d of %s; it is declared at %s",
                 name_path, at_line, file, table.concat(where, ", "))
         end
@@ -2237,10 +2240,16 @@ local function resolve_symbol(file, name_path, pick, at_line)
         -- With the line of each one: an error that lists "Item/Timer,
         -- Item/Timer, Item/Timer" and says to use the full name path names
         -- nothing the caller can act on.
+        table.sort(tied, function(a, b) return a.first < b.first end)
         local names = {}
         for i, e in ipairs(tied) do
             if i > 5 then break end
             names[#names + 1] = ("%s (line %d)"):format(e.path, e.first)
+        end
+        -- Truncating in silence hid the candidate the caller wanted: a file
+        -- with six WriteContentType methods listed five and read as complete.
+        if #tied > 5 then
+            names[#names + 1] = ("and %d more (find_symbol lists them all)"):format(#tied - 5)
         end
         err("ambiguous symbol %q in %s: %s - pass line=<the declaration line> to pick one, "
             .. "or match= with text that only one of them holds",

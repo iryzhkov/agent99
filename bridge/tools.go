@@ -403,7 +403,11 @@ func runGrep(ses session, args map[string]any) (string, error) {
 	// file came back as "(no matches)", an empty answer that looks like an
 	// answer. Only an empty result is worth a second pass, and an empty
 	// search is the cheap one to repeat.
-	if len(lines) == 0 && len(stoppedEarly) == 0 && !asText && usedRg {
+	// Only when nothing was found at all - not when the tests= filter or the
+	// kind= classifier removed the hits, which reported the filtered-out
+	// files as if they held a NUL byte and the search had been incomplete.
+	if len(lines) == 0 && len(stoppedEarly) == 0 && testsFiltered == 0 && truncated == 0 &&
+		!asText && usedRg {
 		stoppedEarly = append(stoppedEarly, textOnlyMatches(pattern, glob, searchDir, searchTarget)...)
 	}
 	waitErr := cmd.Wait()
