@@ -1340,7 +1340,7 @@ def group_indent(c):
     check("a body written at column 0 is shifted to the declaration's column",
           "    def test_beta(self):" in text and "\ndef test_beta" not in text
           and "    def test_gamma(self):" in text
-          and "shifted to match" in (res.get("reindented") or ""), (res, text))
+          and "shifted by 4" in (res.get("reindented") or ""), (res, text))
     # A body already at the right indentation is left byte for byte.
     res = b.call("replace_symbol_body", {
         "file": klass, "name_path": "Suite/test_alpha",

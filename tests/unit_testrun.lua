@@ -203,6 +203,25 @@ local sniffed = testrun.parse_failures(nil, unittest_out, "/repo", 1)
 check("unittest output is recognised without being told the runner",
     #sniffed == 1 and sniffed[1].test == "test_beta", sniffed)
 
+-- `go test ./...` prints "[no test files]" for every package without tests,
+-- which is almost every repository: a whole passing suite was reported as
+-- "no tests ran".
+check("go: packages without tests do not make a passing run look empty",
+    testrun.ran_nothing(lines([==[
+?   	github.com/x/cmd/tool	[no test files]
+ok  	github.com/x/internal/compat	0.004s
+ok  	github.com/x/internal/policy	0.002s]==])) == false, "matched")
+check("go: a filter that matched nothing, with no test having run, is recognised",
+    testrun.ran_nothing(lines([==[
+testing: warning: no tests to run
+?   	github.com/x/cmd/tool	[no test files]]==])) == true, "not matched")
+check("unittest: NO TESTS RAN is recognised",
+    testrun.ran_nothing(lines([[
+----------------------------------------------------------------------
+Ran 0 tests in 0.000s
+
+NO TESTS RAN]])) == true, "not matched")
+
 if failures > 0 then
     io.stdout:write(("unit_testrun: %d failed\n"):format(failures))
     vim.cmd("cquit 1")

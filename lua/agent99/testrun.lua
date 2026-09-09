@@ -285,13 +285,23 @@ end
 -- 0 with a note, which read as "all passing" - a typo in filter= was a green
 -- verification.
 local function ran_nothing(lines)
+    -- Evidence that at least one test did run. `go test ./...` prints
+    -- "?   pkg [no test files]" for every package without tests, which is
+    -- almost every repository: matching that phrase alone reported a whole
+    -- passing suite as "no tests ran".
+    local ran, none = false, false
     for _, l in ipairs(lines) do
-        if l:match("no tests to run") or l:match("^Ran 0 tests")
-            or l:match("no test files") or l:match("0 passed") and l:match("no tests ran") then
-            return true
+        if l:match("^ok%s+%S") or l:match("^%-%-%- PASS") or l:match("^%-%-%- FAIL")
+            or l:match("^PASS") or l:match("^FAIL%s") or l:match("^Ran [1-9]%d* tests?")
+            or l:match("%d+ passed") or l:match("%d+ failed") or l:match("^OK$") then
+            ran = true
+        end
+        if l:match("no tests to run") or l:match("^Ran 0 tests") or l:match("NO TESTS RAN")
+            or l:match("no tests ran") or l:match("collected 0 items") then
+            none = true
         end
     end
-    return false
+    return none and not ran
 end
 
 -- A generic sweep for runners without a parser: any "path:line" on a line
@@ -569,6 +579,9 @@ local function run_tests(args)
             out.output = vim.list_slice(lines, 1, OUTPUT_MAX_LINES)
             if #lines > OUTPUT_MAX_LINES then out.output_truncated = #lines - OUTPUT_MAX_LINES end
             out.summary = #failures > 0 and ("%d failing"):format(#failures)
+                or ran_nothing(lines)
+                and ("no tests ran: the command matched none (exit %d). A run that executes no "
+                    .. "test is not a passing run"):format(result.code)
                 or ("exit %d; no failures parsed from the output, see output"):format(result.code)
         elseif ran_nothing(lines) then
             out.summary = "no tests ran: the command matched none. A filter that matches nothing "
@@ -588,5 +601,6 @@ M.run_tests = run_tests
 M.guess_test_command = guess_test_command
 M.parse_failures = parse_failures
 M.parse_counts = parse_counts
+M.ran_nothing = ran_nothing
 
 return M

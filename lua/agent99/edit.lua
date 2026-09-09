@@ -187,6 +187,9 @@ end
 
 -- Run the server's source.organizeImports action on the buffer. Returns
 -- true when an action was applied.
+-- Defined below, next to the format pass that shares them.
+local indent_profile
+
 local function organize_imports(bufnr)
     local client = client_for(bufnr, "textDocument/codeAction")
     if not client then return false end
@@ -231,7 +234,35 @@ local function organize_imports(bufnr)
         end
     end
     if applied then
-        ledger_absorb(bufnr, before_lines, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
+        -- The same guard the format pass has: a server that re-indents to a
+        -- width the file does not use turns every edit into a whole-file
+        -- diff. tsserver rewrote a 2-space import block to 4 spaces on every
+        -- edit of every file, which no `format` setting could switch off
+        -- because this pass is not the format pass.
+        local after_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+        -- Judged over what the pass actually changed, as the format pass is:
+        -- handing it the whole file compares the file with itself.
+        local first_diff, last_diff
+        for i = 1, math.max(#before_lines, #after_lines) do
+            if before_lines[i] ~= after_lines[i] then
+                first_diff = first_diff or i
+                last_diff = i
+            end
+        end
+        -- Only the indentation half of the format guard: adding an import
+        -- adds a string literal, so the string-literal half of it would
+        -- refuse every organize pass that did its job.
+        local file_indent = indent_profile(before_lines)
+        local region = first_diff
+            and indent_profile(vim.list_slice(after_lines, first_diff, last_diff)) or nil
+        if file_indent.step and region and region.step and region.levels > 1
+            and region.step ~= file_indent.step then
+            vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, before_lines)
+            return false, ("the imports were left as they were: organizing them re-indented in "
+                .. "steps of %d in a %d-space file, which would have rewritten the block"):format(
+                region.step, file_indent.step)
+        end
+        ledger_absorb(bufnr, before_lines, after_lines)
     end
     return applied, note
 end
@@ -242,7 +273,7 @@ end
 -- measured between the widths rather than from column zero, so a region
 -- that sits inside a nested block reports the file's unit and not the
 -- depth it starts at.
-local function indent_profile(lines)
+function indent_profile(lines)
     local tabs, spaces, counts = 0, 0, {}
     for _, line in ipairs(lines) do
         local ws, first = line:match("^(%s+)(%S)")
@@ -877,6 +908,13 @@ local carry = {}      -- what the next reply takes along
 local WATCH_MS = 60 * 1000
 
 local function edit_label(kind, bufnr)
+    -- Undoing a create_file wipes the buffer, and the entries undone after
+    -- it in the same step still name it: labelling threw "Invalid buffer id"
+    -- and the caller got an exception instead of its undo report, for an
+    -- undo that had in fact succeeded.
+    if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
+        return ("%s on a file that is gone"):format(kind)
+    end
     return ("%s on %s"):format(kind, rel_path(vim.api.nvim_buf_get_name(bufnr)))
 end
 
@@ -1156,8 +1194,19 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     local preexisting = { errors = 0, warnings = 0 }
     -- Which files still have anything published, for the fixed count below.
     local still_reported = {}
+    -- A file deleted outside the tools keeps its diagnostics in the editor
+    -- forever: one `rm` of a scratch file put a phantom error into the
+    -- pre-existing count of every later reply in the session.
+    local on_disk = {}
+    local function exists(b)
+        local name = vim.api.nvim_buf_get_name(b)
+        if on_disk[name] == nil then
+            on_disk[name] = name == "" or vim.uv.fs_stat(name) ~= nil
+        end
+        return on_disk[name]
+    end
     for _, d in ipairs(vim.diagnostic.get(nil)) do
-        if d.severity <= vim.diagnostic.severity.WARN then
+        if d.severity <= vim.diagnostic.severity.WARN and exists(d.bufnr) then
             local sig = diag_signature(d)
             still_reported[vim.api.nvim_buf_get_name(d.bufnr)] = true
             if (remaining[sig] or 0) > 0 then
@@ -1179,6 +1228,16 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
             elseif d.bufnr == bufnr then
                 new_here[#new_here + 1] = ("%s line %d: %s"):format(
                     vim.diagnostic.severity[d.severity], d.lnum + 1, d.message)
+            elseif ctx.own and ctx.own[d.bufnr] then
+                -- Another file this same call edited. Only errors are worth
+                -- reporting from files the edit did not touch, but a warning
+                -- in a file it did touch is this edit's doing: moving a
+                -- function out of a Lua module left `Undefined global` in
+                -- the source and the reply said "no new errors or warnings".
+                new_here[#new_here + 1] = ("%s %s:%d: %s"):format(
+                    vim.diagnostic.severity[d.severity],
+                    vim.fn.fnamemodify(vim.api.nvim_buf_get_name(d.bufnr), ":."),
+                    d.lnum + 1, d.message)
             elseif d.severity == vim.diagnostic.severity.ERROR then
                 new_elsewhere[#new_elsewhere + 1] = ("%s:%d: %s"):format(
                     vim.fn.fnamemodify(vim.api.nvim_buf_get_name(d.bufnr), ":."),
@@ -1193,7 +1252,8 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     -- still reports something has really lost the ones that went; a file
     -- that reports nothing at all, and was not the file edited, is a server
     -- mid-republish and is not credited to this edit.
-    local edited_file = bufnr and vim.api.nvim_buf_get_name(bufnr) or nil
+    local edited_file = bufnr and vim.api.nvim_buf_is_valid(bufnr)
+        and vim.api.nvim_buf_get_name(bufnr) or nil
     local fixed = 0
     for sig, n in pairs(remaining) do
         local file = sig:match("^(.-)|") or ""
@@ -1658,7 +1718,8 @@ local function replace_symbol_body(args)
     if type(args.body) ~= "string" then
         err("missing required argument: body")
     end
-    local new_lines = vim.split((args.body:gsub("\n+$", "")), "\n", { plain = true })
+    -- Only the final line terminator, not the blank lines before it.
+    local new_lines = vim.split((args.body:gsub("\n$", "")), "\n", { plain = true })
     local old = vim.api.nvim_buf_get_lines(bufnr, entry.first - 1, entry.last, false)
     -- Written at the declaration's own indentation, which is what the tool
     -- has always promised and did not do: a Python method replaced with a
@@ -1671,22 +1732,27 @@ local function replace_symbol_body(args)
     local want = (old[1] or ""):match("^[ \t]*") or ""
     local have = (new_lines[1] or ""):match("^[ \t]*") or ""
     if want ~= have then
-        local shiftable = true
-        for _, l in ipairs(new_lines) do
-            if l ~= "" and l:sub(1, #have) ~= have then
-                shiftable = false
-                break
+        -- Shift by the difference rather than by rewriting a common prefix.
+        -- Requiring every line to start with the first line's indentation
+        -- meant one flush-left comment in an otherwise indented body
+        -- disabled the whole shift, in silence: a Python method then landed
+        -- inside the method above it and the class lost it.
+        local shifted = {}
+        for i, l in ipairs(new_lines) do
+            if l == "" then
+                shifted[i] = l
+            elseif #want >= #have then
+                shifted[i] = want:sub(#have + 1) .. l
+            else
+                -- Dedent: take back what the line can spare, never more.
+                local drop = #have - #want
+                local lead = l:match("^[ \t]*")
+                shifted[i] = l:sub(math.min(drop, #lead) + 1)
             end
         end
-        if shiftable then
-            local shifted = {}
-            for i, l in ipairs(new_lines) do
-                shifted[i] = l == "" and l or (want .. l:sub(#have + 1))
-            end
-            new_lines = shifted
-            reindented = ("the body was written at column %d and %s sits at column %d; "
-                .. "every line was shifted to match"):format(#have, entry.path, #want)
-        end
+        new_lines = shifted
+        reindented = ("the body was written at column %d and %s sits at column %d; "
+            .. "every line was shifted by %d"):format(#have, entry.path, #want, #want - #have)
     end
     if args.dry_run then
         return vim.tbl_extend("force",
@@ -2051,7 +2117,7 @@ local function replace_symbol_lines(args)
         c.abs_last = c.entry.first + c.last - 1
         local conflict = primary_region_conflict(bufnr, c.abs_first, c.abs_last)
         if conflict then err("chunk %d: %s", c.index, conflict) end
-        c.new_lines = vim.split((c.text:gsub("\n+$", "")), "\n", { plain = true })
+        c.new_lines = vim.split((c.text:gsub("\n$", "")), "\n", { plain = true })
         c.old = vim.api.nvim_buf_get_lines(bufnr, c.abs_first - 1, c.abs_last, false)
     end
     local entry = chunks[1].entry
@@ -2361,23 +2427,26 @@ local function insert_symbol_tool(where)
         if type(args.text) ~= "string" or args.text == "" then
             err("missing required argument: text")
         end
-        local lines = vim.split((args.text:gsub("\n+$", "")), "\n", { plain = true })
+        local lines = vim.split((args.text:gsub("\n$", "")), "\n", { plain = true })
         -- A blank line belongs between two functions and nowhere near two
         -- constants: inserting a sibling into a `const (...)` or `var (...)`
         -- block should not split the block in half. Single-line declarations
         -- are the ones that live in such groups.
+        -- Text that already begins (or ends) with a blank line does not want
+        -- another one: the two together left a double blank that gofmt then
+        -- reported as dirty, with nothing said in the reply.
         local spaced = (entry.last - entry.first) > 0
         local row -- 0-based insertion point
         if where == "after" then
             row = entry.last
-            if spaced then table.insert(lines, 1, "") end
+            if spaced and lines[1] ~= "" then table.insert(lines, 1, "") end
         else
             -- Above the whole declaration, its decorators and doc comment
             -- included, so a new sibling never lands between @Decorator (or
             -- a Rust #[attr], or a Python decorator) and the thing it
             -- annotates, which is a syntax error.
             row = decl_block_top(bufnr, entry.first) - 1
-            if spaced then table.insert(lines, "") end
+            if spaced and lines[#lines] ~= "" then table.insert(lines, "") end
         end
         local conflict = primary_region_conflict(bufnr, row + 1, row + 1)
         if conflict then err(conflict) end
@@ -2425,7 +2494,10 @@ local function insert_lines(args)
             files[#files + 1] = path
         end
     end
-    local lines = vim.split((args.text:gsub("\n+$", "")), "\n", { plain = true })
+    -- Only the final line terminator goes, not the blank lines before it: a
+    -- guard inserted with a blank line after it landed flush against the
+    -- next statement, and the tool documents that the text lands as given.
+    local lines = vim.split((args.text:gsub("\n$", "")), "\n", { plain = true })
     -- Every file is resolved and bounds-checked before any of them is
     -- written, so a line number that is past the end of the fourth file
     -- does not leave the first three edited.
@@ -2460,15 +2532,20 @@ local function insert_lines(args)
         if #previews == 1 then return previews[1] end
         return { chunks = previews }
     end
+    -- One call is one undo step, however many files it wrote: undoing an
+    -- insert over three files took three undo_edit calls, and a caller who
+    -- did not check was left with two of them still inserted.
     local reports = {}
-    for _, t in ipairs(targets) do
-        settle_before_edit(t.bufnr)
-        local before = diag_snapshot()
-        vim.api.nvim_buf_set_lines(t.bufnr, t.row, t.row, false, lines)
-        reports[#reports + 1] = finish_edit(t.bufnr, args, before,
-            ("%s:%d"):format(rel_path(t.path), t.row + 1), "insert_lines", t.row + 1, t.row,
-            {}, #lines, { inserted = ("%d line(s) above line %d"):format(#lines, t.row + 1) })
-    end
+    require("agent99.edits").as_one_step(function()
+        for _, t in ipairs(targets) do
+            settle_before_edit(t.bufnr)
+            local before = diag_snapshot()
+            vim.api.nvim_buf_set_lines(t.bufnr, t.row, t.row, false, lines)
+            reports[#reports + 1] = finish_edit(t.bufnr, args, before,
+                ("%s:%d"):format(rel_path(t.path), t.row + 1), "insert_lines", t.row + 1, t.row,
+                {}, #lines, { inserted = ("%d line(s) above line %d"):format(#lines, t.row + 1) })
+        end
+    end)
     if #reports == 1 then return reports[1] end
     return { files = #reports, reports = reports }
 end
@@ -2615,8 +2692,11 @@ local function rename_symbol(args)
     end)
     local result = { renamed_to = new_name, files = files, total_edits = total,
         file_operations = #file_ops > 0 and file_ops or nil }
+    local own = {}
+    for _, snap in ipairs(snaps) do own[snap.bufnr] = true end
     result = vim.tbl_extend("error", result,
-        post_edit_report(bufnr, before, args.root, args.headless, nil, args.full_diagnostics))
+        post_edit_report(bufnr, before, args.root, args.headless, nil, args.full_diagnostics,
+            { own = own }))
     result.note = edit_note(args)
     return result
 end
@@ -2939,12 +3019,18 @@ local function replace_pattern(args)
             .. "without kind=", kind, table.concat(no_parser, ", "))
     end
 
+    local FILES_SHOWN = 40
+    local files_note
+    if #per_file > FILES_SHOWN then
+        files_note = ("%d of %d files listed"):format(FILES_SHOWN, #per_file)
+    end
     local result = {
         pattern = pattern,
         replacement = replacement,
         total_replacements = total,
         files_matched = #per_file,
-        files = #per_file > 0 and per_file or nil,
+        files_listed = files_note,
+        files = #per_file > 0 and vim.list_slice(per_file, 1, FILES_SHOWN) or nil,
         samples = #samples > 0 and samples or nil,
     }
     if #alts > 0 then
@@ -2982,8 +3068,12 @@ local function replace_pattern(args)
             .. "from code; these files have none and were left alone"):format(kind)
     end
     if capped > 0 then
-        result.note = ("%d further files were not looked at (cap: %d); narrow with "
-            .. "glob= or files="):format(capped, MAX_PATTERN_FILES)
+        -- Kept out of `note`, which the dry-run message overwrites: the
+        -- dangerous case is a run that replaced something and left the rest
+        -- of the tree unlooked-at, and that note used to disappear.
+        result.not_looked_at = ("%d further files were not looked at (cap: %d); the answer above "
+            .. "covers the first %d only - narrow with glob= or files= to reach the rest")
+            :format(capped, MAX_PATTERN_FILES, MAX_PATTERN_FILES)
     end
     if zero_width then
         result.warning = "the pattern can match nothing at some positions (a zero-width "
@@ -3028,6 +3118,8 @@ local function replace_pattern(args)
     end
     local before = diag_snapshot()
     -- One pattern replace is one undo step across every file it changed.
+    local own_bufs = {}
+    for _, p in ipairs(pending) do own_bufs[p.bufnr] = true end
     require("agent99.edits").as_one_step(function()
         for _, p in ipairs(pending) do
             vim.api.nvim_buf_set_lines(p.bufnr, 0, -1, false, p.new)
@@ -3038,7 +3130,7 @@ local function replace_pattern(args)
     result.note = edit_note(args)
     return vim.tbl_extend("error", result,
         post_edit_report(pending[1].bufnr, before, args.root, args.headless, nil,
-            args.full_diagnostics))
+            args.full_diagnostics, { own = own_bufs }))
 end
 
 local FILE_OP_CAPABILITY = {
@@ -3641,7 +3733,8 @@ local function move_symbols(args)
         result.imports_note = info.imports_note
     end
     return vim.tbl_extend("force", result,
-        post_edit_report(to_buf, before, args.root, args.headless, opts, args.full_diagnostics))
+        post_edit_report(to_buf, before, args.root, args.headless, opts, args.full_diagnostics,
+            { own = { [from_buf] = true } }))
 end
 M.post_edit_options = post_edit_options
 M.organize_imports = organize_imports

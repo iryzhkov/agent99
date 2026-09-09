@@ -28,6 +28,16 @@ end
 -- ("make", "gopls", ...), so a Lua table of package names outlines as thirty
 -- String entries that address nothing. One with children is kept: whatever
 -- is inside it may still be worth naming.
+-- A child that covers exactly the same lines as its parent adds nothing: it
+-- is the same source line, one level in.
+local function same_span_child(s, parent)
+    if not parent then return false end
+    local a = s.range or (s.location and s.location.range)
+    local b = parent.range or (parent.location and parent.location.range)
+    if not a or not b then return false end
+    return a.start.line == b.start.line and a["end"].line == b["end"].line
+end
+
 local function value_named(s)
     if s.children and #s.children > 0 then
         return false
@@ -49,6 +59,11 @@ local function flatten_symbols(symbols, depth, out, bufnr, opts)
             -- clangd's wrapper for a macro-opened namespace: show what is
             -- inside it at this depth, not the macro itself.
             flatten_symbols(s.children, depth, out, bufnr, opts)
+        elseif opts and opts.drop_values and same_span_child(s, opts.parent) then
+            -- A child covering exactly its parent's lines is the same source
+            -- line printed twice: a constant and, one level in, the callback
+            -- that makes it.
+            opts.dropped = (opts.dropped or 0) + 1
         elseif opts and opts.drop_values and value_named(s) then
             -- An array's elements, one symbol each and named after their own
             -- text: thirty of them are the whole outline of a data file and
@@ -59,7 +74,9 @@ local function flatten_symbols(symbols, depth, out, bufnr, opts)
                 string.rep("  ", depth), lnum, kind, s.name,
                 bufnr and lnum > 0 and decl_line(bufnr, lnum) or "")
             if s.children then
-                flatten_symbols(s.children, depth + 1, out, bufnr, opts)
+                local nested = opts and vim.tbl_extend("force", opts, { parent = s }) or nil
+                flatten_symbols(s.children, depth + 1, out, bufnr, nested)
+                if nested then opts.dropped = nested.dropped end
             end
         end
     end
@@ -303,9 +320,10 @@ local function ts_outline(bufnr)
                     -- A wrapper and its inner node often start on the same
                     -- row (e.g. declaration + definition); emit it once.
                     if #out >= MAX_SKIM_ENTRIES then
-                        -- Past the cap, keep counting top-level-ish entries
-                        -- so the tail note can say what was left out.
-                        if srow ~= extra_last_row and depth <= 1 then
+                        -- Past the cap, count everything left out: counting
+                        -- only depth<=1 told a QML file with 62 objects below
+                        -- the cut that 2 were missing.
+                        if srow ~= extra_last_row then
                             extra_last_row = srow
                             extra = extra + 1
                         end
@@ -358,7 +376,9 @@ local function ts_query(args)
     if #files == 0 then
         err("%s", glob_note or "no files to search: pass files (array of paths) and/or glob")
     end
+    local files_capped = 0
     if #files > MAX_QUERY_FILES then
+        files_capped = #files - MAX_QUERY_FILES
         files = vim.list_slice(files, 1, MAX_QUERY_FILES)
     end
 
@@ -431,6 +451,12 @@ local function ts_query(args)
     end
     if #matches >= MAX_QUERY_MATCHES then
         res.note = ("truncated at %d matches"):format(MAX_QUERY_MATCHES)
+    end
+    if files_capped > 0 then
+        -- Silence here answered a 555-file glob out of the first 50 files and
+        -- reported the count as though it covered the tree.
+        res.files_note = ("only the first %d files were searched; %d more matched the glob and "
+            .. "were not looked at - narrow it"):format(MAX_QUERY_FILES, files_capped)
     end
     return res
 end

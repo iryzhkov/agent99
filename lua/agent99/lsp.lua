@@ -185,8 +185,12 @@ local function quick_fix_titles(bufnr, client, d)
         -- error, and the note above tells the caller to apply it. lua_ls and
         -- friends also offer "Disable diagnostics ...", which silences the
         -- problem rather than fixing it.
+        -- gopls answers a diagnostic-scoped request with its whole line menu:
+        -- "Add test for lastChar" and "Browse arm64 assembly" came back as
+        -- quick fixes for an unused variable. Only quickfix kinds, and the
+        -- servers that send no kind at all.
         local kind = a.kind or ""
-        local fixes = kind == "" or kind:sub(1, 8) == "quickfix" or kind:sub(1, 6) == "source"
+        local fixes = kind == "" or kind:sub(1, 8) == "quickfix"
         if fixes and not seen[a.title]
             and not a.title:find("^Disable diagnostics") and not a.title:find("^Ignore ") then
             seen[a.title] = true
@@ -679,11 +683,20 @@ local function references_outside(bufnr, path, entry, lines, client, root, cache
     -- dead: 30 of one repository's 72 findings were its own test fixtures.
     -- Test references still do not keep production code alive.
     local own_is_test = core.is_test_path(rel_path(path))
+    -- A Go doc comment starts with the symbol's name, and it sits above the
+    -- declaration, so a text search counted it as a use: every documented
+    -- dead function looked alive, and the only findings left in a whole
+    -- repository were the undocumented ones.
+    local own_first = entry.first
+    do
+        local ok, doc = pcall(index.doc_block_start, bufnr, entry.first)
+        if ok and type(doc) == "number" and doc < own_first then own_first = doc end
+    end
     local function counts(list, file_of)
         local n = 0
         for _, hit in ipairs(list) do
             local file, lnum = file_of(hit)
-            local own = file == path and lnum >= entry.first and lnum <= entry.last
+            local own = file == path and lnum >= own_first and lnum <= entry.last
             if not own and (want_tests or own_is_test or not core.is_test_path(rel_path(file))) then
                 n = n + 1
             end
@@ -768,9 +781,16 @@ local function entry_point(entry, path)
     if not core.is_test_path(rel_path(path)) then
         return false
     end
-    return name:match("^Test%u") ~= nil or name:match("^Benchmark%u") ~= nil
-        or name:match("^Example%u") ~= nil or name:match("^Fuzz%u") ~= nil
-        or name:match("^test_") ~= nil or name:match("^[Tt]est") ~= nil
+    -- Go's rule is that what follows the prefix must not be a lower-case
+    -- letter: Benchmark404 and Example2 are entry points, and requiring an
+    -- upper-case letter reported exactly those as dead code.
+    for _, prefix in ipairs({ "Test", "Benchmark", "Example", "Fuzz" }) do
+        local rest = name:match("^" .. prefix .. "(.*)$")
+        if rest and not rest:match("^%l") then
+            return true
+        end
+    end
+    return name:match("^test_") ~= nil or name:match("^[Tt]est") ~= nil
 end
 
 -- A field set on an object this file did not declare: `vim.opt.number`,
