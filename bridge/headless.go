@@ -459,6 +459,7 @@ var editTools = map[string]bool{
 	"replace_symbol_lines": true,
 	"insert_after_symbol":  true,
 	"insert_before_symbol": true,
+	"insert_lines":         true,
 	"apply_code_action":    true,
 	"undo_edit":            true,
 	"rename_symbol":        true,

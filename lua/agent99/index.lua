@@ -23,9 +23,24 @@ local function symbol_kind(kind)
     return vim.lsp.protocol.SymbolKind[kind] or tostring(kind)
 end
 
+-- A symbol whose name is its own value rather than a name for one: the
+-- elements of an array come back from some servers as one symbol each
+-- ("make", "gopls", ...), so a Lua table of package names outlines as thirty
+-- String entries that address nothing. One with children is kept: whatever
+-- is inside it may still be worth naming.
+local function value_named(s)
+    if s.children and #s.children > 0 then
+        return false
+    end
+    local name = s.name or ""
+    return name:match('^".*"$') ~= nil
+        or name:match("^'.*'$") ~= nil
+        or name:match("^%[?%-?%d+%.?%d*%]?$") ~= nil
+end
+
 -- DocumentSymbol[] (hierarchical) or SymbolInformation[] (flat) -> outline,
 -- each entry carrying the declaration line so signatures are visible.
-local function flatten_symbols(symbols, depth, out, bufnr)
+local function flatten_symbols(symbols, depth, out, bufnr, opts)
     for _, s in ipairs(symbols or {}) do
         local range = s.selectionRange or (s.location and s.location.range)
         local lnum = range and (range.start.line + 1) or 0
@@ -33,13 +48,18 @@ local function flatten_symbols(symbols, depth, out, bufnr)
         if kind == "Null" then
             -- clangd's wrapper for a macro-opened namespace: show what is
             -- inside it at this depth, not the macro itself.
-            flatten_symbols(s.children, depth, out, bufnr)
+            flatten_symbols(s.children, depth, out, bufnr, opts)
+        elseif opts and opts.drop_values and value_named(s) then
+            -- An array's elements, one symbol each and named after their own
+            -- text: thirty of them are the whole outline of a data file and
+            -- none of them addresses anything.
+            opts.dropped = (opts.dropped or 0) + 1
         else
             out[#out + 1] = ("%s%d: %s %s — %s"):format(
                 string.rep("  ", depth), lnum, kind, s.name,
                 bufnr and lnum > 0 and decl_line(bufnr, lnum) or "")
             if s.children then
-                flatten_symbols(s.children, depth + 1, out, bufnr)
+                flatten_symbols(s.children, depth + 1, out, bufnr, opts)
             end
         end
     end
@@ -390,6 +410,10 @@ local function skim(args)
                 file = vim.api.nvim_buf_get_name(bufnr),
                 total_lines = vim.api.nvim_buf_line_count(bufnr),
             }
+            -- A file with no declarations falls back to the server's
+            -- symbols, and for a data table that is every value in it. The
+            -- keys are the outline; the values are the file.
+            local dropped_values = 0
             local function lsp_outline(timeout_ms)
                 local okc, client = pcall(get_client, bufnr,
                     "textDocument/documentSymbol", timeout_ms)
@@ -398,7 +422,9 @@ local function skim(args)
                     "textDocument/documentSymbol",
                     { textDocument = { uri = vim.uri_from_bufnr(bufnr) } })
                 if not okr then return nil end
-                local flat = flatten_symbols(syms, 0, {}, bufnr)
+                local opts = { drop_values = true }
+                local flat = flatten_symbols(syms, 0, {}, bufnr, opts)
+                dropped_values = opts.dropped or 0
                 return #flat > 0 and flat or nil
             end
             local outline
@@ -415,6 +441,10 @@ local function skim(args)
             end
             if outline and #outline > 0 then
                 entry.outline = outline
+                if dropped_values > 0 then
+                    entry.note = ("%d list entries are left out: they are values, named after "
+                        .. "their own text, and read_file shows them"):format(dropped_values)
+                end
             else
                 local ft = vim.bo[bufnr].filetype
                 if ft ~= "" and not has_parser(ft)

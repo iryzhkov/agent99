@@ -96,11 +96,13 @@ cleanup() {
 trap cleanup EXIT
 
 # Pure-Lua checks that need no language server: the guards that decide
-# whether a formatter's pass is kept after an edit, and the region
-# mapping the ledger records.
+# whether a formatter's pass is kept after an edit, the region mapping the
+# ledger records, the test-output parsers, and the commands check_project
+# guesses from a project's files.
 if want unit; then
     nvim --clean --headless -u "$REPO/tests/minimal_init.lua" -l "$REPO/tests/unit_edit.lua"
     nvim --clean --headless -u "$REPO/tests/minimal_init.lua" -l "$REPO/tests/unit_testrun.lua"
+    nvim --clean --headless -u "$REPO/tests/minimal_init.lua" -l "$REPO/tests/unit_check.lua"
 fi
 
 cd "$REPO/tests/testproj"

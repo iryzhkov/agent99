@@ -24,7 +24,7 @@ EXPECTED_TOOLS = {
     "workspace_symbols", "diagnostics", "incoming_calls", "outgoing_calls",
     "buffer_lines", "skim", "ts_query", "find_symbol",
     "replace_symbol_body", "replace_symbol_lines",
-    "insert_after_symbol", "insert_before_symbol",
+    "insert_after_symbol", "insert_before_symbol", "insert_lines",
 }
 MESSY = os.path.join(PROJ, "lua", "testproj", "messy.lua")
 

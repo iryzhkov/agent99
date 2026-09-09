@@ -129,6 +129,27 @@ local function guess_check_command(root)
             end
         end
     end
+    -- A Neovim configuration is checked by starting Neovim. Its real
+    -- breakage is load-time - a require of a module that moved, an API that
+    -- was removed, a plugin spec the manager rejects - which no static
+    -- checker sees and which `luac -p` above cannot: those files parse
+    -- perfectly. init.lua alone is not the signal, since a Lua library has
+    -- one too; a config also carries the manager's lockfile or a runtime
+    -- directory Neovim itself loads.
+    if vim.fn.executable("nvim") == 1 and has("init.lua")
+        and (has("lazy-lock.json") or has("after") or has("plugin")) then
+        -- A first start can install plugins, and a config that prompts is a
+        -- start that never ends; the check_project timeout would take five
+        -- minutes to say so.
+        local prefix = vim.fn.executable("timeout") == 1 and "timeout 60 " or ""
+        add(prefix .. "nvim --headless -u init.lua -c 'messages' -c 'qa!'",
+            "the Neovim config is checked by starting it with this init and printing "
+            .. ":messages: that catches a load-time error (a require of a module that "
+            .. "moved, a removed API) which no static check sees. It says nothing about "
+            .. "code that only runs on a command, a keymap or a filetype, and Neovim "
+            .. "prints a startup error while still exiting 0, so read the new lines "
+            .. "rather than the exit code.")
+    end
     return guesses
 end
 
@@ -952,6 +973,7 @@ local function install_language(args)
     return result
 end
 M.check_project = check_project
+M.guess_check_command = guess_check_command
 M.command_store = command_store
 M.workspace_support = workspace_support
 M.install_language = install_language

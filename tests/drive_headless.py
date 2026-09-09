@@ -451,6 +451,30 @@ def group_index(c):
         check("a make recipe keeps its tab and its spacing",
               "\techo building it\n\ntest: build" in made, made)
 
+    # A Lua file that declares nothing (a table of package names, the way a
+    # plugin config lists them) has no treesitter outline, so the server's
+    # symbols answer instead - and those hold every element of every array,
+    # named after its own text. The keys are the outline; the elements are
+    # left out and counted.
+    deps = os.path.join(root, "lua", "testproj", "deps.lua")
+    with open(deps, "w") as f:
+        f.write("return {\n"
+                "    parsers = { \"lua\", \"go\", \"python\", \"bash\" },\n"
+                "    servers = { \"lua_ls\", \"gopls\" },\n"
+                "}\n")
+    res = b.call("skim", {"files": [deps]})
+    entry = res["files"][0]
+    outline = entry.get("outline", [])
+    if not outline:
+        print("SKIP data-table checks: no outline for a declaration-less Lua file")
+    else:
+        check("skim leaves an array's elements out of a data table's outline",
+              any("parsers" in line for line in outline)
+              and any("servers" in line for line in outline)
+              and not any(line.strip().split(":")[1].startswith(" String") for line in outline)
+              and "6 list entries are left out" in (entry.get("note") or ""), res)
+    os.remove(deps)
+
     script = os.path.join(root, "scripts", "build.sh")
     res = b.call("skim", {"files": [script]})
     if "no treesitter parser" in (res["files"][0].get("note") or ""):
@@ -548,8 +572,9 @@ def group_edit(c):
               and "nowhere in" in str(e) and open(util).read() == text, e)
 
     # Chunks may name their own symbols: one concept living in two
-    # functions is one call. The relocated range follows the expected
-    # text's length, so a miscounted last_line still lands right.
+    # functions is one call. A stale chunk relocates to wherever its
+    # expected text is, as long as that text covers the whole range the
+    # chunk asked for.
     res = b.call("replace_symbol_lines", {
         "file": util,
         "chunks": [
@@ -567,7 +592,7 @@ def group_edit(c):
     res = b.call("replace_symbol_lines", {
         "file": util,
         "chunks": [
-            {"name_path": "M.greet", "first_line": 1, "last_line": 3,
+            {"name_path": "M.greet", "first_line": 1, "last_line": 1,
              "expect": "name = tostring(name):lower()", "text": "    name = tostring(name)"},
             {"name_path": "M.shout", "first_line": 3, "last_line": 3,
              "expect": 'return string.upper(M.greet(name)) .. "!"',
@@ -697,6 +722,62 @@ def group_edit(c):
           "NUL" in (res.get("control_characters") or "")
           and res.get("new_text") == ["a" + chr(0) + "b"], res)
     os.remove(scratch)
+
+    reset(c)
+    # An expect= that covers fewer lines than the range is a different
+    # mistake from a stale offset, and relocating it would apply the edit to
+    # those lines alone - the rest of the range would survive, below the new
+    # text. M.greet is three lines; guarding all three with only its first
+    # line is refused, and the narrowing is offered instead of being taken.
+    before_short = open(util).read()
+    try:
+        b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet", "first_line": 1, "last_line": 3,
+            "expect": "function M.greet(name)",
+            "text": 'function M.greet(name)\n    return "hi, " .. name\nend',
+        })
+        check("a short expect is refused, not narrowed", False, "call succeeded")
+    except RuntimeError as e:
+        token = re.search(r"token=(\d+)", str(e))
+        check("a short expect is refused, not narrowed",
+              "expect covers 1 line(s)" in str(e) and "cover 3" in str(e)
+              and "do start with that text" in str(e)
+              and open(util).read() == before_short and token is not None, e)
+        if token:
+            res = b.call("apply_code_action", {"token": token.group(1), "index": 1})
+            check("the refusal offers the narrowing it would not do on its own",
+                  res.get("replaced") == "lines 1-1 of M.greet"
+                  and 'return "hi, " .. name' in open(util).read(), res)
+
+    reset(c)
+    # insert_lines: main.lua starts with a bare require, so there is no
+    # symbol to anchor an insert to and nothing but its own text to address
+    # its first line by. A guard goes above it by line number.
+    res = b.call("insert_lines", {"file": main_lua, "line": 1, "text": "-- guard"})
+    check("insert_lines puts text above a line",
+          open(main_lua).read().startswith("-- guard\nlocal util")
+          and res.get("inserted") == "1 line(s) above line 1", res)
+    res = b.call("insert_lines", {"file": main_lua, "at": "end", "text": "-- tail"})
+    check("insert_lines appends without knowing the length",
+          open(main_lua).read().rstrip().endswith("-- tail"), res)
+    # The same text into several files in one call: one guard, a directory
+    # of files, no line arithmetic per file.
+    res = b.call("insert_lines", {"files": [util, main_lua], "at": "start", "text": "-- top"})
+    check("insert_lines covers several files at once",
+          res.get("files") == 2 and len(res.get("reports", [])) == 2
+          and open(util).read().startswith("-- top\nlocal M")
+          and open(main_lua).read().startswith("-- top\n-- guard\n"), res)
+    before_insert = open(util).read()
+    res = b.call("insert_lines", {"file": util, "line": 2, "text": "-- dry", "dry_run": True})
+    check("insert_lines dry_run shows the diff and changes nothing",
+          open(util).read() == before_insert
+          and any(line.startswith("+") for line in res.get("diff", [])), res)
+    try:
+        b.call("insert_lines", {"file": util, "line": 999, "text": "x"})
+        check("insert_lines refuses a line past the end", False, "call succeeded")
+    except RuntimeError as e:
+        check("insert_lines refuses a line past the end", "outside the file" in str(e), e)
+    b.call("undo_edit", {"all": True})
 
     # insert_before lands above the doc comment, not between it and the
     # declaration, so the new sibling is not orphaned under the comment.
@@ -885,6 +966,37 @@ def group_edit(c):
         check("replace_pattern refuses a bad pattern", False, "call succeeded")
     except RuntimeError as e:
         check("replace_pattern refuses a bad pattern", "does not compile" in str(e), e)
+    reset(c)
+
+    # An alternation of lines of code: in very magic mode `=` makes the atom
+    # before it optional, so the branch holding one matches nothing while
+    # the reply still reports the files the other branch matched. Each
+    # branch is counted, and a dead one is named with the reason.
+    res = b.call("replace_pattern", {
+        "files": [main_lua], "pattern": "local util = require|print\\(util.greet",
+        "replacement": "-- gone", "dry_run": True,
+    })
+    alts = res.get("alternatives", [])
+    check("replace_pattern counts each alternative and names the dead ones",
+          [a.get("matches") for a in alts] == [0, 1]
+          and "1 of the 2 alternatives matched nothing" in res.get("alternatives_note", "")
+          and "optional" in res.get("alternatives_note", ""), res)
+    # The same explanation for a single pattern that matched nothing at all.
+    res = b.call("replace_pattern", {
+        "files": [main_lua], "pattern": "local util = require",
+        "replacement": "-- gone", "dry_run": True,
+    })
+    check("a very magic pattern that matched nothing says what it did instead",
+          res.get("total_replacements") == 0
+          and "optional" in (res.get("hint") or "")
+          and "literal=true" in (res.get("hint") or ""), res)
+    # literal=true takes the same text as bytes and matches it.
+    res = b.call("replace_pattern", {
+        "files": [main_lua], "pattern": "local util = require",
+        "replacement": "local util = require", "literal": True, "dry_run": True,
+    })
+    check("literal=true matches the line the regex could not",
+          res.get("total_replacements") == 1 and res.get("alternatives") is None, res)
     reset(c)
 
     # A name two declarations share (Stack.push and Queue.push) is not a

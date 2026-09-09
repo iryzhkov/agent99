@@ -1943,25 +1943,42 @@ local function replace_symbol_lines(args)
     -- also does the search the caller would do next: when the expected text
     -- sits in exactly one place, it offers the relocated edit as a code
     -- action, so the fix is one apply_code_action call and no re-read.
-    local stale, relocated = {}, {}
+    local stale, relocated, narrow = {}, {}, {}
     for _, c in ipairs(chunks) do
         if c.expect ~= nil and not args.force then
             local want = vim.trim((c.expect:gsub("\n+$", "")))
+            local want_lines = vim.split(want, "\n", { plain = true })
             local have = vim.trim(table.concat(c.old, "\n"))
             -- Indentation alone is not drift: a format pass that re-indented
             -- the region left the same text on the same lines.
-            local moved = want ~= have
-                and indent_blind(vim.split(want, "\n", { plain = true })) ~= indent_blind(c.old)
+            local moved = want ~= have and indent_blind(want_lines) ~= indent_blind(c.old)
             if moved then
-                -- The relocated range is as long as the expected text, not
-                -- as long as the requested one: a caller who miscounted the
-                -- last line still meant the text it named.
                 local at, count, n, scope, hint_line, hint_text = locate_expected(bufnr, c.entry, want)
-                stale[#stale + 1] = { c = c, have = have, want = want, at = at,
-                    count = count, n = n, scope = scope,
+                -- An expect= that covers a different number of lines than the
+                -- range is a different mistake from a stale offset, and the
+                -- two must not be treated alike. Relocating a shorter expect
+                -- to wherever its text sits shrinks the edit to those lines:
+                -- a 79-line replacement guarded by its own first line becomes
+                -- a one-line replacement, and the other 78 lines stay where
+                -- they are, below the new text. Only an expect that covers
+                -- the whole range relocates; a length mismatch is refused,
+                -- and narrowing is offered as a code action instead.
+                local sized = #want_lines == #c.old
+                local head = not sized and #c.old > #want_lines
+                    and indent_blind(vim.list_slice(c.old, 1, #want_lines)) == indent_blind(want_lines)
+                stale[#stale + 1] = { c = c, have = have, want = want, at = at, want_n = #want_lines,
+                    count = count, n = n, scope = scope, sized = sized, head = head,
                     hint_line = hint_line, hint_text = hint_text }
-                if at then
+                if sized and at then
+                    -- The relocated range is as long as the expected text,
+                    -- which is also as long as the requested one.
                     relocated[c] = { first_line = at, last_line = at + n - 1, scope = scope }
+                elseif head then
+                    -- The range does hold the expected text, at its start:
+                    -- the numbers are not stale, expect= is short.
+                    narrow[c] = { first_line = c.first, last_line = c.first + #want_lines - 1, scope = "symbol" }
+                elseif at then
+                    narrow[c] = { first_line = at, last_line = at + n - 1, scope = scope }
                 end
             end
         end
@@ -2001,6 +2018,29 @@ local function replace_symbol_lines(args)
             return result
         end
         for _, s in ipairs(stale) do
+            if not s.sized then
+                -- Length mismatch: say both counts, and never narrow to the
+                -- shorter text on the caller's behalf.
+                lines[#lines + 1] = ("expect covers %d line(s), but lines %d-%d of %s cover %d, so it "
+                        .. "cannot say what the rest of the range holds.\nexpect: %s\nfound:  %s")
+                    :format(s.want_n, s.c.first, s.c.last, s.c.entry.path, #s.c.old,
+                        vim.inspect(s.want), vim.inspect(s.have))
+                if s.head then
+                    lines[#lines + 1] = ("lines %d-%d do start with that text, so the numbers are right and "
+                            .. "expect= is short: quote all %d lines in expect=, or replace only the %d it "
+                            .. "covers."):format(s.c.first, s.c.last, #s.c.old, s.want_n)
+                elseif s.at then
+                    local abs = s.c.entry.first + s.at - 1
+                    lines[#lines + 1] = ("the expected text is %d line(s) at buffer lines %d-%d, which is not "
+                            .. "the range that was asked for."):format(s.n, abs, abs + s.n - 1)
+                elseif s.count > 1 then
+                    lines[#lines + 1] = ("the expected text occurs %d times in the file; it names no single "
+                        .. "range."):format(s.count)
+                else
+                    lines[#lines + 1] = "the expected text is nowhere else either; re-read the region."
+                end
+                goto next_stale
+            end
             lines[#lines + 1] = ("lines %d-%d of %s do not hold the expected text, so the numbers are "
                     .. "probably from before an earlier edit shifted them.\nexpected: %s\nfound:    %s")
                 :format(s.c.first, s.c.last, s.c.entry.path, vim.inspect(s.want), vim.inspect(s.have))
@@ -2027,6 +2067,7 @@ local function replace_symbol_lines(args)
                 lines[#lines + 1] = ("the expected text is nowhere in %s; re-read it with find_symbol."):format(
                     where)
             end
+            ::next_stale::
         end
         local actions = {}
         if everywhere then
@@ -2037,6 +2078,25 @@ local function replace_symbol_lines(args)
                 title = "apply the same edit at the relocated lines",
                 args = relocated_args(args, chunks, relocated),
             }
+        end
+        -- Narrowing to the lines the expect text covers is a real intention
+        -- (a caller who miscounted the last line), just not one to guess at:
+        -- offered here, applied only when it is chosen.
+        local targeted, all_targeted = {}, true
+        for _, s in ipairs(stale) do
+            targeted[s.c] = relocated[s.c] or narrow[s.c]
+            if not targeted[s.c] then all_targeted = false end
+        end
+        if not everywhere and all_targeted then
+            local title = "replace only the lines each chunk's expect text covers"
+            if #stale == 1 then
+                local t = targeted[stale[1].c]
+                local abs_first = stale[1].c.entry.first + t.first_line - 1
+                local abs_last = stale[1].c.entry.first + t.last_line - 1
+                title = ("replace only the %d line(s) the expect text covers (buffer lines %d-%d)"):format(
+                    abs_last - abs_first + 1, abs_first, abs_last)
+            end
+            actions[#actions + 1] = { title = title, args = relocated_args(args, chunks, targeted) }
         end
         actions[#actions + 1] = {
             title = "apply at the requested lines anyway (ignore expect)",
@@ -2171,6 +2231,89 @@ local function insert_symbol_tool(where)
         return finish_edit(bufnr, args, before, entry.path, "insert_" .. where, row + 1, row,
             {}, #lines, { inserted = ("%s %s"):format(where, entry.path) })
     end
+end
+
+-- Insert text at a line, with no symbol to anchor it to. The symbol inserts
+-- cover everything that has a declaration to sit next to; a file whose first
+-- statement is a bare call has none, and prepending a guard to it used to
+-- mean quoting its first line into replace_symbol_lines, or falling back to
+-- a shell `cat`. `files` takes the same text to each of several files, which
+-- is how that guard reaches a directory of them in one call.
+local function insert_lines(args)
+    if type(args.text) ~= "string" or args.text == "" then
+        err("missing required argument: text")
+    end
+    local at = args.at
+    if at ~= nil and at ~= "start" and at ~= "end" then
+        err("at must be start or end")
+    end
+    local line = args.line ~= nil and tonumber(args.line) or nil
+    if line and at then
+        err("give line, or at=start/end, not both")
+    end
+    if not line and not at then
+        err("missing required argument: line (1-based; the text lands above that line), "
+            .. "or at=start/end")
+    end
+    local wanted = {}
+    if type(args.file) == "string" and args.file ~= "" then wanted[1] = args.file end
+    for _, f in ipairs(args.files or {}) do wanted[#wanted + 1] = f end
+    if #wanted == 0 then
+        err("missing required argument: file (or files, for the same text in several)")
+    end
+    local seen, files = {}, {}
+    for _, f in ipairs(wanted) do
+        local path = vim.fn.fnamemodify(f, ":p")
+        if not seen[path] then
+            seen[path] = true
+            files[#files + 1] = path
+        end
+    end
+    local lines = vim.split((args.text:gsub("\n+$", "")), "\n", { plain = true })
+    -- Every file is resolved and bounds-checked before any of them is
+    -- written, so a line number that is past the end of the fourth file
+    -- does not leave the first three edited.
+    local targets = {}
+    for _, path in ipairs(files) do
+        local bufnr = load_buf(path)
+        local total = vim.api.nvim_buf_line_count(bufnr)
+        local row -- 0-based insertion point
+        if at == "start" then
+            row = 0
+        elseif at == "end" then
+            row = total
+        else
+            if line < 1 or line > total + 1 then
+                err("%s: line %d is outside the file, which has %d lines (line %d appends)",
+                    rel_path(path), line, total, total + 1)
+            end
+            row = line - 1
+        end
+        local conflict = primary_region_conflict(bufnr, row + 1, row + 1)
+        if conflict then err("%s: %s", rel_path(path), conflict) end
+        targets[#targets + 1] = { bufnr = bufnr, row = row, path = path }
+    end
+    if args.dry_run then
+        local previews = {}
+        for _, t in ipairs(targets) do
+            previews[#previews + 1] = vim.tbl_extend("force",
+                { file = rel_path(t.path) },
+                preview_diff({}, lines, ("above line %d"):format(t.row + 1)))
+        end
+        if #previews == 1 then return previews[1] end
+        return { chunks = previews }
+    end
+    local reports = {}
+    for _, t in ipairs(targets) do
+        settle_before_edit(t.bufnr)
+        local before = diag_snapshot()
+        vim.api.nvim_buf_set_lines(t.bufnr, t.row, t.row, false, lines)
+        reports[#reports + 1] = finish_edit(t.bufnr, args, before,
+            ("%s:%d"):format(rel_path(t.path), t.row + 1), "insert_lines", t.row + 1, t.row,
+            {}, #lines, { inserted = ("%d line(s) above line %d"):format(#lines, t.row + 1) })
+    end
+    if #reports == 1 then return reports[1] end
+    return { files = #reports, reports = reports }
 end
 
 local function undo_edit(args)
@@ -2364,6 +2507,67 @@ local function pattern_files(args)
     return out
 end
 
+-- Characters that mean something in very magic mode which a caller quoting a
+-- line of code does not expect them to. `=` is the one that matters: it makes
+-- the atom before it optional, and most lines of code contain one, so an
+-- alternation of first-lines quietly matches only the branches without an `=`.
+local VERY_MAGIC_TRAPS = {
+    ["="] = "`=` makes the atom before it optional",
+    ["<"] = "`<` and `>` are word boundaries",
+    [">"] = "`<` and `>` are word boundaries",
+    ["@"] = "`@` introduces a lookaround or a multi",
+    ["{"] = "`{ }` is a count",
+    ["~"] = "`~` matches the text of the last substitution",
+}
+
+-- The trap characters a pattern uses unescaped, each explained once.
+local function very_magic_traps(pattern)
+    local seen, out = {}, {}
+    local i = 1
+    while i <= #pattern do
+        local c = pattern:sub(i, i)
+        if c == "\\" then
+            i = i + 2
+        else
+            local why = VERY_MAGIC_TRAPS[c]
+            if why and not seen[why] then
+                seen[why] = true
+                out[#out + 1] = why
+            end
+            i = i + 1
+        end
+    end
+    return out
+end
+
+-- A pattern's top-level alternatives: the branches of an unparenthesized
+-- `a|b|c`, which is how a caller asks for several unrelated lines in one
+-- call. Branches inside a group or a bracket expression are that group's
+-- business, and an escaped \| is a literal bar.
+local function top_level_alternatives(pattern)
+    local alts, start, depth, in_class, i = {}, 1, 0, false, 1
+    while i <= #pattern do
+        local c = pattern:sub(i, i)
+        if c == "\\" then
+            i = i + 1
+        elseif in_class then
+            if c == "]" then in_class = false end
+        elseif c == "[" then
+            in_class = true
+        elseif c == "(" then
+            depth = depth + 1
+        elseif c == ")" then
+            depth = depth - 1
+        elseif c == "|" and depth == 0 then
+            alts[#alts + 1] = pattern:sub(start, i - 1)
+            start = i + 1
+        end
+        i = i + 1
+    end
+    alts[#alts + 1] = pattern:sub(start)
+    return alts
+end
+
 -- The Vim regex a call's pattern and replacement become. literal=true means
 -- the caller wants the bytes it wrote and nothing about them read as syntax,
 -- on both sides; otherwise the pattern is very magic (\v), which is close to
@@ -2468,6 +2672,19 @@ local function replace_pattern(args)
             .. "(\\v), close to an extended regular expression; literal=true takes the "
             .. "text as bytes instead.", tostring(re):gsub("\n", " "))
     end
+    -- One dead branch in an alternation is a silent half-edit: the reply
+    -- says how many files matched, which looks like success whether all
+    -- seven alternatives worked or only the two without an `=` in them.
+    -- Count the branches one by one so the ones that matched nothing are
+    -- named, with what very magic did to them.
+    local alts = not args.literal and top_level_alternatives(pattern) or {}
+    if #alts < 2 then alts = {} end
+    local alt_pats, alt_hits = {}, {}
+    for k, a in ipairs(alts) do
+        alt_hits[k] = 0
+        local oka, ra = pcall(vim.regex, "\\C\\v^%(" .. a .. ")$")
+        alt_pats[k] = oka and ra or nil
+    end
     local files = pattern_files(args)
     local capped = 0
     if #files > MAX_PATTERN_FILES then
@@ -2506,6 +2723,13 @@ local function replace_pattern(args)
                     local out, from = {}, 0
                     for _, span in ipairs(spans) do
                         local want = true
+                        for k = 1, #alts do
+                            local ra = alt_pats[k]
+                            if ra and ra:match_str(line:sub(span[1] + 1, span[2])) then
+                                alt_hits[k] = alt_hits[k] + 1
+                                break
+                            end
+                        end
                         if kind then
                             local at = index.classify_hit(bufnr, i, span[1] + 1)
                             want = kind == "code"
@@ -2559,6 +2783,22 @@ local function replace_pattern(args)
         files = #per_file > 0 and per_file or nil,
         samples = #samples > 0 and samples or nil,
     }
+    if #alts > 0 then
+        local per_alt, dead = {}, {}
+        for k, a in ipairs(alts) do
+            per_alt[#per_alt + 1] = { pattern = a, matches = alt_hits[k] }
+            if alt_hits[k] == 0 then dead[#dead + 1] = a end
+        end
+        result.alternatives = per_alt
+        if #dead > 0 then
+            local traps = very_magic_traps(table.concat(dead, "|"))
+            result.alternatives_note = ("%d of the %d alternatives matched nothing: %s."):format(
+                    #dead, #alts, table.concat(dead, ", "))
+                .. (#traps > 0 and (" The pattern is a very magic (\\v) regex, where "
+                    .. table.concat(traps, ", ") .. ". Escape those characters, or pass "
+                    .. "literal=true to take the pattern as bytes.") or "")
+        end
+    end
     if skipped_total > 0 then
         result.left_alone = ("%d matches are inside a comment or a string literal and "
             .. "were not replaced (kind=%s)"):format(skipped_total, kind)
@@ -2582,6 +2822,13 @@ local function replace_pattern(args)
     if total == 0 then
         result.summary = "no replacements: nothing matched"
             .. (skipped_total > 0 and ", except in comments and string literals" or "")
+        if #alts == 0 and not args.literal then
+            local traps = very_magic_traps(pattern)
+            if #traps > 0 then
+                result.hint = ("the pattern is a very magic (\\v) regex, where " .. table.concat(traps, ", ")
+                    .. ". Escape those characters, or pass literal=true to take the pattern as bytes.")
+            end
+        end
         return result
     end
     if args.dry_run then
@@ -3131,6 +3378,7 @@ M.apply_code_action = apply_code_action
 M.replace_symbol_body = replace_symbol_body
 M.replace_symbol_lines = replace_symbol_lines
 M.insert_symbol_tool = insert_symbol_tool
+M.insert_lines = insert_lines
 M.undo_edit = undo_edit
 M.rename_symbol = rename_symbol
 M.replace_pattern = replace_pattern

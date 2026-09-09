@@ -39,6 +39,7 @@ local edit = require("agent99.edit")
 local code_actions, apply_code_action = edit.code_actions, edit.apply_code_action
 local replace_symbol_body, replace_symbol_lines = edit.replace_symbol_body, edit.replace_symbol_lines
 local insert_symbol_tool, undo_edit, rename_symbol = edit.insert_symbol_tool, edit.undo_edit, edit.rename_symbol
+local insert_lines = edit.insert_lines
 local create_file, move_file, delete_file, move_symbols = edit.create_file, edit.move_file, edit.delete_file,
     edit.move_symbols
 local replace_pattern = edit.replace_pattern
@@ -886,6 +887,7 @@ local dispatch_table = {
     replace_symbol_lines = replace_symbol_lines,
     insert_after_symbol = insert_symbol_tool("after"),
     insert_before_symbol = insert_symbol_tool("before"),
+    insert_lines = insert_lines,
     undo_edit = undo_edit,
     rename_symbol = rename_symbol,
     replace_pattern = replace_pattern,

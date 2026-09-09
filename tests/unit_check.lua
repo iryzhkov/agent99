@@ -1,0 +1,84 @@
+-- Unit checks for the commands check_project guesses from a project's
+-- files. Driven by scratch directories rather than by running anything: the
+-- point is which command is chosen, and running it would need the toolchain
+-- of every language the guess covers.
+--
+-- Run with: nvim --clean --headless -u tests/minimal_init.lua -l tests/unit_check.lua
+
+local install = require("agent99.install")
+
+local failures = 0
+
+local function check(name, ok, detail)
+    if ok then
+        io.stdout:write("ok   " .. name .. "\n")
+    else
+        failures = failures + 1
+        io.stdout:write("FAIL " .. name .. (detail and ("\n     " .. vim.inspect(detail)) or "") .. "\n")
+    end
+    io.stdout:flush()
+end
+
+local function scratch(files)
+    local root = vim.fn.tempname()
+    vim.fn.mkdir(root, "p")
+    for name, contents in pairs(files) do
+        local dir = vim.fn.fnamemodify(root .. "/" .. name, ":h")
+        vim.fn.mkdir(dir, "p")
+        if contents ~= false then
+            vim.fn.writefile(vim.split(contents, "\n", { plain = true }), root .. "/" .. name)
+        end
+    end
+    return root
+end
+
+local function commands(root)
+    local out = {}
+    for _, g in ipairs(install.guess_check_command(root)) do
+        out[#out + 1] = g.cmd
+    end
+    return out
+end
+
+local function any(list, text)
+    for _, cmd in ipairs(list) do
+        if cmd:find(text, 1, true) then return true end
+    end
+    return false
+end
+
+-- A Neovim configuration: init.lua next to the runtime directories Neovim
+-- itself loads. Its real breakage is load-time, so the guess starts Neovim
+-- with that init on top of the syntax check every Lua project gets.
+local config_root = scratch({
+    ["init.lua"] = 'require("user.options")',
+    ["lua/user/options.lua"] = "return {}",
+    ["after/plugin/theme.lua"] = 'vim.cmd("colorscheme default")',
+})
+local config_cmds = commands(config_root)
+check("a Neovim config is checked by starting Neovim",
+    vim.fn.executable("nvim") == 0
+    or (any(config_cmds, "nvim --headless -u init.lua") and any(config_cmds, "messages")),
+    config_cmds)
+check("a Neovim config still gets the Lua syntax check",
+    any(config_cmds, "luac") or any(config_cmds, "luacheck"), config_cmds)
+vim.fn.delete(config_root, "rf")
+
+-- A Lua library with an init.lua of its own is not a configuration, and
+-- starting Neovim with it as the init would prove nothing about it.
+local lib_root = scratch({
+    ["init.lua"] = "return require('lib.core')",
+    ["lua/lib/core.lua"] = "return {}",
+})
+local lib_cmds = commands(lib_root)
+check("a plain Lua project is not started as a config",
+    not any(lib_cmds, "nvim --headless"), lib_cmds)
+vim.fn.delete(lib_root, "rf")
+
+if failures > 0 then
+    io.stdout:write(("unit_check: %d failed\n"):format(failures))
+    vim.cmd("cquit 1")
+end
+io.stdout:write("unit_check: OK\n")
+io.stdout:flush()
+vim.cmd("quit")

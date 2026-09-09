@@ -358,7 +358,7 @@ var lspTools = []tool{
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"pattern":     map[string]any{"type": "string", "description": "Vim regex in very magic mode, or plain text with literal=true. Matches within one line."},
+				"pattern":     map[string]any{"type": "string", "description": "Vim regex in very magic mode, or plain text with literal=true. Matches within one line. In very magic mode = makes the atom before it optional and < > are word boundaries, so a pattern quoting a line of code has to escape them (\\=, \\<) or pass literal=true; an alternation reports how many times each branch matched, and a branch that matched nothing is named."},
 				"replacement": map[string]any{"type": "string", "description": "What each match becomes; \"\" deletes it. \\1..\\9 are the pattern's groups unless literal=true."},
 				"literal":     map[string]any{"type": "boolean", "description": "Take both pattern and replacement as plain text, with nothing in them read as regex syntax."},
 				"files": map[string]any{
@@ -402,6 +402,30 @@ var lspTools = []tool{
 				"text":      map[string]any{"type": "string", "description": "Source to insert."},
 			},
 			"required": []string{"file", "name_path", "text"},
+		},
+	},
+	{
+		Name:        "insert_lines",
+		Description: "Insert source at a line, where there is no symbol to anchor it to: the top of a file whose first statement is a bare call, the end of a list. line=N puts the text above line N (1-based, as read_file and grep report lines); at=start/end is the same without having to know the file's length. files= takes the same text to several files in one call, so one guard reaches a directory of them. Applied and saved to disk immediately.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"file": map[string]any{"type": "string", "description": "File to insert into (absolute or relative to root)."},
+				"files": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Several files to insert the same text into, each at the same place.",
+				},
+				"line": map[string]any{"type": "integer", "description": "1-based buffer line; the text lands above it, so line=1 prepends. One past the last line appends. Alternative to at."},
+				"at": map[string]any{
+					"type":        "string",
+					"enum":        []string{"start", "end"},
+					"description": "Insert at the top or the bottom of each file, whatever its length. Alternative to line.",
+				},
+				"text":    map[string]any{"type": "string", "description": "Source to insert. It lands as given; no blank line is added around it."},
+				"dry_run": map[string]any{"type": "boolean", "description": "Show a unified diff of the insertion without applying it."},
+			},
+			"required": []string{"text"},
 		},
 	},
 	{
@@ -769,6 +793,7 @@ var writingTools = map[string]bool{
 	"replace_symbol_lines": true,
 	"insert_after_symbol":  true,
 	"insert_before_symbol": true,
+	"insert_lines":         true,
 }
 
 // The edit tools that run the server's formatter over what they wrote when
@@ -779,6 +804,7 @@ var formattingTools = map[string]bool{
 	"replace_symbol_lines": true,
 	"insert_after_symbol":  true,
 	"insert_before_symbol": true,
+	"insert_lines":         true,
 	"create_file":          true,
 	"move_symbols":         true,
 }
