@@ -1351,14 +1351,21 @@ local function code_actions(args)
     action_token = action_token + 1
     local token = tostring(action_token)
     action_cache[token] = { client_id = client.id, bufnr = bufnr, actions = result }
-    local out = {}
+    -- Servers repeat themselves: gopls offered "Remove variable trimmed"
+    -- twice for one diagnostic, at indices 1 and 2, which reads as two
+    -- different fixes. The first of each title keeps its index.
+    local out, seen = {}, {}
     for i, a in ipairs(result) do
-        out[i] = {
-            index = i,
-            title = a.title,
-            kind = a.kind,
-            preferred = a.isPreferred or nil,
-        }
+        local key = (a.title or "") .. "\0" .. (a.kind or "")
+        if not seen[key] then
+            seen[key] = true
+            out[#out + 1] = {
+                index = i,
+                title = a.title,
+                kind = a.kind,
+                preferred = a.isPreferred or nil,
+            }
+        end
     end
     return {
         token = token,
@@ -1614,7 +1621,23 @@ end
 -- otherwise apply immediately. rename_symbol has always been able to show its
 -- blast radius before committing to it; a large body replacement is no less
 -- worth looking at first.
-local function preview_diff(old_lines, new_lines, label)
+local function preview_diff(old_lines, new_lines, label, at)
+    -- An insertion has no old side, and a unified diff of "" against the new
+    -- text renders as a replacement of line 1: "@@ -1 +1 @@" with a "-" for
+    -- a blank line that does not exist, whatever line the text is going to.
+    -- Four separate runs read that as "line 1 will be deleted".
+    if #old_lines == 0 then
+        local shown = {}
+        for i, l in ipairs(new_lines) do
+            shown[i] = "+" .. l
+        end
+        return {
+            dry_run = true,
+            inserted = label,
+            diff = vim.list_extend({ ("@@ %s @@"):format(at or label) }, shown),
+            note = "nothing applied; call again without dry_run to make the edit",
+        }
+    end
     local diff = text_diff(
         table.concat(old_lines, "\n") .. "\n",
         table.concat(new_lines, "\n") .. "\n",
@@ -2431,7 +2454,8 @@ local function insert_lines(args)
         for _, t in ipairs(targets) do
             previews[#previews + 1] = vim.tbl_extend("force",
                 { file = rel_path(t.path) },
-                preview_diff({}, lines, ("above line %d"):format(t.row + 1)))
+                preview_diff({}, lines, ("%d line(s) above line %d"):format(#lines, t.row + 1),
+                    ("+%d,%d"):format(t.row + 1, #lines)))
         end
         if #previews == 1 then return previews[1] end
         return { chunks = previews }
@@ -2940,8 +2964,14 @@ local function replace_pattern(args)
         end
     end
     if skipped_total > 0 then
-        result.left_alone = ("%d matches are inside a comment or a string literal and "
-            .. "were not replaced (kind=%s)"):format(skipped_total, kind)
+        -- The sentence used to be written for kind=code whatever the filter
+        -- was, so kind=string reported its skipped *code* matches as "inside
+        -- a comment or a string literal".
+        result.left_alone = kind == "code"
+            and ("%d matches are inside a comment or a string literal and were not replaced "
+                .. "(kind=code)"):format(skipped_total)
+            or ("%d matches are not %s and were not replaced (kind=%s)")
+            :format(skipped_total, kind == "comment" and "in a comment" or "in a string literal", kind)
     end
     if #unreadable > 0 then
         result.unreadable = unreadable
@@ -3282,6 +3312,17 @@ local function move_file(args)
     if #touched > 0 then
         result.updated_by_server = touched
         result.updated_note = "the language server rewrote references to the old path"
+    else
+        -- Silence here read as "nothing needed changing", and the reply's
+        -- "no new errors or warnings" agreed with it: a Lua config whose
+        -- three `require("iryzhkov.theme")` call sites now pointed at a
+        -- module that no longer existed was reported clean, because a
+        -- require argument is a string and no diagnostic covers it.
+        result.updated_by_server = nil
+        result.updated_note = "the language server rewrote nothing: either no file referred to "
+            .. "the old path, or this language addresses modules by a name the server does not "
+            .. "rename (a Lua require, a Python import string). Check the callers yourself - "
+            .. "grep for the old module path - because no diagnostic covers it."
     end
     return vim.tbl_extend("force", result,
         post_edit_report(bufnr, before, args.root, args.headless, nil, args.full_diagnostics))
@@ -3332,8 +3373,15 @@ local function delete_file(args)
         end,
     })
 
+    -- readfile in binary mode ends with an empty string for a file that
+    -- ends in a newline, which every text file does: a 9-line file was
+    -- reported as 10.
+    local line_count = #contents
+    if line_count > 0 and contents[line_count] == "" then
+        line_count = line_count - 1
+    end
     local result = {
-        deleted = rel_path(path), lines = #contents, note = edit_note(args),
+        deleted = rel_path(path), lines = line_count, note = edit_note(args),
         restorable = "undo_edit puts it back with its contents",
     }
     if #touched > 0 then
@@ -3343,6 +3391,29 @@ local function delete_file(args)
     local report = post_edit_report(nil, before, args.root, args.headless, nil, args.full_diagnostics)
     report.file = nil
     return vim.tbl_extend("force", result, report)
+end
+
+-- The row (0-based, as an insertion point) of a module's trailing `return`
+-- statement, when its last top-level statement is one. Lua modules end that
+-- way, and so do older JavaScript ones; anything appended below it is dead
+-- code the parser rejects.
+local function trailing_return_row(bufnr)
+    local okp, parser = pcall(vim.treesitter.get_parser, bufnr)
+    if not okp or not parser then return nil end
+    local okt, trees = pcall(function() return parser:parse() end)
+    if not okt or not trees or not trees[1] then return nil end
+    local root = trees[1]:root()
+    local last
+    for child in root:iter_children() do
+        if child:named() and child:type() ~= "comment" then
+            last = child
+        end
+    end
+    if not last or not last:type():find("return", 1, true) then
+        return nil
+    end
+    local srow = last:range()
+    return srow
 end
 
 -- Move whole symbols from one file to another.
@@ -3492,6 +3563,24 @@ local function move_symbols(args)
         vim.list_extend(appended, block)
     end
     local at = empty_dest and 0 or #to_before
+    -- A module whose last statement returns it ends there: `return M` in Lua,
+    -- the same shape in JavaScript. Appending after that line is unreachable
+    -- at best and a syntax error at worst - moving a function into a Lua
+    -- module put it below `return M` and broke the file every time. Land
+    -- above the return instead.
+    local tail_return = not empty_dest and trailing_return_row(to_buf) or nil
+    if tail_return then
+        at = tail_return
+        appended = {}
+        for _, block in ipairs(blocks) do
+            if #appended > 0 then appended[#appended + 1] = "" end
+            vim.list_extend(appended, block)
+        end
+        if at > 0 and (to_before[at] or "") ~= "" then
+            table.insert(appended, 1, "")
+        end
+        appended[#appended + 1] = ""
+    end
     vim.api.nvim_buf_set_lines(to_buf, at, empty_dest and #to_before or at, false, appended)
     for i = #moving, 1, -1 do
         vim.api.nvim_buf_set_lines(from_buf, moving[i].first - 1, moving[i].last, false, {})
@@ -3505,6 +3594,13 @@ local function move_symbols(args)
     if args.headless then
         save_all()
     end
+    -- The polish above added the imports the moved code needs and took away
+    -- the ones the source no longer uses. Without waiting for the servers to
+    -- catch up with that, the report below is read off the diagnostics they
+    -- published mid-move: nine "undefined" errors were reported for a file
+    -- that compiled, and retracted 115 ms later as late_diagnostics.
+    settle_before_edit(to_buf)
+    settle_before_edit(from_buf)
 
     -- Whole-file entries for both, so undo_edit puts the split back. Both of
     -- them plus the destination's create belong to one undo step: undoing

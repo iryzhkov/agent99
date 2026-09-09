@@ -175,6 +175,34 @@ check("go: a failure with the detail on the next line carries a message",
     go_testify[1] and go_testify[1].line == 1077
     and (go_testify[1].message or ""):find("Error Trace") ~= nil, go_testify)
 
+-- python -m unittest had no parser: a failing run answered "no failures
+-- parsed from the output" and the baseline stored every output line.
+local unittest_out = lines([[
+test_alpha (probe.test_plain.PlainTest.test_alpha) ... ok
+test_beta (probe.test_plain.PlainTest.test_beta) ... FAIL
+
+======================================================================
+FAIL: test_beta (probe.test_plain.PlainTest.test_beta)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/repo/probe/test_plain.py", line 12, in test_beta
+    self.assertEqual(2, 3)
+AssertionError: 2 != 3
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.001s
+
+FAILED (failures=1)]])
+local ut = testrun.parse_failures("unittest", unittest_out, "/repo", 1)
+check("unittest: the failing test is named with its file and line",
+    #ut == 1 and ut[1].test == "test_beta" and ut[1].line == 12
+    and ut[1].file == "/repo/probe/test_plain.py"
+    and (ut[1].message or ""):find("2 != 3") ~= nil, ut)
+
+local sniffed = testrun.parse_failures(nil, unittest_out, "/repo", 1)
+check("unittest output is recognised without being told the runner",
+    #sniffed == 1 and sniffed[1].test == "test_beta", sniffed)
+
 if failures > 0 then
     io.stdout:write(("unit_testrun: %d failed\n"):format(failures))
     vim.cmd("cquit 1")

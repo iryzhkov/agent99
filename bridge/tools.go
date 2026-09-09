@@ -225,6 +225,16 @@ func runGrep(ses session, args map[string]any) (string, error) {
 	}
 	ctxArg := fmt.Sprintf("-C%d", ctx)
 	glob, _ := args["glob"].(string)
+	// files= was accepted and dropped: one file was asked for and three came
+	// back, from the whole tree.
+	var namedFiles []string
+	if list, ok := args["files"].([]any); ok {
+		for _, v := range list {
+			if s, ok := v.(string); ok && s != "" {
+				namedFiles = append(namedFiles, resolveInRoot(root, s))
+			}
+		}
+	}
 	blame, _ := args["blame"].(bool)
 	asText, _ := args["text"].(bool)
 	tests, _ := args["tests"].(string)
@@ -253,6 +263,19 @@ func runGrep(ses session, args map[string]any) (string, error) {
 	} else {
 		searchDir, searchTarget = "", target
 	}
+	// The targets the searcher is given: the files named, else the path (or
+	// the root) the call scoped itself to.
+	searchTargets := []string{searchTarget}
+	if len(namedFiles) > 0 {
+		searchTargets = nil
+		for _, f := range namedFiles {
+			if rel, err := filepath.Rel(searchDir, f); err == nil && !strings.HasPrefix(rel, "..") {
+				searchTargets = append(searchTargets, rel)
+			} else {
+				searchTargets = append(searchTargets, f)
+			}
+		}
+	}
 	ctxCancel, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var cmd *exec.Cmd
@@ -278,7 +301,8 @@ func runGrep(ses session, args map[string]any) (string, error) {
 		if glob != "" {
 			cargs = append(cargs, "-g", glob)
 		}
-		cargs = append(cargs, "-e", pattern, searchTarget)
+		cargs = append(cargs, "-e", pattern)
+		cargs = append(cargs, searchTargets...)
 		cmd = exec.CommandContext(ctxCancel, "rg", cargs...)
 	} else {
 		cargs := []string{"-rnHE", ctxArg}
@@ -290,7 +314,8 @@ func runGrep(ses session, args map[string]any) (string, error) {
 		if glob != "" {
 			cargs = append(cargs, "--include="+glob)
 		}
-		cargs = append(cargs, "-e", pattern, searchTarget)
+		cargs = append(cargs, "-e", pattern)
+		cargs = append(cargs, searchTargets...)
 		cmd = exec.CommandContext(ctxCancel, "grep", cargs...)
 	}
 	cmd.Dir = searchDir
@@ -397,6 +422,15 @@ func runGrep(ses session, args map[string]any) (string, error) {
 			if len(stoppedEarly) > 0 {
 				return binaryNote(stoppedEarly), nil
 			}
+			// A glob that matches no file at all answers the same as a
+			// pattern that is not in the code, and the two need different
+			// fixes. find_symbol and workspace_map say which; this said
+			// "(no matches)" and left a typo'd glob looking like an answer.
+			if glob != "" && usedRg && !globMatchesAnything(glob, searchDir, searchTargets) {
+				return fmt.Sprintf("(no matches: the glob %q matched no files under %s, so "+
+					"nothing was searched. A glob is matched against the path from the root, "+
+					"so subdirectories need a \"**/\" prefix)", glob, rel(root, searchDir)), nil
+			}
 			return "(no matches)", nil
 		}
 		detail := stderr.String()
@@ -445,6 +479,26 @@ func runGrep(ses session, args map[string]any) (string, error) {
 		return "(no matches)", nil
 	}
 	return strings.Join(append(lines, notes...), "\n"), nil
+}
+
+// Whether a glob matches any file at all in the search scope.
+func globMatchesAnything(glob, dir string, targets []string) bool {
+	args := append([]string{"--files", "-g", glob}, targets...)
+	cmd := exec.Command("rg", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
+}
+
+// A path for a message: relative to the root when it is under it.
+func rel(root, path string) string {
+	if r, err := filepath.Rel(root, path); err == nil && !strings.HasPrefix(r, "..") {
+		if r == "." {
+			return filepath.Base(root)
+		}
+		return r
+	}
+	return path
 }
 
 // The files a search matches only when they are read as text: those holding

@@ -590,6 +590,12 @@ def group_index(c):
                 "        color: \"black\"\n"
                 "    }\n"
                 "}\n")
+    res = b.call("workspace_map", {"glob": "Panel.qml"})
+    mapped = next((f for f in res.get("files", []) if f["file"].endswith("Panel.qml")), None)
+    if mapped and mapped.get("outline"):
+        check("the map descends into a QML object",
+              len(mapped["outline"]) > 1
+              and any("property string label" in line for line in mapped["outline"]), res)
     res = b.call("skim", {"files": [qml]})
     entry = res["files"][0]
     outline = entry.get("outline", [])
@@ -1603,6 +1609,20 @@ def group_search(c):
     util, main_lua, tools = c.util, c.main_lua, c.tools
 
     reset(c)
+    # files= was accepted and ignored: one file asked for, three returned.
+    r = b.rpc("tools/call", {"name": "grep", "arguments": {
+        "pattern": "greet", "files": [os.path.join(root, "lua", "testproj", "util.lua")]}})
+    only = r["result"]["content"][0]["text"]
+    check("grep searches only the files it was given",
+          "util.lua" in only and "main.lua" not in only, only)
+    # A glob that matches nothing is a different answer from a pattern that
+    # is not there, and needs a different fix.
+    r = b.rpc("tools/call", {"name": "grep", "arguments": {
+        "pattern": "greet", "glob": "nosuchdir/**/*.lua"}})
+    empty = r["result"]["content"][0]["text"]
+    check("a glob that matches no files says so",
+          "matched no files" in empty, empty)
+
     # A match inside a string literal that sits on a declaration's own line:
     # calling the whole declaration line "def" kept it under kind=code, which
     # is the one thing that filter exists to drop.
@@ -1673,7 +1693,7 @@ def group_search(c):
     reply = b.rpc("tools/call", {"name": "grep", "arguments": {
         "pattern": "M.greet", "glob": "nosuch/**/*.lua", "context": 0}})
     check("grep path glob excludes",
-          reply["result"]["content"][0]["text"] == "(no matches)", reply)
+          "matched no files" in reply["result"]["content"][0]["text"], reply)
 
     # grep filters. The project has no test file of its own, so one is
     # added here: tests= is matched on the path, and kind= on what the
@@ -1829,6 +1849,26 @@ def group_files(c):
     check("undo_edit removes a destination the move created",
           not os.path.exists(split), os.path.exists(split) and open(split).read())
     os.path.exists(split) and os.remove(split)
+
+    # A Lua module ends with `return M`; appending below it is a syntax
+    # error, and the move did that every time.
+    reset(c)
+    dest = os.path.join(root, "lua", "testproj", "helpers.lua")
+    with open(dest, "w") as f:
+        f.write("local H = {}\n\nfunction H.keep()\n    return 1\nend\n\nreturn H\n")
+    res = b.call("move_symbols", {"from": util, "to": dest, "names": ["M.shout"]})
+    moved_text = open(dest).read()
+    # The move does not requalify identifiers, so `M` is undefined in the
+    # destination - which the reply says. What matters here is that the
+    # symbol went above the return rather than below it.
+    check("a symbol moved into a Lua module lands above its return",
+          moved_text.rstrip().endswith("return H")
+          and "function M.shout" in moved_text
+          and moved_text.index("function M.shout") < moved_text.index("return H"),
+          (res, moved_text))
+    b.call("undo_edit", {"all": True})
+    os.path.exists(dest) and os.remove(dest)
+    reset(c)
 
     try:
         b.call("move_symbols", {"from": util, "to": util, "names": ["M.greet"]})

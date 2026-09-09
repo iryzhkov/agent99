@@ -558,7 +558,12 @@ var fileTools = []tool{
 				},
 				"context": map[string]any{"type": "integer", "description": "Context lines around each match (default 2, max 10)."},
 				"blame":   map[string]any{"type": "boolean", "description": "Add git blame age per hit (slower)."},
-				"text":    map[string]any{"type": "boolean", "description": "Search files holding a NUL byte in full. Without it the searcher stops at the first match in such a file - a source file with one stray NUL is searched no further - and the reply names the files it gave up on."},
+				"files": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Search only these files, instead of walking path=.",
+				},
+				"text": map[string]any{"type": "boolean", "description": "Search files holding a NUL byte in full. Without it the searcher stops at the first match in such a file - a source file with one stray NUL is searched no further - and the reply names the files it gave up on."},
 			},
 			"required": []string{"pattern"},
 		},

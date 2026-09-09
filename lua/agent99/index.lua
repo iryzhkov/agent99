@@ -122,6 +122,10 @@ end
 -- body is statements. The workspace map descends into these one level.
 local TS_CONTAINER = {
     class = true,
+    -- A QML object holds the properties, signals and objects under it, and
+    -- workspace_map descends one level into a container: without this a
+    -- 1419-line component was one line of map, "20: Item {".
+    ui_object_definition = true,
     struct = true,
     interface = true,
     impl = true,
@@ -204,6 +208,12 @@ local function ts_container(node_type, ft)
     local data = data_nodes(ft)
     if data then
         return data[node_type] == true
+    end
+    -- Whole node types first: a QML "ui_object_definition" has no segment
+    -- that says "container", and matching by segment alone left the map with
+    -- one line per QML file.
+    if TS_CONTAINER[node_type] then
+        return true
     end
     local container = false
     for segment in node_type:gmatch("[^_]+") do
@@ -406,7 +416,16 @@ local function ts_query(args)
             .. "grammar - the skim tool shows which constructs exist in a file.",
             first_query_error:gsub("\n", " "))
     end
-    local res = { count = #matches, matches = matches }
+    -- One match can produce several captures, and each is an entry: a query
+    -- with two @captures over 38 call sites reported "count: 76".
+    local places = {}
+    for _, m in ipairs(matches) do
+        places[("%s:%d"):format(m.file, m.line)] = true
+    end
+    local res = { count = #matches, places = vim.tbl_count(places), matches = matches }
+    if res.places ~= res.count then
+        res.count_note = ("count is captures; the query matched %d place(s)"):format(res.places)
+    end
     if #skipped > 0 then
         res.skipped = skipped
     end
@@ -452,6 +471,18 @@ local function skim(args)
                 local opts = { drop_values = true }
                 local flat = flatten_symbols(syms, 0, {}, bufnr, opts)
                 dropped_values = opts.dropped or 0
+                -- Some servers answer alphabetically (pyright does), which
+                -- reads as a shuffled file; and an outline is a map, so it
+                -- takes the same cap the treesitter one has.
+                table.sort(flat, function(a, b)
+                    return (tonumber(a:match("^%s*(%d+)")) or 0) < (tonumber(b:match("^%s*(%d+)")) or 0)
+                end)
+                if #flat > MAX_SKIM_ENTRIES then
+                    local extra = #flat - MAX_SKIM_ENTRIES
+                    flat = vim.list_slice(flat, 1, MAX_SKIM_ENTRIES)
+                    flat[#flat + 1] = ("… +%d more declarations; find_symbol or read_file with "
+                        .. "offset reach them"):format(extra)
+                end
                 return #flat > 0 and flat or nil
             end
             local outline

@@ -177,12 +177,19 @@ local function quick_fix_titles(bufnr, client, d)
     if not ok or not actions or #actions == 0 then
         return nil
     end
-    local titles = {}
+    local titles, seen = {}, {}
     for _, a in ipairs(actions) do
-        -- lua_ls and friends offer "Disable diagnostics ..." actions; those
-        -- silence the problem instead of fixing it and must not be sold to
-        -- the model as quick fixes.
-        if not a.title:find("^Disable diagnostics") and not a.title:find("^Ignore ") then
+        -- Only actions the server itself calls a fix. A server that answers
+        -- a diagnostic-scoped request with its whole refactor menu offered
+        -- "Convert default export to named export" as the fix for a type
+        -- error, and the note above tells the caller to apply it. lua_ls and
+        -- friends also offer "Disable diagnostics ...", which silences the
+        -- problem rather than fixing it.
+        local kind = a.kind or ""
+        local fixes = kind == "" or kind:sub(1, 8) == "quickfix" or kind:sub(1, 6) == "source"
+        if fixes and not seen[a.title]
+            and not a.title:find("^Disable diagnostics") and not a.title:find("^Ignore ") then
+            seen[a.title] = true
             titles[#titles + 1] = a.title
             if #titles == 3 then break end
         end

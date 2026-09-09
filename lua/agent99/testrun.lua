@@ -252,6 +252,48 @@ local function parse_cargo(lines)
     return failures
 end
 
+-- `python -m unittest` prints "FAIL: name (module.Class.name)" and a
+-- traceback whose last "File ..., line N" is the assertion. It had no parser
+-- at all, so a failing run answered "exit 1; no failures parsed from the
+-- output" and the baseline quietly stored every line of output as a failure.
+local function parse_unittest(lines)
+    local failures, current = {}, nil
+    for _, l in ipairs(lines) do
+        local kind, name, where = l:match("^(%u+): ([%w_]+) %(([^)]+)%)")
+        if kind == "FAIL" or kind == "ERROR" then
+            current = { test = name, message = kind == "ERROR" and "error" or nil }
+            -- The dotted path names the module the test lives in.
+            local module = where:match("^([%w_%.]+)"):gsub("%.[%w_]+$", "")
+            current.file = (module:gsub("%.", "/")) .. ".py"
+            failures[#failures + 1] = current
+        elseif current then
+            local file, line = l:match('^%s*File "([^"]+)", line (%d+)')
+            if file and not file:match("/unittest/") then
+                current.file, current.line = file, tonumber(line)
+            end
+            local detail = l:match("^(%u%w+Error: .*)$") or l:match("^(AssertionError: .*)$")
+            if detail then
+                current.message = detail
+                current = nil
+            end
+        end
+    end
+    return failures
+end
+
+-- Whether a run executed no test at all. A filter that matches nothing exits
+-- 0 with a note, which read as "all passing" - a typo in filter= was a green
+-- verification.
+local function ran_nothing(lines)
+    for _, l in ipairs(lines) do
+        if l:match("no tests to run") or l:match("^Ran 0 tests")
+            or l:match("no test files") or l:match("0 passed") and l:match("no tests ran") then
+            return true
+        end
+    end
+    return false
+end
+
 -- A generic sweep for runners without a parser: any "path:line" on a line
 -- that also says fail/error/assert, so a failure still gets a location.
 local function parse_generic(lines, root, exit_code)
@@ -264,7 +306,11 @@ local function parse_generic(lines, root, exit_code)
         return {}
     end
     local failures, seen = {}, {}
+    -- A prose sweep can match a whole page of output, and the baseline then
+    -- stores every line of it as a failing test.
+    local GENERIC_MAX = 20
     for _, l in ipairs(lines) do
+        if #failures >= GENERIC_MAX then break end
         local lower = l:lower()
         local warning = l:match("%f[%w][%w_]*Warning:%s") ~= nil
         if not warning and (lower:match("fail") or lower:match("error") or lower:match("assert")) then
@@ -291,6 +337,7 @@ local function detect_runner(cmd)
         return "js"
     end
     if cmd:match("busted") then return "busted" end
+    if cmd:match("unittest") then return "unittest" end
     return nil
 end
 
@@ -299,12 +346,16 @@ local function parse_failures(runner, lines, root, exit_code)
     if runner == "pytest" then return parse_pytest(lines) end
     if runner == "js" then return parse_js(lines) end
     if runner == "cargo" then return parse_cargo(lines) end
+    if runner == "unittest" then return parse_unittest(lines) end
     -- make and busted: the Makefile's target runs whatever it runs; sniff
     -- the output for the runner it turned out to be.
     for _, l in ipairs(lines) do
         if l:match("^%s*%-%-%- FAIL: ") or l:match("^ok%s+%S+%s+[%d.]+s") then return parse_go(lines) end
         if l:match("^FAILED %S+::") or l:match("^=+ .* passed") then return parse_pytest(lines) end
         if l:match("^test %S+ %.%.%. ") then return parse_cargo(lines) end
+        if l:match("^%u+: [%w_]+ %([%w_%.]+%)") or l:match("^Ran %d+ tests? in") then
+            return parse_unittest(lines)
+        end
         if l:match("^%s*[✕✗×●] ") or l:match("^%s*Tests:%s+%d") then return parse_js(lines) end
     end
     return parse_generic(lines, root, exit_code), nil
@@ -496,7 +547,10 @@ local function run_tests(args)
         out.baseline_failures = #base
         out.new_failures = new
         out.fixed = fixed
-        if result.code == 0 then
+        if result.code == 0 and ran_nothing(lines) then
+            out.summary = "no tests ran: the command matched none. A filter that matches nothing "
+                .. "exits 0, which is not the same as passing"
+        elseif result.code == 0 then
             out.summary = #fixed > 0 and ("all passing; %d fixed since the baseline"):format(#fixed) or "all passing"
         elseif #new == 0 and #fixed == 0 then
             out.summary = ("still failing as at the baseline (%d)"):format(#now_set)
@@ -516,6 +570,9 @@ local function run_tests(args)
             if #lines > OUTPUT_MAX_LINES then out.output_truncated = #lines - OUTPUT_MAX_LINES end
             out.summary = #failures > 0 and ("%d failing"):format(#failures)
                 or ("exit %d; no failures parsed from the output, see output"):format(result.code)
+        elseif ran_nothing(lines) then
+            out.summary = "no tests ran: the command matched none. A filter that matches nothing "
+                .. "exits 0, which is not the same as passing"
         else
             out.summary = passed and ("all passing (%d)"):format(passed) or "all passing"
         end
