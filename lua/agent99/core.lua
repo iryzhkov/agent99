@@ -444,7 +444,32 @@ local function load_buf(file)
     end
     local path = vim.fn.fnamemodify(file, ":p")
     if vim.fn.filereadable(path) == 0 then
-        err("file not readable: %s", path)
+        if vim.fn.isdirectory(path) == 1 then
+            err("%s is a directory, not a file", path)
+        end
+        if vim.fn.getftype(path) ~= "" then
+            err("file not readable: %s", path)
+        end
+        -- A guessed path - the site's own override of a theme layout, the
+        -- src/ twin of a file that lives at the root - is the common way
+        -- here. Naming the files that share its basename answers the
+        -- guess in the same reply, instead of leaving the caller to try
+        -- the next path it can think of.
+        local root = vim.fn.getcwd()
+        local base = vim.fn.fnamemodify(path, ":t")
+        local twins = {}
+        for _, rel in ipairs(project_files(root)) do
+            if vim.fn.fnamemodify(rel, ":t") == base then
+                twins[#twins + 1] = rel
+                if #twins == 5 then break end
+            end
+        end
+        if #twins > 0 then
+            err("no such file: %s. Files named %s in the workspace: %s",
+                path, base, table.concat(twins, ", "))
+        end
+        err("no such file: %s, and nothing named %s anywhere under %s "
+            .. "(create_file makes a new one)", path, base, root)
     end
     local bufnr = vim.fn.bufadd(path)
     if not vim.api.nvim_buf_is_loaded(bufnr) then

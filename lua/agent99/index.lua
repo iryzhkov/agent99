@@ -1972,7 +1972,7 @@ local function near_names(index, name_path)
 end
 
 -- Resolve one unambiguous symbol for an edit.
-local function resolve_symbol(file, name_path)
+local function resolve_symbol(file, name_path, pick)
     if type(name_path) ~= "string" or name_path == "" then
         err("missing required argument: name_path")
     end
@@ -2003,10 +2003,24 @@ local function resolve_symbol(file, name_path)
             name_path, file, near_names(index, name_path))
     end
     if #candidates > 1 and candidates[1].rank == candidates[2].rank then
+        -- A tie: two declarations answer to the same fragment (a method
+        -- name shared by two classes, an overload). The caller may know
+        -- more than the name - the text it wants to replace, or the lines
+        -- it wants - and can settle the tie from that; the refusal is for
+        -- when nothing does.
+        local tied = {}
+        for _, c in ipairs(candidates) do
+            if c.rank ~= candidates[1].rank then break end
+            tied[#tied + 1] = c.entry
+        end
+        local chosen = pick and pick(bufnr, tied)
+        if chosen then
+            return bufnr, chosen
+        end
         local names = {}
-        for i, c in ipairs(candidates) do
+        for i, e in ipairs(tied) do
             if i > 5 then break end
-            names[#names + 1] = c.entry.path
+            names[#names + 1] = e.path
         end
         err("ambiguous symbol %q in %s: %s - use the full name path",
             name_path, file, table.concat(names, ", "))

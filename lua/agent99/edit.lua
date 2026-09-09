@@ -1732,6 +1732,41 @@ local function edit_chunks(args)
     return out
 end
 
+-- Settle a tie between symbols that answer to the same name, from what the
+-- chunk says beyond the name. A match= text that sits, exactly once, in
+-- one of them names that one; absolute lines that fall inside one of them
+-- do the same. Nil when nothing decides it, and the refusal that follows
+-- names the candidates as before.
+local function pick_tied_symbol(bufnr, tied, c)
+    local found = {}
+    if c.match ~= nil then
+        local want = vim.trim((c.match:gsub("\n+$", "")))
+        local want_lines = vim.split(want, "\n", { plain = true })
+        local keys = { want, indent_blind(want_lines) }
+        for _, entry in ipairs(tied) do
+            local first = doc_block_start(bufnr, entry.first)
+            for pass = 1, 2 do
+                local at = locate_between(bufnr, first, entry.last, keys[pass], #want_lines, pass == 2)
+                if at then
+                    found[#found + 1] = entry
+                    break
+                end
+            end
+        end
+    elseif c.absolute and c.first and c.last then
+        for _, entry in ipairs(tied) do
+            local first = doc_block_start(bufnr, entry.first)
+            if c.first >= first and c.last <= entry.last then
+                found[#found + 1] = entry
+            end
+        end
+    end
+    if #found == 1 then
+        return found[1]
+    end
+    return nil
+end
+
 -- The same replace_symbol_lines call with every chunk re-addressed to
 -- where its expected text actually is. Buffer line numbers throughout,
 -- whatever the original used: a chunk that names no symbol has no
@@ -1790,12 +1825,25 @@ local function replace_symbol_lines(args)
             end
             c.entry = entries[false]
         else
-            if not entries[c.name_path] then
-                local b, entry = resolve_symbol(args.file, c.name_path)
+            local entry = entries[c.name_path]
+            if not entry then
+                -- A name shared by two declarations (Stack/push and
+                -- Queue/push) is a tie the name alone cannot break, but
+                -- a chunk carries more than the name: its match text, or
+                -- its absolute lines, sit in only one of them. Picked
+                -- entries are not cached, since the next chunk may pick
+                -- the other one.
+                local b, picked
+                b, entry = resolve_symbol(args.file, c.name_path, function(buf, tied)
+                    picked = pick_tied_symbol(buf, tied, c)
+                    return picked
+                end)
                 bufnr = bufnr or b
-                entries[c.name_path] = entry
+                if not picked then
+                    entries[c.name_path] = entry
+                end
             end
-            c.entry = entries[c.name_path]
+            c.entry = entry
         end
         local span = c.entry.last - c.entry.first + 1
         -- The doc comment above the declaration is reachable too, by

@@ -60,11 +60,26 @@ local function guess_check_command(root)
             add("tsc --noEmit -p .")
         end
     end
-    if has("pyproject.toml") or has("setup.py") or has("setup.cfg") then
+    -- Keyed on the files, not on a manifest: a directory holding one
+    -- module and its test has no pyproject.toml and is still a Python
+    -- project, and it was the case that answered "no check command" most
+    -- often in real sessions.
+    if has_ext(".py") then
         if vim.fn.executable("pyright") == 1 then
             add("pyright")
         elseif vim.fn.executable("mypy") == 1 then
             add("mypy .")
+        else
+            local python = vim.fn.executable("python3") == 1 and "python3"
+                or vim.fn.executable("python") == 1 and "python"
+                or nil
+            if python then
+                add(python .. " -m compileall -q .",
+                    "compileall is a syntax check only: it byte-compiles each file and "
+                    .. "catches what breaks parsing, not a wrong name or type. Install "
+                    .. "pyright or mypy for more, or pass command= with the project's "
+                    .. "own check.")
+            end
         end
     end
     if has("CMakeLists.txt") and has("build") then
@@ -225,8 +240,10 @@ local function check_project(args)
         end
     end
     if not cmds then
-        err("no check command: pass command= or commands=, set AGENT99_CHECK, "
-            .. "or post_edit.check in setup()")
+        err("no check command could be guessed for %s (it guesses from go.mod, Cargo.toml, "
+            .. "tsconfig.json, CMakeLists.txt, and .py, .lua and .qml files, with the "
+            .. "checker installed): pass command= or commands= (remember=true keeps it "
+            .. "for this root), set AGENT99_CHECK, or post_edit.check in setup()", root)
     end
     if explicit and args.remember then
         check_override[root] = cmds

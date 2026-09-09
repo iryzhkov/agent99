@@ -887,6 +887,56 @@ def group_edit(c):
         check("replace_pattern refuses a bad pattern", "does not compile" in str(e), e)
     reset(c)
 
+    # A name two declarations share (Stack.push and Queue.push) is not a
+    # refusal when the chunk says which: its match text sits in one of them
+    # only. The same name with text both hold is still ambiguous.
+    pair = os.path.join(root, "lua", "testproj", "pair.lua")
+    with open(pair, "w") as f:
+        f.write("local Stack = {\n"
+                "    push = function(self, item)\n"
+                "        self.items[#self.items + 1] = item\n"
+                "        return self\n"
+                "    end,\n"
+                "}\n"
+                "local Queue = {\n"
+                "    push = function(self, item)\n"
+                "        table.insert(self.items, 1, item)\n"
+                "        return self\n"
+                "    end,\n"
+                "}\n"
+                "return { Stack = Stack, Queue = Queue }\n")
+    res = b.call("replace_symbol_lines", {
+        "file": pair, "name_path": "push",
+        "match": "        table.insert(self.items, 1, item)",
+        "text": "        table.insert(self.items, item)",
+    })
+    text = open(pair).read()
+    check("a shared name is settled by the chunk's match text",
+          "table.insert(self.items, item)" in text
+          and "self.items[#self.items + 1] = item" in text, res)
+    try:
+        b.call("replace_symbol_lines", {
+            "file": pair, "name_path": "push",
+            "match": "        return self", "text": "        return nil",
+        })
+        check("a shared name with text both hold is still ambiguous", False, "call succeeded")
+    except RuntimeError as e:
+        check("a shared name with text both hold is still ambiguous",
+              "ambiguous" in str(e) and "Stack/push" in str(e) and "Queue/push" in str(e), e)
+
+    # A guessed path that does not exist: the refusal names the files that
+    # share its basename, so the next call is the right one.
+    try:
+        b.call("replace_symbol_lines", {
+            "file": os.path.join(root, "lua", "util.lua"),
+            "match": "x", "text": "y",
+        })
+        check("a missing file names its namesakes", False, "call succeeded")
+    except RuntimeError as e:
+        check("a missing file names its namesakes",
+              "no such file" in str(e) and "lua/testproj/util.lua" in str(e), e)
+    reset(c)
+
 
 def group_verdict(c):
     """What an edit reports afterwards: new, pre-existing and fixed

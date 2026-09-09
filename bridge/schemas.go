@@ -212,7 +212,7 @@ var lspTools = []tool{
 			"type": "object",
 			"properties": map[string]any{
 				"file":       map[string]any{"type": "string", "description": "File containing the symbol."},
-				"name_path":  map[string]any{"type": "string", "description": "Symbol name path; the default for chunks that name none."},
+				"name_path":  map[string]any{"type": "string", "description": "Symbol name path; the default for chunks that name none. A name two declarations share (Stack/push, Queue/push) is settled by the chunk's match text or absolute lines when only one of them holds it; otherwise give the full path."},
 				"match":      map[string]any{"type": "string", "description": "The lines to replace, as they are now (whole lines); must occur exactly once in the symbol. Replaces first_line/last_line/expect."},
 				"first_line": map[string]any{"type": "integer", "description": "First line to replace, relative to the symbol's declaration (1-based) unless absolute. Relative numbers are re-anchored to wherever the declaration is now, so an edit above the symbol does not move them."},
 				"last_line":  map[string]any{"type": "integer", "description": "Last line to replace (inclusive)."},
