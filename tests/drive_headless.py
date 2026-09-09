@@ -759,6 +759,28 @@ def group_edit(c):
               "of M.greet do not hold the expected text" in str(e)
               and "nowhere in" in str(e) and open(util).read() == text, e)
 
+    # One stale chunk out of several: the ones that matched are still
+    # right, and re-sending them by hand is work already done once.
+    try:
+        b.call("replace_symbol_lines", {
+            "file": util, "name_path": "M.greet",
+            "chunks": [
+                {"first_line": 1, "last_line": 1, "expect": "function M.greet(name)",
+                 "text": "function M.greet(name)"},
+                {"first_line": 3, "last_line": 3, "expect": "nothing like this here", "text": "x"},
+            ],
+        })
+        check("a partly stale chunked call is refused", False, "call succeeded")
+    except RuntimeError as e:
+        token = re.search(r"token=(\d+)", str(e))
+        check("the refusal offers to apply the chunks that matched",
+              "apply only the 1 chunk(s) that matched" in str(e) and token is not None, e)
+        if token:
+            res = b.call("apply_code_action", {"token": token.group(1), "index": 1})
+            check("that action applies them",
+                  res.get("replaced") == "lines 1-1 of M.greet", res)
+            b.call("undo_edit", {"count": 1})
+
     # Chunks may name their own symbols: one concept living in two
     # functions is one call. A stale chunk relocates to wherever its
     # expected text is, as long as that text covers the whole range the
@@ -1349,6 +1371,118 @@ def group_indent(c):
           res.get("reindented") is None
           and "        return 11" in open(klass).read(), res)
     os.remove(klass)
+
+
+def group_ambiguity(c):
+    """Two declarations answering to one name path: the refusal has to name
+    something the caller can act on, and line= has to settle it."""
+    b, root = c.b, c.root
+
+    reset(c)
+    pair = os.path.join(root, "lua", "testproj", "twins.lua")
+    with open(pair, "w") as f:
+        f.write("local Stack = {\n"
+                "    push = function(self, item)\n"
+                "        return item\n"
+                "    end,\n"
+                "}\n"
+                "local Queue = {\n"
+                "    push = function(self, item)\n"
+                "        return item\n"
+                "    end,\n"
+                "}\n"
+                "return { Stack = Stack, Queue = Queue }\n")
+    try:
+        b.call("replace_symbol_body", {"file": pair, "name_path": "push", "body": "x"})
+        check("an ambiguous name path is refused", False, "call succeeded")
+    except RuntimeError as e:
+        check("the ambiguity names the line of each candidate",
+              "line 2" in str(e) and "line 7" in str(e)
+              and "pass line=" in str(e), e)
+    res = b.call("replace_symbol_body", {
+        "file": pair, "name_path": "push", "line": 7,
+        "body": "    push = function(self, item)\n        return item, 2\n    end,"})
+    text = open(pair).read()
+    check("line= picks the declaration that starts there",
+          "return item, 2" in text and text.count("return item") == 2, (res, text))
+    try:
+        b.call("replace_symbol_body", {"file": pair, "name_path": "push", "line": 3, "body": "x"})
+        check("a line that declares nothing is refused", False, "call succeeded")
+    except RuntimeError as e:
+        check("a line that declares nothing is refused",
+              "declared on line 3" in str(e) and "line 2" in str(e), e)
+    os.remove(pair)
+
+
+def group_multifile(c):
+    """The same symbol edit in several files: one call, one undo step."""
+    b, root = c.b, c.root
+
+    reset(c)
+    made = []
+    for name in ("alpha", "beta"):
+        path = os.path.join(root, "lua", "testproj", name + ".lua")
+        with open(path, "w") as f:
+            f.write("local M = {}\n\nfunction M.run()\n    return 1\nend\n\nreturn M\n")
+        made.append(path)
+    res = b.call("insert_before_symbol", {
+        "files": made, "name_path": "M.run", "text": "--- Runs it.\n"})
+    check("insert_before_symbol edits every file it is given",
+          res.get("files") == 2 and len(res.get("reports", [])) == 2
+          and all("--- Runs it." in open(p).read() for p in made), res)
+    res = b.call("replace_symbol_body", {
+        "files": made, "name_path": "M.run",
+        "body": "function M.run()\n    return 2\nend"})
+    check("replace_symbol_body edits every file it is given",
+          res.get("files") == 2 and all("return 2" in open(p).read() for p in made), res)
+    res = b.call("undo_edit", {"count": 1})
+    check("one undo takes back the whole multi-file edit",
+          all("return 1" in open(p).read() for p in made), res)
+    try:
+        b.call("replace_symbol_body", {"files": made, "file": made[0],
+                                       "name_path": "M.run", "body": "x"})
+        check("file and files together are refused", False, "call succeeded")
+    except RuntimeError as e:
+        check("file and files together are refused", "not both" in str(e), e)
+    try:
+        b.call("replace_symbol_body", {
+            "files": made, "name_path": "M.missing", "body": "x"})
+        check("a file without the symbol is named", False, "call succeeded")
+    except RuntimeError as e:
+        check("a file without the symbol is named",
+              "alpha.lua" in str(e) and "no symbol named" in str(e), e)
+    b.call("undo_edit", {"all": True})
+    for p in made:
+        os.path.exists(p) and os.remove(p)
+
+
+def group_undo(c):
+    """An entry that refuses to undo blocked every older one, with no way
+    past it but git."""
+    b, root = c.b, c.root
+
+    reset(c)
+    util = c.util
+    b.call("replace_symbol_lines", {
+        "file": util, "name_path": "M.greet",
+        "match": '    return "hello, " .. name', "text": '    return "hi, " .. name'})
+    b.call("replace_symbol_lines", {
+        "file": util, "match": "local M = {}", "text": "local M = {} -- edited"})
+    # Change the newest edit's region behind the tool's back.
+    with open(util) as f:
+        text = f.read()
+    with open(util, "w") as f:
+        f.write(text.replace("local M = {} -- edited", "local M = {} -- by hand"))
+    b.call("find_symbol", {"file": util, "name": "M.greet"})
+    res = b.call("undo_edit", {"all": True})
+    check("an entry whose region changed refuses and says how to get past it",
+          len(res.get("refused", [])) == 1 and "skip=true" in (res.get("refused_note") or "")
+          and 'return "hi, "' in open(util).read(), res)
+    res = b.call("undo_edit", {"all": True, "skip": True})
+    check("skip=true forgets it and undoes the rest",
+          len(res.get("dropped", [])) == 1
+          and 'return "hello, " .. name' in open(util).read()
+          and res.get("remaining") == 0, res)
 
 
 def group_polish(c):
@@ -2043,6 +2177,9 @@ GROUPS = [
     ("index", group_index),
     ("edit", group_edit),
     ("indent", group_indent),
+    ("ambiguity", group_ambiguity),
+    ("undo", group_undo),
+    ("multifile", group_multifile),
     ("polish", group_polish),
     ("verdict", group_verdict),
     ("search", group_search),

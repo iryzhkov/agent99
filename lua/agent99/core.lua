@@ -873,4 +873,17 @@ M.client_for = client_for
 M.dialect_note = dialect_note
 M.assert_writable = assert_writable
 
+-- Whether this workspace's dependencies are missing, set by workspace_support
+-- when it opens. A server that cannot resolve imports answers about one
+-- package and calls it the project, and the tools that lead to a deletion or
+-- a rename have to say so where they answer, not only at open time.
+local deps_missing = {}
+function M.note_deps_missing(root, why)
+    deps_missing[root or ""] = why
+end
+
+function M.deps_missing(root)
+    return deps_missing[root or ""]
+end
+
 return M

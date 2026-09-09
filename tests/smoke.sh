@@ -19,7 +19,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$PATH:$HOME/.local/share/nvim/mason/bin"
 
 ALL_SUITES="unit mcp headless multi debug"
-HEADLESS_GROUPS="workspace index edit indent polish verdict search files tests lifecycle"
+HEADLESS_GROUPS="workspace index edit indent ambiguity undo multifile polish verdict search files tests lifecycle"
 HEADLESS_ARGS=""
 if [ $# -eq 0 ]; then
     SUITES="$ALL_SUITES"

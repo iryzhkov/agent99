@@ -29,6 +29,22 @@ const (
 	serverVersion           = "0.4.0"
 )
 
+// The revisions this server implements, newest first. It used to answer
+// `initialize` with whatever version the client claimed, which is a promise
+// it cannot keep: a client asking for a revision this does not speak was
+// told it had it. The spec's rule is the other way round - answer with a
+// version the server supports and let the client decide.
+var supportedProtocolVersions = []string{"2025-06-18", "2025-03-26", "2024-11-05"}
+
+func negotiateProtocolVersion(asked string) string {
+	for _, v := range supportedProtocolVersions {
+		if asked == v {
+			return v
+		}
+	}
+	return fallbackProtocolVersion
+}
+
 var workspaceTools = []tool{
 	{
 		Name: "open_workspace",
@@ -353,14 +369,19 @@ func mcpHandle(method string, params map[string]any) (map[string]any, bool) {
 	switch method {
 	case "initialize":
 		noteFrictionClient(params)
-		version := fallbackProtocolVersion
-		if v, ok := params["protocolVersion"].(string); ok && v != "" {
-			version = v
-		}
+		asked, _ := params["protocolVersion"].(string)
 		return map[string]any{
-			"protocolVersion": version,
+			"protocolVersion": negotiateProtocolVersion(asked),
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 			"serverInfo":      map[string]any{"name": "agent99-lsp", "version": serverVersion},
+		}, true
+	case "server/discover":
+		// Mandatory from the 2026-07-28 revision, and cheap: the versions
+		// this server actually implements, plus what it can do.
+		return map[string]any{
+			"protocolVersions": supportedProtocolVersions,
+			"capabilities":     map[string]any{"tools": map[string]any{}},
+			"serverInfo":       map[string]any{"name": "agent99-lsp", "version": serverVersion},
 		}, true
 	case "ping":
 		return map[string]any{}, true

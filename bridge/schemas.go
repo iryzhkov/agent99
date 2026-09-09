@@ -199,8 +199,14 @@ var lspTools = []tool{
 			"properties": map[string]any{
 				"file":      map[string]any{"type": "string", "description": "File containing the symbol."},
 				"name_path": map[string]any{"type": "string", "description": "Symbol name path (full path if ambiguous)."},
-				"body":      map[string]any{"type": "string", "description": "Complete replacement source for the symbol."},
-				"dry_run":   map[string]any{"type": "boolean", "description": "Show a unified diff of the change without applying it."},
+				"line":      map[string]any{"type": "integer", "description": "The symbol's declaration line, when several answer to the same name path (find_symbol prints it)."},
+				"files": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Make the same edit in each of these files, in one call and one undo step. Alternative to file.",
+				},
+				"body":    map[string]any{"type": "string", "description": "Complete replacement source for the symbol."},
+				"dry_run": map[string]any{"type": "boolean", "description": "Show a unified diff of the change without applying it."},
 			},
 			"required": []string{"file", "name_path", "body"},
 		},
@@ -253,7 +259,13 @@ var lspTools = []tool{
 			"properties": map[string]any{
 				"file":      map[string]any{"type": "string", "description": "File containing the anchor symbol."},
 				"name_path": map[string]any{"type": "string", "description": "Anchor symbol name path."},
-				"text":      map[string]any{"type": "string", "description": "Source to insert."},
+				"line":      map[string]any{"type": "integer", "description": "The anchor's declaration line, when several symbols answer to the same name path (find_symbol prints it)."},
+				"files": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Insert into each of these files, in one call and one undo step. Alternative to file.",
+				},
+				"text": map[string]any{"type": "string", "description": "Source to insert."},
 			},
 			"required": []string{"file", "name_path", "text"},
 		},
@@ -387,6 +399,7 @@ var lspTools = []tool{
 			"properties": map[string]any{
 				"count": map[string]any{"type": "integer", "description": "How many of the newest edits to undo (default 1)."},
 				"all":   map[string]any{"type": "boolean", "description": "Undo every edit of this run."},
+				"skip":  map[string]any{"type": "boolean", "description": "Forget an entry that refuses to undo (its region changed since) and carry on with the older ones, instead of stopping there."},
 			},
 			"required": []string{},
 		},
@@ -399,7 +412,13 @@ var lspTools = []tool{
 			"properties": map[string]any{
 				"file":      map[string]any{"type": "string", "description": "File containing the anchor symbol."},
 				"name_path": map[string]any{"type": "string", "description": "Anchor symbol name path."},
-				"text":      map[string]any{"type": "string", "description": "Source to insert."},
+				"line":      map[string]any{"type": "integer", "description": "The anchor's declaration line, when several symbols answer to the same name path (find_symbol prints it)."},
+				"files": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Insert into each of these files, in one call and one undo step. Alternative to file.",
+				},
+				"text": map[string]any{"type": "string", "description": "Source to insert."},
 			},
 			"required": []string{"file", "name_path", "text"},
 		},

@@ -30,3 +30,25 @@ func TestBinaryStopPathFindsTheFileTheSearchGaveUpOn(t *testing.T) {
 		}
 	}
 }
+
+// The server used to echo back whatever protocol version the client claimed,
+// so a client asking for a revision it does not implement was told it had it.
+func TestProtocolVersionIsOneTheServerImplements(t *testing.T) {
+	for _, v := range supportedProtocolVersions {
+		if got := negotiateProtocolVersion(v); got != v {
+			t.Errorf("negotiateProtocolVersion(%q) = %q, want the same", v, got)
+		}
+	}
+	for _, asked := range []string{"", "2026-07-28", "nonsense"} {
+		got := negotiateProtocolVersion(asked)
+		found := false
+		for _, v := range supportedProtocolVersions {
+			if got == v {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("negotiateProtocolVersion(%q) = %q, which this server does not implement", asked, got)
+		}
+	}
+}

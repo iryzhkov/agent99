@@ -88,8 +88,11 @@ end
 --- has changed that region since and blindly restoring would clobber it.
 --- File operations carry their own check inside their undo function.
 --- Returns the list of undone entries and the list of refusals.
-function M.undo_last(n)
-    local undone, refused = {}, {}
+--- `skip` drops an entry that refuses to undo instead of stopping there:
+--- one region changed by hand made every older edit unreachable, and the
+--- only way out was git.
+function M.undo_last(n, skip)
+    local undone, refused, dropped = {}, {}, {}
     local todo = n or M.operations()
     -- `todo` counts steps; a step is every entry sharing the newest group.
     local step_group = nil
@@ -123,7 +126,14 @@ function M.undo_last(n)
         end
         if why then
             refused[#refused + 1] = { file = e.file, name_path = e.name_path, why = why }
-            break -- older edits below it would be off too
+            if not skip then
+                break -- older edits below it would be off too
+            end
+            -- Asked to skip: forget this entry and carry on with the older
+            -- ones. They are not made safer by it, so each is still checked.
+            dropped[#dropped + 1] = { file = e.file, name_path = e.name_path, why = why }
+            current[#current] = nil
+            goto continue
         end
         if not e.file_op then
             vim.api.nvim_buf_set_lines(e.bufnr, e.first - 1, e.first - 1 + e.new_count,
@@ -131,8 +141,9 @@ function M.undo_last(n)
         end
         undone[#undone + 1] = e
         current[#current] = nil
+        ::continue::
     end
-    return undone, refused
+    return undone, refused, dropped
 end
 
 --- Where the lines an edit wrote sit now: at the recorded row when the text

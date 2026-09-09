@@ -675,6 +675,7 @@ local function workspace_support(args)
     local ok_dep, dep_note = pcall(node_modules_note, root, by_ft)
     if ok_dep and dep_note then
         notes[#notes + 1] = dep_note
+        core.note_deps_missing(root, dep_note)
     end
     return { languages = out, note = #notes > 0 and table.concat(notes, " ") or nil }
 end

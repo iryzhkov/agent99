@@ -1714,7 +1714,7 @@ local function preview_diff(old_lines, new_lines, label, at)
 end
 
 local function replace_symbol_body(args)
-    local bufnr, entry = resolve_symbol(args.file, args.name_path)
+    local bufnr, entry = resolve_symbol(args.file, args.name_path, nil, tonumber(args.line))
     if type(args.body) ~= "string" then
         err("missing required argument: body")
     end
@@ -1886,7 +1886,7 @@ local function edit_chunks(args)
     -- only hint that the key was dropped.
     local KNOWN = {
         first_line = true, last_line = true, text = true, expect = true,
-        match = true, absolute = true, name_path = true,
+        match = true, absolute = true, name_path = true, declared_on = true,
     }
     local out = {}
     for i, c in ipairs(chunks) do
@@ -2035,7 +2035,7 @@ local function replace_symbol_lines(args)
                 b, entry = resolve_symbol(args.file, c.name_path, function(buf, tied)
                     picked = pick_tied_symbol(buf, tied, c)
                     return picked
-                end)
+                end, tonumber(c.declared_on or args.declared_on))
                 bufnr = bufnr or b
                 if not picked then
                     entries[c.name_path] = entry
@@ -2092,7 +2092,18 @@ local function replace_symbol_lines(args)
                     err("chunk %d: the match text is nowhere in %s; re-read it with find_symbol",
                         c.index, where)
                 end
-                err("chunk %d: the match text occurs %d times in %s; include more context",
+            -- Is any of it inside the symbol that was named? "occurs 2 times
+            -- in the file; include more context" cannot be acted on when the
+            -- text is not in that symbol at all - no amount of context will
+            -- put it there.
+            local inside = select(2, locate_between(bufnr, doc_first, c.entry.last,
+                want, #vim.split(want, "\n", { plain = true }), false))
+            if c.name_path and inside == 0 then
+                err("chunk %d: the match text is not in %s at all; it occurs %d times elsewhere "
+                    .. "in %s. Name the symbol that holds it, or drop name_path to address the "
+                    .. "file's own lines", c.index, c.entry.path, count, where)
+            end
+            err("chunk %d: the match text occurs %d times in %s; include more context",
                     c.index, count, where)
             end
             c.first, c.last, c.expect = at, at + n - 1, c.match
@@ -2117,7 +2128,10 @@ local function replace_symbol_lines(args)
         c.abs_last = c.entry.first + c.last - 1
         local conflict = primary_region_conflict(bufnr, c.abs_first, c.abs_last)
         if conflict then err("chunk %d: %s", c.index, conflict) end
-        c.new_lines = vim.split((c.text:gsub("\n$", "")), "\n", { plain = true })
+        -- "" deletes the lines, as it does in replace_pattern; it used to
+        -- leave one blank line behind and need a second call.
+        c.new_lines = c.text == "" and {}
+            or vim.split((c.text:gsub("\n$", "")), "\n", { plain = true })
         c.old = vim.api.nvim_buf_get_lines(bufnr, c.abs_first - 1, c.abs_last, false)
     end
     local entry = chunks[1].entry
@@ -2320,6 +2334,33 @@ local function replace_symbol_lines(args)
             end
             actions[#actions + 1] = { title = title, args = relocated_args(args, chunks, targeted) }
         end
+        -- A call refused for one stale chunk out of several: the chunks that
+        -- did match are still right, and re-sending them by hand is the work
+        -- the caller has already done once.
+        if #chunks > #stale then
+            local kept = {}
+            for _, c in ipairs(chunks) do
+                local is_stale = false
+                for _, s in ipairs(stale) do
+                    if s.c == c then is_stale = true end
+                end
+                if not is_stale then
+                    kept[#kept + 1] = {
+                        first_line = c.abs_first, last_line = c.abs_last, text = c.text,
+                        expect = c.expect, name_path = c.name_path, absolute = true,
+                    }
+                end
+            end
+            local kept_args = vim.deepcopy(args)
+            kept_args.chunks = kept
+            kept_args.name_path, kept_args.first_line, kept_args.last_line = nil, nil, nil
+            kept_args.text, kept_args.expect, kept_args.match, kept_args.absolute = nil, nil, nil, nil
+            actions[#actions + 1] = {
+                title = ("apply only the %d chunk(s) that matched, leaving the %d stale one(s)")
+                    :format(#kept, #stale),
+                args = kept_args,
+            }
+        end
         actions[#actions + 1] = {
             title = "apply at the requested lines anyway (ignore expect)",
             args = vim.tbl_extend("force", args, { force = true })
@@ -2423,7 +2464,7 @@ end
 
 local function insert_symbol_tool(where)
     return function(args)
-        local bufnr, entry = resolve_symbol(args.file, args.name_path)
+        local bufnr, entry = resolve_symbol(args.file, args.name_path, nil, tonumber(args.line))
         if type(args.text) ~= "string" or args.text == "" then
             err("missing required argument: text")
         end
@@ -2564,7 +2605,7 @@ local function undo_edit(args)
     end
     local last_bufnr
     local before = diag_snapshot()
-    local undone, refused = edits.undo_last(count)
+    local undone, refused, dropped = edits.undo_last(count, args.skip == true)
     local out = {}
     for _, e in ipairs(undone) do
         local item = { file = rel_path(e.file), symbol = e.name_path, kind = e.kind }
@@ -2580,8 +2621,16 @@ local function undo_edit(args)
     end
     -- Steps left, not files left: one rename across seven files is one.
     local result = { undone = out, remaining = edits.operations() }
+    if #dropped > 0 then
+        result.dropped = dropped
+        result.dropped_note = "skip=true: these entries could not be undone and were forgotten, "
+            .. "so the ones under them could be reached. What they wrote is still in the file."
+    end
     if #refused > 0 then
         result.refused = refused
+        result.refused_note = "the entries under this one were left alone, because undoing them "
+            .. "over a region that has changed would clobber it. Fix that region by hand, or "
+            .. "pass skip=true to forget this entry and undo the rest."
     end
     if last_bufnr then
         local opts = post_edit_options()
@@ -2692,6 +2741,13 @@ local function rename_symbol(args)
     end)
     local result = { renamed_to = new_name, files = files, total_edits = total,
         file_operations = #file_ops > 0 and file_ops or nil }
+    -- A rename reaches exactly as far as the server's references do.
+    local missing = core.deps_missing(args.root)
+    if missing then
+        result.may_be_incomplete = "the language server cannot resolve this project's imports ("
+            .. missing .. ") so call sites in other packages were not renamed; grep for the old "
+            .. "name before trusting this"
+    end
     local own = {}
     for _, snap in ipairs(snaps) do own[snap.bufnr] = true end
     result = vim.tbl_extend("error", result,

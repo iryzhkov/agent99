@@ -141,6 +141,11 @@ local function hover(args)
     if placeholder_hover(text) then
         return { hover = nil, note = "the language server is still indexing (" .. text .. "); retry shortly" }
     end
+    -- qmlls answers with an empty payload rather than with nothing, and a
+    -- bare `"hover": ""` reads as "the position was wrong".
+    if vim.trim(text or "") == "" then
+        return { hover = nil, note = "the language server returned no hover text for this symbol" }
+    end
     return { hover = text }
 end
 
@@ -773,6 +778,15 @@ end
 -- have no caller by construction, so listing them is noise that buries the
 -- findings: 78 of one run's 78 entries were Go test functions, and they ate
 -- the file budget on the way.
+-- A symbol with no name of its own: an anonymous callback the server named
+-- after its first parameter or after the call around it. Nothing references
+-- those and nothing can delete them, so they are noise in this list.
+local function anonymous(entry)
+    local name = entry.name or ""
+    return name == "" or name:find("^<") ~= nil or name:find("%(%)") ~= nil
+        or name:find("callback") ~= nil or name:find("^line%d+$") ~= nil
+end
+
 local function entry_point(entry, path)
     local name = bare_name(entry.name)
     if name == "main" or name == "init" or name == "setup" or name == "teardown" then
@@ -862,6 +876,7 @@ local function unreferenced_symbols(args)
             for _, e in ipairs(symbol_index(bufnr)) do
                 if e.name and e.name ~= "" and not e.path:find("/", 1, true)
                     and not entry_point(e, path) and not foreign_field(e, declared_here)
+                    and not anonymous(e)
                     and checked < MAX_UNREFERENCED_SYMBOLS then
                     checked = checked + 1
                     entries[#entries + 1] = e
@@ -971,6 +986,18 @@ local dispatch_table = {
         end
         result.locations = nil
         result.files = files
+        -- A server that cannot resolve the project's imports answers about
+        -- one package and looks complete: on a monorepo with no node_modules
+        -- installed, this returned 23 hits in 3 files while the symbol was
+        -- used in 6, and rename_symbol went on to break the other 3. The
+        -- caveat belongs here, where the answer is read, not only in the
+        -- reply to open_workspace.
+        local missing = core.deps_missing(args.root)
+        if missing then
+            result.may_be_incomplete = "the language server cannot resolve this project's "
+                .. "imports (" .. missing .. ") so references from other packages are missing "
+                .. "from this answer; grep for the name to see them"
+        end
         return result
     end,
     hover = hover,
@@ -1029,6 +1056,48 @@ local WRITE_TOOLS = {
     create_file = true, move_file = true, delete_file = true,
     move_symbols = true, replace_pattern = true,
 }
+
+-- The symbol edits take one file. `files=` runs the same call once per file
+-- and answers with one report each: the same helper added to four modules,
+-- the same line replaced in three, used to be four and three calls, and the
+-- undo of them was as many steps.
+local PER_FILE_TOOLS = {
+    replace_symbol_body = true, replace_symbol_lines = true,
+    insert_after_symbol = true, insert_before_symbol = true,
+}
+
+for name in pairs(PER_FILE_TOOLS) do
+    local fn = dispatch_table[name]
+    if fn then
+        dispatch_table[name] = function(args)
+            args = args or {}
+            local files = args.files
+            if type(files) ~= "table" or #files == 0 then
+                return fn(args)
+            end
+            if type(args.file) == "string" and args.file ~= "" then
+                core.err("give file or files, not both")
+            end
+            local reports = {}
+            require("agent99.edits").as_one_step(function()
+                for _, f in ipairs(files) do
+                    local one = vim.tbl_extend("force", args, { file = f, files = nil })
+                    local ok, res = pcall(fn, one)
+                    if not ok then
+                        -- Name the file: "no symbol named X" says nothing
+                        -- about which of four files did not have it.
+                        core.err("%s: %s", core.rel_path(f),
+                            type(res) == "table" and (res.message or vim.inspect(res))
+                            or tostring(res):gsub("^[^:]*:%d+: ", ""))
+                    end
+                    res.file = res.file or f
+                    reports[#reports + 1] = res
+                end
+            end)
+            return { files = #reports, reports = reports }
+        end
+    end
+end
 
 for name in pairs(WRITE_TOOLS) do
     local fn = dispatch_table[name]

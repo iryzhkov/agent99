@@ -1156,6 +1156,12 @@ local function workspace_map(args)
     local target = root
     if type(args.path) == "string" and args.path ~= "" then
         target = args.path:sub(1, 1) == "/" and args.path or (root .. "/" .. args.path)
+        -- An empty map for a directory that is not there reads as "this part
+        -- of the project has nothing in it".
+        if vim.fn.isdirectory(target) == 0 then
+            err("no directory %s under %s (path= names a directory; glob= matches files)",
+                rel_path(target), rel_path(root))
+        end
     end
     local files = list_project_files(target)
     local tests_skipped = 0
@@ -2163,7 +2169,7 @@ local function near_names(index, name_path)
 end
 
 -- Resolve one unambiguous symbol for an edit.
-local function resolve_symbol(file, name_path, pick)
+local function resolve_symbol(file, name_path, pick, at_line)
     if type(name_path) ~= "string" or name_path == "" then
         err("missing required argument: name_path")
     end
@@ -2176,6 +2182,26 @@ local function resolve_symbol(file, name_path, pick)
         end
     end
     table.sort(candidates, function(a, b) return a.rank < b.rank end)
+    -- A line settles what a name cannot: four QML objects all called
+    -- Item/Timer, four Lua `name` fields in one table, two `push` methods.
+    -- find_symbol prints the line of every match, so the caller already has
+    -- the one thing that tells them apart.
+    if at_line then
+        for _, c in ipairs(candidates) do
+            if c.entry.first == at_line then
+                return bufnr, c.entry
+            end
+        end
+        if #candidates > 0 then
+            local where = {}
+            for i, c in ipairs(candidates) do
+                if i > 5 then break end
+                where[#where + 1] = ("%s at line %d"):format(c.entry.path, c.entry.first)
+            end
+            err("no symbol named %q declared on line %d of %s; it is declared at %s",
+                name_path, at_line, file, table.concat(where, ", "))
+        end
+    end
     if #candidates == 0 then
         -- A name that resolves to nothing is either a typo or a file whose
         -- declarations the editor cannot see at all, and the two need
@@ -2208,12 +2234,16 @@ local function resolve_symbol(file, name_path, pick)
         if chosen then
             return bufnr, chosen
         end
+        -- With the line of each one: an error that lists "Item/Timer,
+        -- Item/Timer, Item/Timer" and says to use the full name path names
+        -- nothing the caller can act on.
         local names = {}
         for i, e in ipairs(tied) do
             if i > 5 then break end
-            names[#names + 1] = e.path
+            names[#names + 1] = ("%s (line %d)"):format(e.path, e.first)
         end
-        err("ambiguous symbol %q in %s: %s - use the full name path",
+        err("ambiguous symbol %q in %s: %s - pass line=<the declaration line> to pick one, "
+            .. "or match= with text that only one of them holds",
             name_path, file, table.concat(names, ", "))
     end
     return bufnr, candidates[1].entry
