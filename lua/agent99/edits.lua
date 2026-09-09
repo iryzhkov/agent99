@@ -8,9 +8,39 @@ local M = {}
 
 local current = {}
 
+-- One tool call is one undo step, however many files or ledger entries it
+-- took. A rename across seven files was seven entries, so undo_edit(count=1)
+-- put two of them back and left the package uncompilable; a move_symbols was
+-- three, and undoing one of those restored the destination while the symbol
+-- stayed deleted from the source - the function was then in neither file.
+-- Entries recorded inside the same group are undone together, in order.
+local group_seq = 0
+local open_group = nil
+
+--- Record everything `fn` writes as one undo step.
+function M.as_one_step(fn)
+    local outer = open_group
+    group_seq = group_seq + 1
+    open_group = group_seq
+    local ok, res = pcall(fn)
+    open_group = outer
+    if not ok then error(res, 0) end
+    return res
+end
+
+local function stamp(entry)
+    if open_group then
+        entry.group = open_group
+    else
+        group_seq = group_seq + 1
+        entry.group = group_seq
+    end
+end
+
 --- Record one applied edit.
 --- entry = { file, bufnr, name_path, kind, first, last, old_lines, new_count }
 function M.record(entry)
+    stamp(entry)
     current[#current + 1] = entry
     -- Live UI: show the edit in the code window as it happens.
     pcall(function()
@@ -36,7 +66,20 @@ end
 --- entry = { file, kind, file_op = true, undo = function() ... end }
 function M.record_file_op(entry)
     entry.file_op = true
+    stamp(entry)
     current[#current + 1] = entry
+end
+
+--- How many undo steps the ledger holds: tool calls, not files touched.
+function M.operations()
+    local seen, n = {}, 0
+    for _, e in ipairs(current) do
+        if e.group == nil or not seen[e.group] then
+            if e.group ~= nil then seen[e.group] = true end
+            n = n + 1
+        end
+    end
+    return n
 end
 
 --- Undo the newest `n` recorded edits (all of them when n is nil), newest
@@ -47,9 +90,18 @@ end
 --- Returns the list of undone entries and the list of refusals.
 function M.undo_last(n)
     local undone, refused = {}, {}
-    local todo = n or #current
+    local todo = n or M.operations()
+    -- `todo` counts steps; a step is every entry sharing the newest group.
+    local step_group = nil
     while todo > 0 and #current > 0 do
         local e = current[#current]
+        if step_group == nil then
+            step_group = e.group
+        elseif e.group ~= step_group then
+            todo = todo - 1
+            step_group = e.group
+            if todo == 0 then break end
+        end
         local why
         if e.file_op then
             -- Not `ok and res or ...`: a successful undo returns nil, which
@@ -79,7 +131,6 @@ function M.undo_last(n)
         end
         undone[#undone + 1] = e
         current[#current] = nil
-        todo = todo - 1
     end
     return undone, refused
 end

@@ -36,6 +36,20 @@ vim.lsp.config("lua_ls", {
 })
 vim.lsp.enable("lua_ls")
 
+-- pyright when present. A Python server is what makes the "a server reports
+-- a variable by the range of its name alone" case testable: without one the
+-- suite cannot see a multi-line constant come back as a one-line symbol,
+-- which is how that bug shipped.
+if vim.fn.executable("pyright-langserver") == 1 then
+    vim.lsp.config("pyright", {
+        cmd = { "pyright-langserver", "--stdio" },
+        filetypes = { "python" },
+        root_markers = { "pyproject.toml", "setup.py", "requirements.txt", ".git" },
+        settings = { python = {} },
+    })
+    vim.lsp.enable("pyright")
+end
+
 -- gopls when present, so the debugger tests get symbol annotation on Go.
 if vim.fn.executable("gopls") == 1 then
     vim.lsp.config("gopls", {

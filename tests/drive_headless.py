@@ -491,6 +491,31 @@ def group_index(c):
                 "}\n"
                 "\n"
                 "return RESPONSES\n")
+    # The same shape in Python, where the server (pyright) reports a variable
+    # by the range of its name alone. A file that declares no function has no
+    # treesitter entries at all, so its symbols come from the server unmerged
+    # - the path the first version of this fix missed.
+    pyconst = os.path.join(root, "lua", "testproj", "constants.py")
+    with open(pyconst, "w") as f:
+        f.write("RESPONSES = {\n"
+                '    "ok": "fine",\n'
+                '    "bad": "nope",\n'
+                "}\n"
+                "\n"
+                "TIMEOUT = 30\n")
+    res = b.call("find_symbol", {"file": pyconst, "name": "RESPONSES", "include_body": True})
+    match = (res.get("matches") or [{}])[0]
+    if not match.get("body"):
+        print("SKIP python constant check: no python server under the test config")
+    else:
+        check("a python multi-line constant carries its whole value",
+              match.get("lines") == "1-4" and len(match["body"]) == 4
+              and match["body"][-1].endswith("}"), res)
+        res2 = b.call("find_symbol", {"file": pyconst, "name": "TIMEOUT", "include_body": True})
+        m2 = (res2.get("matches") or [{}])[0]
+        check("a python scalar constant stays one line", m2.get("lines") == "6-6", res2)
+    os.remove(pyconst)
+
     res = b.call("find_symbol", {"file": fixtures, "name": "RESPONSES", "include_body": True})
     match = (res.get("matches") or [{}])[0]
     body = match.get("body") or []
@@ -1648,6 +1673,15 @@ def group_files(c):
     check("move_symbols creates the destination and reports what moved",
           res.get("created") is True and res.get("moved") == ["M.shout"], res)
     check("the symbol that stayed is untouched", "function M.greet" in left_text, left_text)
+    # One move is one undo step. Undoing it entry by entry restored the
+    # destination while the symbol was still deleted from the source, so it
+    # existed in neither file - and the reply said "no new errors".
+    res = b.call("undo_edit", {"count": 1})
+    with open(util) as f:
+        back = f.read()
+    check("one undo takes a whole move back",
+          "function M.shout" in back and len(res.get("undone", [])) == 3
+          and not os.path.exists(split), res)
     res = b.call("undo_edit", {"all": True})
     with open(util) as f:
         check("undo_edit puts a split back", "function M.shout" in f.read(), res)

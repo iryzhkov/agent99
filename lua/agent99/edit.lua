@@ -2421,7 +2421,8 @@ local function undo_edit(args)
         out[#out + 1] = item
         last_bufnr = e.bufnr or last_bufnr
     end
-    local result = { undone = out, remaining = edits.count() }
+    -- Steps left, not files left: one rename across seven files is one.
+    local result = { undone = out, remaining = edits.operations() }
     if #refused > 0 then
         result.refused = refused
     end
@@ -2524,10 +2525,14 @@ local function rename_symbol(args)
         snap.old = vim.api.nvim_buf_get_lines(snap.bufnr, 0, -1, false)
     end
     vim.lsp.util.apply_workspace_edit(edit, client.offset_encoding)
-    for _, snap in ipairs(snaps) do
-        local new = vim.api.nvim_buf_get_lines(snap.bufnr, 0, -1, false)
-        record_edit(snap.bufnr, "rename " .. new_name, "rename", 1, #snap.old, snap.old, new)
-    end
+    -- One rename is one undo step, however many files it reached: undoing it
+    -- file by file leaves the project half-renamed and uncompilable.
+    require("agent99.edits").as_one_step(function()
+        for _, snap in ipairs(snaps) do
+            local new = vim.api.nvim_buf_get_lines(snap.bufnr, 0, -1, false)
+            record_edit(snap.bufnr, "rename " .. new_name, "rename", 1, #snap.old, snap.old, new)
+        end
+    end)
     local result = { renamed_to = new_name, files = files, total_edits = total,
         file_operations = #file_ops > 0 and file_ops or nil }
     result = vim.tbl_extend("error", result,
@@ -2928,11 +2933,14 @@ local function replace_pattern(args)
         settle_before_edit(p.bufnr)
     end
     local before = diag_snapshot()
-    for _, p in ipairs(pending) do
-        vim.api.nvim_buf_set_lines(p.bufnr, 0, -1, false, p.new)
-        record_edit(p.bufnr, "replace_pattern " .. pattern, "pattern",
-            1, #p.old, p.old, p.new)
-    end
+    -- One pattern replace is one undo step across every file it changed.
+    require("agent99.edits").as_one_step(function()
+        for _, p in ipairs(pending) do
+            vim.api.nvim_buf_set_lines(p.bufnr, 0, -1, false, p.new)
+            record_edit(p.bufnr, "replace_pattern " .. pattern, "pattern",
+                1, #p.old, p.old, p.new)
+        end
+    end)
     result.note = edit_note(args)
     return vim.tbl_extend("error", result,
         post_edit_report(pending[1].bufnr, before, args.root, args.headless, nil,
@@ -3348,6 +3356,9 @@ local function move_symbols(args)
     -- Only Go-style `package X` is inferred; anything else the caller supplies
     -- with header=, since guessing wrong writes a broken file.
     local created = false
+    -- Recorded inside the undo step below rather than here, so the move is
+    -- one step: create, source, destination.
+    local created_op
     if not exists then
         local header = args.header
         if header == nil then
@@ -3377,7 +3388,8 @@ local function move_symbols(args)
         -- undo restored the destination to its seeded header and left a
         -- two-line `package x` stub behind, which no build and no linter
         -- complains about and a repeated move/undo litters the package with.
-        require("agent99.edits").record_file_op({
+        created_op = function()
+            require("agent99.edits").record_file_op({
             file = to_path,
             kind = "create_file",
             undo = function()
@@ -3391,7 +3403,8 @@ local function move_symbols(args)
                 notify_file_operation("workspace/didDeleteFiles", { { uri = file_uri(to_path) } })
                 return nil
             end,
-        })
+            })
+        end
     end
 
     local to_buf = load_buf(to_path)
@@ -3429,11 +3442,17 @@ local function move_symbols(args)
         save_all()
     end
 
-    -- Whole-file entries for both, so undo_edit puts the split back.
-    record_edit(from_buf, ("moved out of %s"):format(rel_path(args.from)), "move_symbols",
-        1, #from_before, from_before, vim.api.nvim_buf_get_lines(from_buf, 0, -1, false))
-    record_edit(to_buf, ("moved into %s"):format(rel_path(to_path)), "move_symbols",
-        1, #to_before, to_before, vim.api.nvim_buf_get_lines(to_buf, 0, -1, false))
+    -- Whole-file entries for both, so undo_edit puts the split back. Both of
+    -- them plus the destination's create belong to one undo step: undoing
+    -- "half" a move restored the destination while the symbol stayed deleted
+    -- from the source, so it existed in neither file.
+    require("agent99.edits").as_one_step(function()
+        if created_op then created_op() end
+        record_edit(from_buf, ("moved out of %s"):format(rel_path(args.from)), "move_symbols",
+            1, #from_before, from_before, vim.api.nvim_buf_get_lines(from_buf, 0, -1, false))
+        record_edit(to_buf, ("moved into %s"):format(rel_path(to_path)), "move_symbols",
+            1, #to_before, to_before, vim.api.nvim_buf_get_lines(to_buf, 0, -1, false))
+    end)
 
     local names = {}
     for _, m in ipairs(moving) do names[#names + 1] = m.path end

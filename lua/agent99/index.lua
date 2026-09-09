@@ -1630,6 +1630,9 @@ local function ts_index(bufnr)
     end
     return entries
 end
+-- Defined below, next to the merge that also uses it.
+local statement_end
+
 local function lsp_index(bufnr)
     local okc, client = pcall(get_client, bufnr, "textDocument/documentSymbol", 2000)
     if not okc then
@@ -1651,9 +1654,18 @@ local function lsp_index(bufnr)
                 walk(s.children, prefix)
             elseif range then
                 local path = prefix == "" and s.name or (prefix .. "/" .. s.name)
+                local first, last = range.start.line + 1, range["end"].line + 1
+                -- Widened here rather than where the server's symbols are
+                -- merged into treesitter's, because a file that declares no
+                -- function - a module of constants, the case this is for -
+                -- has no treesitter entries at all and takes the server's
+                -- list unmerged.
+                if first == last then
+                    last = statement_end(bufnr, first)
+                end
                 entries[#entries + 1] = {
                     path = path, name = s.name, kind = kind,
-                    first = range.start.line + 1, last = range["end"].line + 1,
+                    first = first, last = last,
                 }
                 walk(s.children, path)
             end
@@ -1670,7 +1682,7 @@ end
 -- that line, orphaning the rest of the value into a syntax error. Treesitter
 -- has the whole statement: from the node at the name, climb while the parent
 -- still starts on that line, and take the widest end.
-local function statement_end(bufnr, first)
+function statement_end(bufnr, first)
     local line = vim.api.nvim_buf_get_lines(bufnr, first - 1, first, false)[1]
     if not line then return first end
     local col = (line:find("%S") or 1) - 1
@@ -1737,9 +1749,7 @@ local function merge_lsp_only_symbols(entries, bufnr)
     end
     for _, e in ipairs(from_lsp) do
         if not covered[key(e)] and not declared[same_decl(e)] then
-            if e.first == e.last then
-                e.last = statement_end(bufnr, e.first)
-            end
+
             entries[#entries + 1] = e
             covered[key(e)] = true
             declared[same_decl(e)] = true
