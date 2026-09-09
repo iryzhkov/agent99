@@ -165,7 +165,31 @@ local FT_NODES = {
     make = { rule = true, variable_assignment = true },
     sh = { variable_assignment = "top" },
     bash = { variable_assignment = "top" },
+    -- A QML file is an object tree with properties and signals on it, and
+    -- the JS functions are the small part of it. Outlining only those left a
+    -- 1400-line file summarised as 34 function names, with every Item,
+    -- property and signal invisible.
+    qml = { ui_object_definition = true, ui_property = true, ui_signal = true },
+    -- A Go file whose only declaration is a const - a config sample, a MIME
+    -- table - had no outline at all and so no line in the map. Only at the
+    -- top level: the same node inside a function is a statement.
+    go = { const_declaration = "top", var_declaration = "top" },
+    rust = { const_item = "top", static_item = "top" },
 }
+
+-- A callback written as a single expression - `(store) => store.setPrompt`,
+-- the shape half a React file is made of - declares nothing worth an outline
+-- entry. One .tsx file of 4265 lines contributed 200 of them to a 14-file
+-- skim. A callback with a statement block is a different thing (a jest
+-- `describe`, an effect body) and stays.
+local function expression_bodied(node)
+    local t = node:type()
+    if t ~= "arrow_function" and t ~= "function_expression" then
+        return false
+    end
+    local body = node:field("body")[1]
+    return body ~= nil and body:type() ~= "statement_block"
+end
 
 local function data_nodes(ft)
     return ft and DATA_NODES[ft] or nil
@@ -218,6 +242,9 @@ end
 -- ts_wanted on a node rather than a type, so the filetypes whose extra
 -- nodes only count at the top of the file can be told where they are.
 local function wanted_node(node, ft)
+    if expression_bodied(node) then
+        return false
+    end
     local rule = (FT_NODES[ft or ""] or {})[node:type()]
     if rule == "top" then
         local parent = node:parent()
@@ -1075,22 +1102,6 @@ local function workspace_map(args)
     end
     local files = list_project_files(target)
     local tests_skipped = 0
-    -- Tests are left out to keep a big map readable; in a small project
-    -- they are the spec (a bug-fix task starts from the failing test) and
-    -- the map has room for them, so they stay in unless asked otherwise.
-    local include_tests = args.include_tests
-    if include_tests == nil then
-        include_tests = #files <= MAP_SMALL_PROJECT
-    end
-    if not include_tests then
-        files = vim.tbl_filter(function(f)
-            if is_test_path(f) then
-                tests_skipped = tests_skipped + 1
-                return false
-            end
-            return true
-        end, files)
-    end
     local glob_note
     if type(args.glob) == "string" and args.glob ~= "" then
         -- Same feel as ripgrep's -g: a bare "*.go" matches at any depth,
@@ -1111,6 +1122,47 @@ local function workspace_map(args)
                 .. "from the root (\"**\" spans directories, \"*.go\" alone matches at any depth), "
                 .. "and path= narrows by directory instead"):format(before_glob, args.glob)
         end
+    end
+    -- Tests are left out to keep a big map readable; in a small project
+    -- they are the spec (a bug-fix task starts from the failing test) and
+    -- the map has room for them, so they stay in unless asked otherwise.
+    --
+    -- After the glob, not before it: a glob narrowing to twenty files was
+    -- answered with "3228 test files left out", the whole repository's count,
+    -- and the same repository-wide size decided whether tests were dropped
+    -- from a handful of files at all.
+    local include_tests = args.include_tests
+    if include_tests == nil then
+        include_tests = #files <= MAP_SMALL_PROJECT
+    end
+    if not include_tests then
+        files = vim.tbl_filter(function(f)
+            if is_test_path(f) then
+                tests_skipped = tests_skipped + 1
+                return false
+            end
+            return true
+        end, files)
+    end
+    -- Vendored trees last. The cap is on files, and the list is path-sorted,
+    -- so a monorepo with a `.repos/` checkout of two other projects spent all
+    -- 200 of its slots there, alphabetically, before reaching apps/: ten
+    -- thousand tokens of somebody else's code and none of this one's.
+    local vendored = {}
+    local own = {}
+    for _, f in ipairs(files) do
+        if f:match("^%.?repos/") or f:match("^vendor/") or f:match("/vendor/")
+            or f:match("^third_party/") or f:match("/third_party/")
+            or f:match("^external/") or f:match("/external/")
+            or f:match("site%-packages/") then
+            vendored[#vendored + 1] = f
+        else
+            own[#own + 1] = f
+        end
+    end
+    if #vendored > 0 and #own > 0 then
+        files = own
+        vim.list_extend(files, vendored)
     end
     local total_files = #files
     local out, entries = {}, 0
@@ -1169,6 +1221,10 @@ local function workspace_map(args)
     if total_files > MAX_MAP_FILES then
         notes[#notes + 1] = ("showing first %d of %d files; narrow with path or glob")
             :format(MAX_MAP_FILES, total_files)
+        if #vendored > 0 and #own > 0 then
+            notes[#notes + 1] = ("%d of them are vendored (%s and the like) and were put last, "
+                .. "so the cap falls on those first"):format(#vendored, vendored[1])
+        end
     elseif cut_files > 0 then
         notes[#notes + 1] = ("%d outlines were shortened to fit the map (\"+N more\" lines); "
             .. "skim those files for the full list"):format(cut_files)
@@ -1607,6 +1663,41 @@ local function lsp_index(bufnr)
     return entries
 end
 
+-- Where the statement that starts on `first` actually ends. Some servers
+-- report a variable by the range of its name alone - pyright does - so a
+-- constant whose value spans eight lines arrives as a one-line symbol.
+-- find_symbol then shows one line of it and replace_symbol_body writes over
+-- that line, orphaning the rest of the value into a syntax error. Treesitter
+-- has the whole statement: from the node at the name, climb while the parent
+-- still starts on that line, and take the widest end.
+local function statement_end(bufnr, first)
+    local line = vim.api.nvim_buf_get_lines(bufnr, first - 1, first, false)[1]
+    if not line then return first end
+    local col = (line:find("%S") or 1) - 1
+    -- The parser is asked for and parsed here rather than through
+    -- vim.treesitter.get_node, which answers nothing for a buffer nobody has
+    -- parsed yet - every buffer these tools load from disk.
+    local okp, parser = pcall(vim.treesitter.get_parser, bufnr)
+    if not okp or not parser then return first end
+    local okt, trees = pcall(function() return parser:parse() end)
+    if not okt or not trees or not trees[1] then return first end
+    local node = trees[1]:root():named_descendant_for_range(first - 1, col, first - 1, col)
+    local last = first
+    -- Never the file's root node: a statement on the first line shares its
+    -- start row, and taking it would widen every such symbol to the whole
+    -- file.
+    while node and node:parent() ~= nil do
+        local srow, _, erow, ecol = node:range()
+        if srow ~= first - 1 then break end
+        -- A node ending at column 0 ends on the line before, not on the one
+        -- its range points into.
+        if ecol == 0 and erow > srow then erow = erow - 1 end
+        if erow + 1 > last then last = erow + 1 end
+        node = node:parent()
+    end
+    return last
+end
+
 -- The treesitter index deliberately only keeps declarations that carry a
 -- body - functions, classes, types. That leaves out the named constants and
 -- module-level variables an agent does have to find and edit: Go's MIME
@@ -1646,6 +1737,9 @@ local function merge_lsp_only_symbols(entries, bufnr)
     end
     for _, e in ipairs(from_lsp) do
         if not covered[key(e)] and not declared[same_decl(e)] then
+            if e.first == e.last then
+                e.last = statement_end(bufnr, e.first)
+            end
             entries[#entries + 1] = e
             covered[key(e)] = true
             declared[same_decl(e)] = true
@@ -2200,8 +2294,23 @@ end
 -- symbol, the callee of a call, or text inside a comment or string literal.
 -- nil (no tag) means a plain code reference.
 local function classify_hit(bufnr, line, col, entry)
-    if entry and entry.first == line then
-        return "def"
+    -- A hit on a declaration's first line is that declaration only where the
+    -- name is. `DB = os.environ.get("NOTES_DB", "notes.db")` declares DB and
+    -- quotes NOTES_DB in a string on the same line, and calling the whole
+    -- line "def" kept that string match under kind=code - the one thing the
+    -- filter exists to drop.
+    local on_decl = entry ~= nil and entry.first == line
+    if on_decl then
+        local c = tonumber(col)
+        local text = vim.api.nvim_buf_get_lines(bufnr, line - 1, line, false)[1]
+        local name = (entry.name or ""):match("[^%.:/]+$")
+        if not c or not text or not name or name == "" then
+            return "def"
+        end
+        local s, e = text:find("%f[%w_]" .. name:gsub("%W", "%%%0") .. "%f[^%w_]")
+        if s and c >= s and c <= e then
+            return "def"
+        end
     end
     local ok, parser = pcall(vim.treesitter.get_parser, bufnr)
     if not ok or parser == nil then
@@ -2244,7 +2353,9 @@ local function classify_hit(bufnr, line, col, entry)
         end
         n = p
     end
-    return nil
+    -- On the declaration's line but not on its name, and nothing else claimed
+    -- it: still that declaration's line.
+    return on_decl and "def" or nil
 end
 
 -- Worst diagnostic severity already present on a line (ERROR/WARN or nil).
@@ -2362,5 +2473,8 @@ M.line_diag = line_diag
 M.enclosing_symbols = enclosing_symbols
 M.annotate_locations = annotate_locations
 M.MAX_BODY_LINES = MAX_BODY_LINES
+-- Exported for tests/unit_index.lua: the widening that keeps a constant
+-- whose value spans lines from arriving as a one-line symbol.
+M.statement_end = statement_end
 
 return M

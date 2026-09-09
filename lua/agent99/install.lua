@@ -27,14 +27,35 @@ local CHECK_MAX_LINES = 60
 -- because a green check here is easy to mistake for a green project.
 local function guess_check_command(root)
     local function has(rel) return vim.uv.fs_stat(root .. "/" .. rel) ~= nil end
-    -- Whether the project holds files with this extension, taken from the
-    -- file list the rest of the plugin uses (git's, when there is a git) so
-    -- that asking costs no extra walk of the tree.
-    local function has_ext(ext)
-        for _, rel in ipairs(project_files(root)) do
-            if rel:sub(-#ext) == ext then return true end
+    local function has_any(pattern)
+        return #vim.fn.globpath(root, pattern, true, true) > 0
+    end
+    -- How much of the project is written in a language, taken from the file
+    -- list the rest of the plugin uses (git's, when there is a git) so that
+    -- asking costs no extra walk of the tree.
+    local files = project_files(root)
+    local function count_ext(ext)
+        local n = 0
+        for _, rel in ipairs(files) do
+            if rel:sub(-#ext) == ext then n = n + 1 end
         end
-        return false
+        return n
+    end
+    -- A language with no manifest of its own is guessed from its files, and
+    -- "there is one somewhere" is not enough: a TypeScript monorepo carrying
+    -- seven vendored Python fixtures was answered with `pyright`, which
+    -- passed in 0.2s and reported a repository of 13k unchecked .ts files
+    -- green. What matters is whether the language is a real part of this
+    -- tree, so the test is its share of the files - low enough that a
+    -- directory holding one module and its test still counts, high enough
+    -- that a handful of files in a vendored corner does not.
+    local LANGUAGE_SHARE = 0.02
+    local function is_a_language_here(ext, markers)
+        for _, marker in ipairs(markers or {}) do
+            if has(marker) then return true end
+        end
+        local n = count_ext(ext)
+        return n > 0 and (#files == 0 or n / #files >= LANGUAGE_SHARE)
     end
     -- One entry per language the project mixes, not just the first match:
     -- a repo with a Go bridge and a Lua plugin (this one) needs both, or
@@ -53,18 +74,31 @@ local function guess_check_command(root)
     if has("Cargo.toml") then
         add("cargo check --message-format short")
     end
-    if has("tsconfig.json") then
-        if has("node_modules/.bin/tsc") then
-            add("node_modules/.bin/tsc --noEmit -p .")
-        elseif vim.fn.executable("tsc") == 1 then
-            add("tsc --noEmit -p .")
+    -- A monorepo names its root config tsconfig.base.json and keeps a
+    -- tsconfig.json per app, so the exact name is the wrong thing to look
+    -- for; -p needs one that tsc can actually build from, which is the plain
+    -- name when it exists.
+    if has_any("tsconfig*.json") then
+        local project = has("tsconfig.json") and "." or nil
+        local tsc = has("node_modules/.bin/tsc") and "node_modules/.bin/tsc"
+            or vim.fn.executable("tsc") == 1 and "tsc"
+            or nil
+        if tsc and project then
+            add(("%s --noEmit -p %s"):format(tsc, project))
+        elseif tsc then
+            add(("%s --noEmit -p %s"):format(tsc, vim.fn.fnamemodify(
+                vim.fn.globpath(root, "tsconfig*.json", true, true)[1], ":t")),
+                "this root has no plain tsconfig.json, so the check builds the one "
+                .. "tsconfig it found; a monorepo usually needs one command per app "
+                .. "(commands=[...]), or its own `typecheck` script.")
         end
     end
     -- Keyed on the files, not on a manifest: a directory holding one
     -- module and its test has no pyproject.toml and is still a Python
     -- project, and it was the case that answered "no check command" most
     -- often in real sessions.
-    if has_ext(".py") then
+    if is_a_language_here(".py", { "pyproject.toml", "setup.py", "setup.cfg",
+            "requirements.txt", "Pipfile", "tox.ini" }) then
         if vim.fn.executable("pyright") == 1 then
             add("pyright")
         elseif vim.fn.executable("mypy") == 1 then
@@ -92,8 +126,16 @@ local function guess_check_command(root)
     -- that (-W) does not exist on older Qt. The exit code is therefore not
     -- the gate for this command; the baseline diff is, since a new warning
     -- is still a new line.
-    if vim.fn.executable("qmllint") == 1 and has_ext(".qml") then
-        add("find . -name '*.qml' -not -path './.git/*' -print0 | xargs -0 -r qmllint",
+    -- qmllint ships with Qt 6 and is not always on PATH: Arch keeps it in the
+    -- Qt 6 bin directory and Debian names it qmllint6, so a PATH-only probe
+    -- finds nothing on the two distributions most Qt work happens on.
+    local qmllint = nil
+    for _, candidate in ipairs({ "qmllint", "qmllint6", "/usr/lib/qt6/bin/qmllint",
+        "/usr/lib/qt6/libexec/qmllint", "/usr/lib/qt5/bin/qmllint" }) do
+        if qmllint == nil and vim.fn.executable(candidate) == 1 then qmllint = candidate end
+    end
+    if qmllint and is_a_language_here(".qml", { "CMakeLists.txt" }) then
+        add(("find . -name '*.qml' -not -path './.git/*' -print0 | xargs -0 -r %s"):format(qmllint),
             "qmllint reports warnings but still exits 0, so read the new lines rather "
             .. "than the exit code. It also checks one import path: types it cannot "
             .. "resolve are reported as warnings that say nothing about your change, "
@@ -105,7 +147,7 @@ local function guess_check_command(root)
     -- but is an optional install, so prefer it when present and fall back
     -- to luac's own syntax-only parse check, which ships with Lua itself
     -- and needs nothing installed.
-    if has_ext(".lua") then
+    if is_a_language_here(".lua", { ".luacheckrc", ".luarc.json" }) then
         if vim.fn.executable("luacheck") == 1 then
             add("luacheck .",
                 "luacheck reads .luacheckrc if the project has one; without one it uses "
@@ -229,6 +271,27 @@ check_override, check_store_save = command_store("check_commands")
 local function save_check_overrides(root)
     check_store_save(root)
 end
+-- The command each root last checked with, for this session only. The
+-- persisted store above is what remember=true writes; this is the weaker
+-- promise that a command passed once does not have to be passed again.
+local session_command = {}
+
+-- What a caller needs to know about a command whoever chose it, guessed or
+-- not. qmllint is the case that costs a real bug: it exits 0 on warnings,
+-- and a .qmllint.ini that downgrades a category makes it quiet as well, so
+-- a check that reads the exit code alone calls broken QML clean.
+local function command_caveat(cmds)
+    for _, cmd in ipairs(cmds or {}) do
+        if cmd:find("qmllint", 1, true) then
+            return "qmllint reports warnings but still exits 0, so the new lines are the gate "
+                .. "rather than the exit code (that is what the baseline diff is for). A "
+                .. "project's .qmllint.ini can downgrade a category to silence as well; pass "
+                .. "your own -W or a grep over the output when a finding has to fail the check."
+        end
+    end
+    return nil
+end
+
 local function check_project(args)
     local root = args.root
     if type(root) ~= "string" or root == "" then
@@ -239,7 +302,8 @@ local function check_project(args)
         and config.options.post_edit.check or nil
 
     -- Explicit for this call, then whatever was remembered for this root,
-    -- then the environment, the user's config, and finally the guess.
+    -- then the environment, the user's config, the command the last check in
+    -- this root used, and finally the guess.
     local cmds
     if type(args.commands) == "table" and #args.commands > 0 then
         cmds = {}
@@ -257,6 +321,17 @@ local function check_project(args)
     local from_env = os.getenv("AGENT99_CHECK")
     if not cmds and from_env and from_env ~= "" then cmds = { from_env } end
     if not cmds and configured and configured ~= "" then cmds = { configured } end
+    -- A command passed once without remember=true still recorded a baseline
+    -- under this root, and the next bare call used to fail with "no check
+    -- command could be guessed" while that baseline sat there. Keeping the
+    -- last one for the session costs nothing and matches what the baseline
+    -- already implies; remember=true is still what carries it to the next
+    -- session, and an explicit command, a remembered one and the environment
+    -- all still win over it.
+    local from_session = false
+    if not cmds and session_command[root] then
+        cmds, from_session = session_command[root], true
+    end
     local guessed, guess_note = false, nil
     if not cmds then
         local guesses = guess_check_command(root)
@@ -273,13 +348,27 @@ local function check_project(args)
     end
     if not cmds then
         err("no check command could be guessed for %s (it guesses from go.mod, Cargo.toml, "
-            .. "tsconfig.json, CMakeLists.txt, and .py, .lua and .qml files, with the "
-            .. "checker installed): pass command= or commands= (remember=true keeps it "
-            .. "for this root), set AGENT99_CHECK, or post_edit.check in setup()", root)
+            .. "a tsconfig, CMakeLists.txt, and from .py, .lua and .qml files when they are "
+            .. "a real share of the tree rather than a few vendored ones - with the checker "
+            .. "installed): pass command= or commands= (remember=true keeps it for this "
+            .. "root), set AGENT99_CHECK, or post_edit.check in setup()", root)
     end
     if explicit and args.remember then
         check_override[root] = cmds
         save_check_overrides(root)
+    end
+    if explicit then
+        session_command[root] = cmds
+    end
+    -- A caveat that belongs to the command rather than to the guess: whoever
+    -- chose qmllint needs to hear that its exit code is not the gate.
+    if not guessed then
+        guess_note = command_caveat(cmds)
+        if from_session then
+            guess_note = (guess_note and (guess_note .. " ") or "")
+                .. "this is the command the last check in this root used, kept for the "
+                .. "session; pass remember=true to keep it for later sessions too."
+        end
     end
     -- Only for the baseline key and the reply; the commands are run one at a
     -- time below, not handed to a shell as one line.
@@ -444,7 +533,7 @@ end
 -- filetype from the git index, checks the parser instantly, and for the
 -- filetypes that have an enabled LSP config loads one sample file and
 -- waits briefly for a client to attach (the binary may be missing).
-local SUPPORT_MAX_FILETYPES = 6
+local SUPPORT_MAX_FILETYPES = 10
 
 local SUPPORT_ATTACH_MS = 2500
 
@@ -486,12 +575,24 @@ local function workspace_support(args)
     end
     local files = project_files(root)
     local by_ft, sample, ext_cache = {}, {}, {}
+    -- Reading a shebang costs a file open, so only for the files that have no
+    -- extension to go on, and only for the first few: a repository's shell
+    -- tooling is `scripts/lint`, `scripts/test`, and those were reported as
+    -- no language at all - not even as unsupported.
+    local sniffed, SNIFF_MAX = 0, 40
     for _, rel in ipairs(files) do
-        local ext = rel:match("%.([%w_]+)$") or rel
-        local ft = ext_cache[ext]
+        local ext = rel:match("%.([%w_]+)$")
+        local ft = ext and ext_cache[ext] or nil
         if ft == nil then
             ft = vim.filetype.match({ filename = rel }) or false
-            ext_cache[ext] = ft
+            if not ft and not ext and sniffed < SNIFF_MAX then
+                sniffed = sniffed + 1
+                local okl, lines = pcall(vim.fn.readfile, root .. "/" .. rel, "", 1)
+                if okl and lines and lines[1] then
+                    ft = vim.filetype.match({ filename = rel, contents = lines }) or false
+                end
+            end
+            if ext then ext_cache[ext] = ft end
         end
         if ft then
             by_ft[ft] = (by_ft[ft] or 0) + 1
@@ -502,9 +603,14 @@ local function workspace_support(args)
     end
     local fts = vim.tbl_keys(by_ft)
     table.sort(fts, function(a, b) return by_ft[a] > by_ft[b] end)
-    local out, blind = {}, {}
+    local out, blind, not_probed = {}, {}, {}
     for i, ft in ipairs(fts) do
-        if i > SUPPORT_MAX_FILETYPES then break end
+        if i > SUPPORT_MAX_FILETYPES then
+            -- Silently stopping here reported a repository's shell scripts as
+            -- absent rather than as unprobed, and an agent following "install
+            -- what says none" never learned they were covered.
+            not_probed[#not_probed + 1] = ("%s (%d)"):format(ft, by_ft[ft])
+        else
         local parser = has_parser(ft)
         local configs = enabled_lsp_configs_for(ft)
         -- What could run this language under a debugger, so a client
@@ -547,8 +653,14 @@ local function workspace_support(args)
             blind[#blind + 1] = ft
         end
         out[#out + 1] = entry
+        end
     end
     local notes = {}
+    if #not_probed > 0 then
+        notes[#notes + 1] = ("%d further filetypes are in this tree and were not probed for a "
+                .. "parser or a server (%s); skim or find_symbol on one of their files says what "
+                .. "it has"):format(#not_probed, table.concat(not_probed, ", "))
+    end
     if #blind > 0 then
         notes[#notes + 1] = ("no parser and no language server for %s: symbol, navigation and "
                 .. "diagnostic tools will not work on those files; grep and read_file will. "

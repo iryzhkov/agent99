@@ -36,7 +36,7 @@ const (
 	// Each workspace is a Neovim with a full set of language servers - a
 	// gopls over a large repository is a gigabyte by itself - so how many
 	// run at once is capped rather than left to the agent.
-	defaultMaxWorkspaces = 4
+	defaultMaxWorkspaces = 10
 )
 
 type headlessWorkspace struct {
@@ -282,9 +282,11 @@ func openWorkspace(root string) (*headlessWorkspace, error) {
 	}
 	if max := maxWorkspaces(); len(workspaces) >= max {
 		return nil, fmt.Errorf("%d workspaces are already open (%s) and the limit is %d; "+
-			"close one first (each is a Neovim with its own language servers), or raise "+
+			"close one of your own with close_workspace, or wait and retry - a workspace "+
+			"is a Neovim with its own language servers, and the roots above may belong to "+
+			"other agents sharing this server, whose slots free up when they finish. Raise "+
 			"AGENT99_MAX_WORKSPACES in the server's environment if this machine has the "+
-			"memory for another",
+			"memory for more",
 			len(workspaces), strings.Join(rootsLocked(), ", "), max)
 	}
 

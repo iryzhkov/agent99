@@ -103,6 +103,7 @@ if want unit; then
     nvim --clean --headless -u "$REPO/tests/minimal_init.lua" -l "$REPO/tests/unit_edit.lua"
     nvim --clean --headless -u "$REPO/tests/minimal_init.lua" -l "$REPO/tests/unit_testrun.lua"
     nvim --clean --headless -u "$REPO/tests/minimal_init.lua" -l "$REPO/tests/unit_check.lua"
+    nvim --clean --headless -u "$REPO/tests/minimal_init.lua" -l "$REPO/tests/unit_index.lua"
 fi
 
 cd "$REPO/tests/testproj"

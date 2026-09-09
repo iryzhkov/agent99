@@ -745,6 +745,10 @@ local FT_LANGUAGE = {
     ksh = "bash",
     javascriptreact = "javascript",
     typescriptreact = "tsx",
+    -- The QML grammar is packaged as qmljs, so a machine with the parser
+    -- installed still answers "no parser" for a .qml file until the two are
+    -- tied together.
+    qml = "qmljs",
 }
 
 for ft, lang in pairs(FT_LANGUAGE) do

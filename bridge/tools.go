@@ -226,6 +226,7 @@ func runGrep(ses session, args map[string]any) (string, error) {
 	ctxArg := fmt.Sprintf("-C%d", ctx)
 	glob, _ := args["glob"].(string)
 	blame, _ := args["blame"].(bool)
+	asText, _ := args["text"].(bool)
 	tests, _ := args["tests"].(string)
 	kind, _ := args["kind"].(string)
 	if kind != "" && !grepKinds[kind] {
@@ -262,13 +263,22 @@ func runGrep(ses session, args map[string]any) (string, error) {
 		// -H keeps the filename even for a single-file target, which the
 		// annotator's path:line:col parsing depends on.
 		cargs := []string{"-H", "-n", "--column", "--no-heading", "-S", "--sort", "path", ctxArg}
+		if asText {
+			// A source file that happens to hold a NUL byte is still source.
+			cargs = append(cargs, "--text")
+		}
 		if glob != "" {
 			cargs = append(cargs, "-g", glob)
 		}
 		cargs = append(cargs, "-e", pattern, searchTarget)
 		cmd = exec.CommandContext(ctxCancel, "rg", cargs...)
 	} else {
-		cargs := []string{"-rnHIE", ctxArg}
+		cargs := []string{"-rnHE", ctxArg}
+		if asText {
+			cargs = append(cargs, "-a")
+		} else {
+			cargs = append(cargs, "-I")
+		}
 		if glob != "" {
 			cargs = append(cargs, "--include="+glob)
 		}
@@ -297,6 +307,7 @@ func runGrep(ses session, args map[string]any) (string, error) {
 	// between context groups are not hits: they are passed through, never
 	// counted, and collapsed where the filter emptied a group.
 	var lines []string
+	var stoppedEarly []string
 	var testsFiltered, truncated, scanned int
 	filtering := tests == "exclude" || tests == "only"
 	capped := false
@@ -312,6 +323,16 @@ func runGrep(ses session, args map[string]any) (string, error) {
 			if len(lines) > 0 && lines[len(lines)-1] != "--" && len(lines) < maxGrepLines {
 				lines = append(lines, l)
 			}
+		} else if binaryPath := binaryStopPath(l); binaryPath != "" {
+			// ripgrep gives up on a file holding a NUL byte after its first
+			// match and says so on stdout. The line is not a hit, and left
+			// among the results it reads as one while the rest of that file
+			// went unsearched - a TypeScript file with one stray NUL was
+			// searched to its 94kth byte and no further, silently.
+			if searchDir != "" {
+				binaryPath = filepath.Join(searchDir, binaryPath)
+			}
+			stoppedEarly = append(stoppedEarly, binaryPath)
 		} else {
 			if searchDir != "" {
 				l = absolutizeGrepPath(l, searchDir)
@@ -397,10 +418,38 @@ func runGrep(ses session, args map[string]any) (string, error) {
 		notes = append(notes, fmt.Sprintf("... (%d hits are shown unannotated: the classifier stops after "+
 			"the first files; narrow with path= or glob= to annotate them)", unclassified))
 	}
+	if len(stoppedEarly) > 0 && !asText {
+		shown := stoppedEarly
+		if len(shown) > 3 {
+			shown = shown[:3]
+		}
+		notes = append(notes, fmt.Sprintf("... (%d file(s) hold a NUL byte, so the search stopped at the "+
+			"first match in each and the rest of them is unsearched: %s. Pass text=true to search them "+
+			"in full)", len(stoppedEarly), strings.Join(shown, ", ")))
+	}
 	if len(lines) == 0 && len(notes) == 0 {
 		return "(no matches)", nil
 	}
 	return strings.Join(append(lines, notes...), "\n"), nil
+}
+
+// The path out of ripgrep's "<path>: binary file matches (found "\0" byte
+// around offset N)" and "WARNING: stopped searching binary file after match"
+// lines, which arrive on stdout among the results. "" for any other line.
+func binaryStopPath(l string) string {
+	for _, marker := range []string{
+		": WARNING: stopped searching binary file after match",
+		": binary file matches",
+	} {
+		if i := strings.Index(l, marker); i > 0 {
+			// A hit is "path:line:col:text", so anything with a colon before
+			// the marker is a match whose text quotes it, not the warning.
+			if path := l[:i]; !strings.Contains(path, ":") {
+				return path
+			}
+		}
+	}
+	return ""
 }
 
 // A match line is "path:line:col:text" and a context line is

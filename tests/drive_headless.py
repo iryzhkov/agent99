@@ -171,6 +171,10 @@ def group_workspace(c):
     check("open_workspace reports languages",
           "lua" in langs and langs.get("zig", {}).get("treesitter_parser") is False
           and "zig" in (res.get("note") or ""), res)
+    # scripts/lint has no extension and a bash shebang. Reported as no
+    # language at all, its shell tooling looks absent rather than covered.
+    check("a shebang names the language of an extension-less script",
+          "sh" in langs or "bash" in langs, langs)
 
     again = b.call("open_workspace", {"root": root})
     check("reopen is a no-op", again.get("pid") == c.pid, again)
@@ -475,6 +479,134 @@ def group_index(c):
               and "6 list entries are left out" in (entry.get("note") or ""), res)
     os.remove(deps)
 
+    # A constant whose value spans several lines. Some servers report a
+    # variable by the range of its name alone (pyright does), and a one-line
+    # symbol for an eight-line dict is a rewrite that orphans the rest of it.
+    fixtures = os.path.join(root, "lua", "testproj", "fixtures.lua")
+    with open(fixtures, "w") as f:
+        f.write("local RESPONSES = {\n"
+                '    login_ok = "logged in",\n'
+                '    login_bad = "try again",\n'
+                '    gone = "not here",\n'
+                "}\n"
+                "\n"
+                "return RESPONSES\n")
+    res = b.call("find_symbol", {"file": fixtures, "name": "RESPONSES", "include_body": True})
+    match = (res.get("matches") or [{}])[0]
+    body = match.get("body") or []
+    if not body:
+        print("SKIP multi-line constant check: no symbol for RESPONSES")
+    else:
+        check("a multi-line constant carries its whole value",
+              match.get("lines") == "1-5" and len(body) == 5
+              and body[-1].endswith("}"), res)
+        res = b.call("replace_symbol_body", {
+            "file": fixtures, "name_path": "RESPONSES",
+            "body": 'local RESPONSES = { login_ok = "logged in" }', "dry_run": True})
+        removed = [l for l in res.get("diff", []) if l.startswith("-")]
+        check("rewriting it replaces the whole value, not its first line",
+              len(removed) == 5, res)
+    os.remove(fixtures)
+
+    # A file whose only declaration is a top-level const had no outline at
+    # all, so it had no line in the map either: a Go config sample or MIME
+    # table simply was not there.
+    goconst = os.path.join(root, "sample.go")
+    with open(goconst, "w") as f:
+        f.write("package sample\n"
+                "\n"
+                "const sampleConfig = `\n"
+                "listen = 8080\n"
+                "`\n"
+                "\n"
+                "func use() string {\n"
+                "\tlocalVar := sampleConfig\n"
+                "\treturn localVar\n"
+                "}\n")
+    res = b.call("workspace_map", {"glob": "sample.go"})
+    entry = next((f for f in res.get("files", []) if f["file"].endswith("sample.go")), None)
+    if entry is None or "no treesitter parser" in str(res.get("notes") or ""):
+        print("SKIP go const check: sample.go not mapped")
+    else:
+        outline = entry.get("outline") or []
+        check("a file whose only declaration is a const is outlined",
+              any("sampleConfig" in line for line in outline)
+              and any("func use" in line for line in outline)
+              and not any("localVar" in line for line in outline), res)
+    os.remove(goconst)
+
+    # The test-file count belongs to the files the call asked about: a glob
+    # over one directory used to report the whole repository's tests.
+    res = b.call("workspace_map", {"glob": "lua/testproj/*.lua", "include_tests": False})
+    mapped = [f["file"] for f in res.get("files", [])]
+    notes = " ".join(res.get("notes") or [])
+    check("the test-file count is scoped to the glob",
+          all("_test" not in f for f in mapped)
+          and ("1 test files left out" in notes or "test files left out" not in notes), res)
+
+    # A QML file is an object tree: the Items, properties and signals are
+    # most of what it declares, and outlining only its JS functions summed a
+    # 1400-line component up as 34 function names.
+    qml = os.path.join(root, "Panel.qml")
+    with open(qml, "w") as f:
+        f.write("import QtQuick\n"
+                "\n"
+                "Item {\n"
+                "    id: root\n"
+                "\n"
+                "    property string label: \"\"\n"
+                "    signal ready(string text)\n"
+                "\n"
+                "    function refresh() {\n"
+                "        root.label = \"x\"\n"
+                "    }\n"
+                "\n"
+                "    Rectangle {\n"
+                "        color: \"black\"\n"
+                "    }\n"
+                "}\n")
+    res = b.call("skim", {"files": [qml]})
+    entry = res["files"][0]
+    outline = entry.get("outline", [])
+    if "no treesitter parser" in (entry.get("note") or ""):
+        print("SKIP qml checks: no qmljs parser under the test config")
+    else:
+        check("skim outlines QML objects, properties and signals",
+              any("Item {" in line for line in outline)
+              and any("property string label" in line for line in outline)
+              and any("signal ready" in line for line in outline)
+              and any("function refresh" in line for line in outline)
+              and any("Rectangle {" in line for line in outline), res)
+    os.remove(qml)
+
+    # A callback that is one expression declares nothing worth an outline
+    # entry; one with a statement block still does.
+    tsx = os.path.join(root, "widget.js")
+    with open(tsx, "w") as f:
+        f.write("const setPrompt = useStore((store) => store.setPrompt);\n"
+                "const addImage = useStore((store) => store.addImage);\n"
+                "\n"
+                "describe('widget', () => {\n"
+                "    it('renders', () => {\n"
+                "        expect(1).toBe(1);\n"
+                "    });\n"
+                "});\n"
+                "\n"
+                "function render() {\n"
+                "    return null;\n"
+                "}\n")
+    res = b.call("skim", {"files": [tsx]})
+    entry = res["files"][0]
+    outline = entry.get("outline", [])
+    if "no treesitter parser" in (entry.get("note") or ""):
+        print("SKIP javascript checks: no javascript parser under the test config")
+    else:
+        check("a one-expression callback is not a declaration",
+              not any("store.setPrompt" in line for line in outline)
+              and any("function render" in line for line in outline)
+              and any("describe(" in line for line in outline), res)
+    os.remove(tsx)
+
     script = os.path.join(root, "scripts", "build.sh")
     res = b.call("skim", {"files": [script]})
     if "no treesitter parser" in (res["files"][0].get("note") or ""):
@@ -517,6 +649,14 @@ def group_index(c):
         names = [s["name"] for s in res.get("unreferenced", [])]
         check("unreferenced_symbols keeps quiet about a symbol with callers",
               "M.greet" not in names, res)
+    # A helper declared in a test file is used by tests and by nothing else
+    # by design. Dropping test references there reported every test fixture
+    # in a repository as dead - 30 of one project's 72 findings.
+    test_file = os.path.join(root, "lua", "testproj", "util_test.lua")
+    res = b.call("unreferenced_symbols", {"file": test_file})
+    names = [s["name"] for s in res.get("unreferenced", [])]
+    check("a helper used only by its own test file is not a finding",
+          "test_greet" not in names, res)
 
 
 def group_edit(c):
@@ -1311,6 +1451,52 @@ def group_search(c):
     util, main_lua, tools = c.util, c.main_lua, c.tools
 
     reset(c)
+    # A match inside a string literal that sits on a declaration's own line:
+    # calling the whole declaration line "def" kept it under kind=code, which
+    # is the one thing that filter exists to drop.
+    envfile = os.path.join(root, "lua", "testproj", "env.lua")
+    with open(envfile, "w") as f:
+        f.write('local DB = os.getenv("NOTES_DB")\n'
+                "\n"
+                "local function open_db()\n"
+                "    return DB\n"
+                "end\n"
+                "\n"
+                "return { open_db = open_db }\n")
+    r = b.rpc("tools/call", {"name": "grep", "arguments": {
+        "pattern": "NOTES_DB", "path": "lua/testproj/env.lua"}})
+    plain = r["result"]["content"][0]["text"]
+    r = b.rpc("tools/call", {"name": "grep", "arguments": {
+        "pattern": "NOTES_DB", "path": "lua/testproj/env.lua", "kind": "code"}})
+    code_only = r["result"]["content"][0]["text"]
+    check("a string literal on a declaration line is not code",
+          "NOTES_DB" in plain and "NOTES_DB" not in code_only, (plain, code_only))
+    r = b.rpc("tools/call", {"name": "grep", "arguments": {
+        "pattern": "DB", "path": "lua/testproj/env.lua", "kind": "code"}})
+    decl = r["result"]["content"][0]["text"]
+    check("the declaration itself is still code", "local DB" in decl, decl)
+    os.remove(envfile)
+
+    # A source file with a stray NUL byte: the searcher stops at the first
+    # match in it, and the rest goes unsearched. That has to be visible - it
+    # cost a real search half of a 4000-line TypeScript file - and text=true
+    # searches it in full.
+    nul = os.path.join(root, "lua", "testproj", "nul.lua")
+    with open(nul, "wb") as f:
+        f.write(b'-- needle one\nlocal x = "\x00"\n-- needle two\n-- needle three\n')
+    r = b.rpc("tools/call", {"name": "grep", "arguments": {"pattern": "needle", "path": "lua/testproj/nul.lua"}})
+    hit = r["result"]["content"][0]["text"]
+    check("a file the search gave up on is named, not passed off as a result",
+          "hold a NUL byte" in hit and "text=true" in hit
+          and "WARNING" not in hit, hit)
+    r = b.rpc("tools/call", {"name": "grep", "arguments": {
+        "pattern": "needle", "path": "lua/testproj/nul.lua", "text": True}})
+    full = r["result"]["content"][0]["text"]
+    check("text=true searches the whole file",
+          full.count("needle") >= 3 and "hold a NUL byte" not in full, full)
+    os.remove(nul)
+
+    reset(c)
     # File tools run in-process, rooted at the workspace.
     reply = b.rpc("tools/call", {"name": "grep", "arguments": {"pattern": "M.greet"}})
     text = reply["result"]["content"][0]["text"]
@@ -1465,6 +1651,11 @@ def group_files(c):
     res = b.call("undo_edit", {"all": True})
     with open(util) as f:
         check("undo_edit puts a split back", "function M.shout" in f.read(), res)
+    # The destination this move created goes with it: restoring it to the
+    # header it was seeded with left a two-line stub no build complains
+    # about, and a repeated move and undo litters the package with them.
+    check("undo_edit removes a destination the move created",
+          not os.path.exists(split), os.path.exists(split) and open(split).read())
     os.path.exists(split) and os.remove(split)
 
     try:

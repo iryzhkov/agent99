@@ -77,6 +77,34 @@ check("a configuration copy still gets the Lua syntax check",
     any(copy_cmds, "luac") or any(copy_cmds, "luacheck"), copy_cmds)
 vim.fn.delete(copy_root, "rf")
 
+-- A few vendored files of another language are not that language's project.
+-- A TypeScript monorepo carrying seven Python fixtures was answered with
+-- `pyright`, which passed in 0.2s and called 13k unchecked .ts files green.
+local mono = { ["tsconfig.base.json"] = "{}", ["package.json"] = "{}" }
+for i = 1, 200 do
+    mono[("apps/web/src/mod%d.ts"):format(i)] = "export const x = 1"
+end
+for i = 1, 7 do
+    mono[(".repos/vendor/fixture%d.py"):format(i)] = "x = 1"
+end
+local mono_root = scratch(mono)
+local mono_cmds = commands(mono_root)
+check("a handful of vendored .py files is not a Python project",
+    not any(mono_cmds, "pyright") and not any(mono_cmds, "mypy"), mono_cmds)
+vim.fn.delete(mono_root, "rf")
+
+-- The same files, without the TypeScript around them: one module and its
+-- test still has no pyproject.toml and is still a Python project.
+local py_root = scratch({
+    ["app.py"] = "def run():\n    return 1\n",
+    ["test_app.py"] = "from app import run\n",
+})
+local py_cmds = commands(py_root)
+check("a small Python project is still checked",
+    vim.fn.executable("pyright") == 0 and vim.fn.executable("mypy") == 0
+    or any(py_cmds, "pyright") or any(py_cmds, "mypy"), py_cmds)
+vim.fn.delete(py_root, "rf")
+
 -- A Lua library with an init.lua of its own is not a configuration either.
 local lib_root = scratch({
     ["init.lua"] = "return require('lib.core')",

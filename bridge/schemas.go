@@ -381,7 +381,7 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "undo_edit",
-		Description: "Undo the newest symbol edit(s) of this run (count, or all), restoring the previous source. Refuses if the region changed since. Code actions are not covered.",
+		Description: "Undo the newest symbol edit(s) of this run (count, or all), restoring the previous source, and removing a file the run created. Refuses if the region changed since. A language server's own code action is not covered; an action offered by a refused edit is, since it re-runs that edit tool.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -558,6 +558,7 @@ var fileTools = []tool{
 				},
 				"context": map[string]any{"type": "integer", "description": "Context lines around each match (default 2, max 10)."},
 				"blame":   map[string]any{"type": "boolean", "description": "Add git blame age per hit (slower)."},
+				"text":    map[string]any{"type": "boolean", "description": "Search files holding a NUL byte in full. Without it the searcher stops at the first match in such a file - a source file with one stray NUL is searched no further - and the reply names the files it gave up on."},
 			},
 			"required": []string{"pattern"},
 		},

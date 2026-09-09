@@ -631,6 +631,13 @@ local function textual_hits(root, names)
     return hits
 end
 
+-- The identifier a symbol is written as at a call site: the last component
+-- of the name the index gives it. A Go method is indexed `(*Archiver).Do`
+-- and called `a.Do(...)`; a Lua one is `M.greet` and called `util.greet(...)`.
+local function bare_name(name)
+    return name:match("[^%.:/]+$") or name
+end
+
 -- The line inside the symbol that carries its name, which is where a
 -- reference request has to be made from. Almost always the first line; a
 -- grammar that puts the name on the line after the keyword is the reason
@@ -660,12 +667,17 @@ end
 -- question could not be answered, which is not the same as zero and is
 -- reported as such.
 local function references_outside(bufnr, path, entry, lines, client, root, cache, want_tests)
+    -- A helper declared in a test file is used by tests and nowhere else by
+    -- design, so dropping test references there reports every one of them as
+    -- dead: 30 of one repository's 72 findings were its own test fixtures.
+    -- Test references still do not keep production code alive.
+    local own_is_test = core.is_test_path(rel_path(path))
     local function counts(list, file_of)
         local n = 0
         for _, hit in ipairs(list) do
             local file, lnum = file_of(hit)
             local own = file == path and lnum >= entry.first and lnum <= entry.last
-            if not own and (want_tests or not core.is_test_path(rel_path(file))) then
+            if not own and (want_tests or own_is_test or not core.is_test_path(rel_path(file))) then
                 n = n + 1
             end
         end
@@ -703,12 +715,19 @@ local function references_outside(bufnr, path, entry, lines, client, root, cache
         end)
     end
     -- The text search ran once for every name before this loop; a name it
-    -- did not cover (a batch that failed) is searched on its own here.
-    if cache[entry.name] == nil then
-        local found = textual_hits(root, { entry.name })
-        cache[entry.name] = found and found[entry.name] or false
+    -- did not cover (a batch that failed) is searched on its own here. It
+    -- searches the bare name: a method indexed as `(*Archiver).Candidates`
+    -- is written `a.Candidates(...)` at every call site, so a whole-word
+    -- search for the qualified spelling can never hit, and every method in
+    -- the file came back unreferenced. The bare name over-counts instead
+    -- (another type's method of the same name is a hit), which keeps live
+    -- code off the list rather than putting it on.
+    local key = bare_name(entry.name)
+    if cache[key] == nil then
+        local found = textual_hits(root, { key })
+        cache[key] = found and found[key] or false
     end
-    local hits = cache[entry.name]
+    local hits = cache[key]
     if hits == false then
         return nil
     end
@@ -762,9 +781,10 @@ local function unreferenced_symbols(args)
                     and checked < MAX_UNREFERENCED_SYMBOLS then
                     checked = checked + 1
                     entries[#entries + 1] = e
-                    if not client and not text_seen[e.name] then
-                        text_seen[e.name] = true
-                        text_names[#text_names + 1] = e.name
+                    local key = bare_name(e.name)
+                    if not client and not text_seen[key] then
+                        text_seen[key] = true
+                        text_names[#text_names + 1] = key
                     end
                 end
             end

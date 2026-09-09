@@ -1085,6 +1085,12 @@ end
 -- counts, so the next report names only what is new to the list. The hint
 -- about full_diagnostics goes out once per session.
 local last_prior_sigs = {}
+
+-- Signatures carried over one extra reply because they left the list without
+-- being fixed - a server re-analyzing a file drops its diagnostics and
+-- publishes them again a moment later. Carried once, so a diagnostic that is
+-- really gone stops being remembered on the reply after that.
+local carried_prior_sigs = {}
 local preexisting_hinted = false
 
 -- ctx (optional): label = what the edit was, for the deferred and late
@@ -1147,9 +1153,12 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     local remaining = vim.deepcopy(before or {})
     local new_here, new_elsewhere, prior_items = {}, {}, {}
     local preexisting = { errors = 0, warnings = 0 }
+    -- Which files still have anything published, for the fixed count below.
+    local still_reported = {}
     for _, d in ipairs(vim.diagnostic.get(nil)) do
         if d.severity <= vim.diagnostic.severity.WARN then
             local sig = diag_signature(d)
+            still_reported[vim.api.nvim_buf_get_name(d.bufnr)] = true
             if (remaining[sig] or 0) > 0 then
                 remaining[sig] = remaining[sig] - 1
                 if d.severity == vim.diagnostic.severity.ERROR then
@@ -1176,8 +1185,21 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
             end
         end
     end
+    -- What is in the snapshot and not here now looks fixed, and mostly is
+    -- not: a server that re-analyzes a file publishes an empty set for it
+    -- first, so an edit to one file was reported as having fixed five
+    -- diagnostics in another that were back a moment later. A file that
+    -- still reports something has really lost the ones that went; a file
+    -- that reports nothing at all, and was not the file edited, is a server
+    -- mid-republish and is not credited to this edit.
+    local edited_file = bufnr and vim.api.nvim_buf_get_name(bufnr) or nil
     local fixed = 0
-    for _, n in pairs(remaining) do fixed = fixed + n end
+    for sig, n in pairs(remaining) do
+        local file = sig:match("^(.-)|") or ""
+        if file == edited_file or still_reported[file] then
+            fixed = fixed + n
+        end
+    end
     if #new_here > 15 then
         local extra = #new_here - 15
         new_here = vim.list_slice(new_here, 1, 15)
@@ -1264,6 +1286,17 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         if not preexisting_hinted then
             report.preexisting = report.preexisting .. "; full_diagnostics=true lists them all"
             preexisting_hinted = true
+        end
+    end
+    -- The same churn empties a file's list and fills it again, and every
+    -- return read as "new to this list". What the last two replies saw
+    -- counts as seen, so a diagnostic has to be genuinely new to be named.
+    for sig, n in pairs(last_prior_sigs) do
+        if not seen_now[sig] and (carried_prior_sigs[sig] or 0) == 0 then
+            seen_now[sig] = n
+            carried_prior_sigs[sig] = n
+        else
+            carried_prior_sigs[sig] = nil
         end
     end
     last_prior_sigs = seen_now
@@ -1700,8 +1733,28 @@ local function edit_chunks(args)
             absolute = args.absolute,
         } }
     end
+    -- A key a chunk does not have is a chunk that means something else. The
+    -- one that costs is `file`: chunks are one file per call, so a chunk
+    -- carrying its own file was silently scoped to the call's file, and two
+    -- of them came back as "chunks overlap: lines 1-1 of colors.lua and
+    -- lines 1-1 of colors.lua" - the same file named twice, which is the
+    -- only hint that the key was dropped.
+    local KNOWN = {
+        first_line = true, last_line = true, text = true, expect = true,
+        match = true, absolute = true, name_path = true,
+    }
     local out = {}
     for i, c in ipairs(chunks) do
+        for k in pairs(c) do
+            if not KNOWN[k] then
+                if k == "file" then
+                    err("chunk %d: a chunk cannot name its own file; one call edits one file "
+                        .. "(the call's file=). Several files take one call each.", i)
+                end
+                err("chunk %d: unknown key %q; a chunk takes first_line, last_line, match, "
+                    .. "text, expect, absolute and name_path", i, tostring(k))
+            end
+        end
         local first, last = tonumber(c.first_line), tonumber(c.last_line)
         if c.match ~= nil and type(c.match) ~= "string" then
             err("chunk %d: match must be a string: the text to replace, as it is now", i)
@@ -2347,7 +2400,9 @@ local function undo_edit(args)
         return {
             undone = {},
             note = "no symbol edits recorded in this run; apply_code_action edits are "
-                .. "not tracked here - reverse those with another code action or an edit",
+                .. "not tracked here - reverse a server's own action with another code "
+                .. "action or an edit (an action offered by a refused edit is tracked: it "
+                .. "re-runs that edit tool)",
         }
     end
     local last_bufnr
@@ -3317,6 +3372,26 @@ local function move_symbols(args)
         end
         notify_file_operation("workspace/didCreateFiles", { { uri = file_uri(to_path) } })
         created = true
+        -- Recorded before the content edits below, so undo_edit takes those
+        -- back first and then removes the file this call made. Without it the
+        -- undo restored the destination to its seeded header and left a
+        -- two-line `package x` stub behind, which no build and no linter
+        -- complains about and a repeated move/undo litters the package with.
+        require("agent99.edits").record_file_op({
+            file = to_path,
+            kind = "create_file",
+            undo = function()
+                if not vim.uv.fs_stat(to_path) then
+                    return "the file is already gone"
+                end
+                forget_buf(to_path)
+                if vim.fn.delete(to_path) ~= 0 then
+                    return "could not delete it"
+                end
+                notify_file_operation("workspace/didDeleteFiles", { { uri = file_uri(to_path) } })
+                return nil
+            end,
+        })
     end
 
     local to_buf = load_buf(to_path)

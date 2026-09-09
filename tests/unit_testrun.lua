@@ -134,7 +134,46 @@ check("guess: filter skips make and reaches go -run",
 vim.fn.mkdir(root .. "/pkg", "p")
 g = testrun.guess_test_command(root, root .. "/pkg")
 check("guess: directory path narrows go", g[1] and g[1].cmd == "go test ./pkg/...", g)
+-- "." is the root, which is no narrowing: it used to come out as ././...
+g = testrun.guess_test_command(root, ".")
+check("guess: a path of . is the root, not a subdirectory",
+    g[1] and g[1].cmd == "make test" and g[2] and g[2].cmd == "go test ./...", g)
 vim.fn.delete(root, "rf")
+
+-- The generic parser reads prose, so it must not turn a warning printed by
+-- a passing run into failing tests. unittest through `python -m unittest`
+-- has no parser of its own, and the standard library's ResourceWarning
+-- lines were reported as three failures next to the runner's own "OK".
+local unittest_out = lines([[
+...
+/usr/lib/python3.14/tempfile.py:484: ResourceWarning: Implicitly cleaning up <HTTPError 404: 'Not Found'>
+  _warnings.warn(warn_message, ResourceWarning)
+----------------------------------------------------------------------
+Ran 3 tests in 0.066s
+
+OK]])
+local generic = testrun.parse_failures(nil, unittest_out, "/tmp/project", 0)
+check("generic: a passing run reports no failures", #generic == 0, generic)
+local generic_failed = testrun.parse_failures(nil, unittest_out, "/tmp/project", 1)
+check("generic: a warning from the standard library is not a failing test",
+    #generic_failed == 0, generic_failed)
+local real_failure = testrun.parse_failures(nil, lines([[
+FAIL: test_add (tests.test_math.MathTest)
+tests/test_math.py:12: AssertionError: add(1, 2) == 4
+Ran 3 tests in 0.010s]]), "/tmp/project", 1)
+check("generic: a real failure in the project is still reported",
+    #real_failure >= 1, real_failure)
+
+-- testify prints the location on one line and the detail under it.
+local go_testify = testrun.parse_failures("go", lines([[
+--- FAIL: TestLiteralColonWithRun (0.00s)
+    gin_test.go:1077:
+        	Error Trace:	/repo/gin_test.go:1077
+        	Error:      	Not equal: expected: 418, actual: 200
+FAIL]]), "/repo", 1)
+check("go: a failure with the detail on the next line carries a message",
+    go_testify[1] and go_testify[1].line == 1077
+    and (go_testify[1].message or ""):find("Error Trace") ~= nil, go_testify)
 
 if failures > 0 then
     io.stdout:write(("unit_testrun: %d failed\n"):format(failures))

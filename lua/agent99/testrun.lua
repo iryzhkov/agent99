@@ -40,6 +40,13 @@ local function guess_test_command(root, path, filter)
     local rel
     if path then
         rel = path:sub(1, #root + 1) == root .. "/" and path:sub(#root + 2) or rel_path(path)
+        -- "." and "./" name the root, which is no narrowing at all: passed
+        -- through, they came out as `go test ././...`, and they hid the
+        -- Makefile target that a call with no path would have found.
+        rel = (rel:gsub("^%./", ""))
+        if rel == "." or rel == "" then
+            rel, path = nil, nil
+        end
     end
     local function add(cmd, runner, note)
         guesses[#guesses + 1] = { cmd = cmd, runner = runner, note = note }
@@ -120,6 +127,13 @@ local function parse_go(lines)
             local file, line, msg = l:match("^%s+([%w_%-./]+%.go):(%d+): ?(.*)$")
             if file and not current.file then
                 current.file, current.line, current.message = file, tonumber(line), msg
+                -- testify prints the location on its own line and the detail
+                -- under it, so the message came back empty next to an output
+                -- that had "expected: 418 / actual: 200" in it.
+                if msg == "" then current.want_message = true end
+            elseif current.want_message and l:match("%S") then
+                current.message = (l:gsub("^%s+", ""):gsub("%s+$", ""))
+                current.want_message = nil
             elseif l:match("^FAIL") or l:match("^ok") or l:match("^%-%-%- ") then
                 current = nil
             end
@@ -129,6 +143,10 @@ local function parse_go(lines)
     for _, l in ipairs(lines) do
         local pkg = l:match("^FAIL%s+(%S+)%s+%[build failed%]") or l:match("^FAIL%s+(%S+)%s+%[setup failed%]")
         if pkg then pkg_fail[#pkg_fail + 1] = pkg end
+    end
+    for _, f in ipairs(failures) do
+        f.want_message = nil
+        if f.message == "" then f.message = nil end
     end
     return failures, pkg_fail
 end
@@ -236,12 +254,26 @@ end
 
 -- A generic sweep for runners without a parser: any "path:line" on a line
 -- that also says fail/error/assert, so a failure still gets a location.
-local function parse_generic(lines)
+local function parse_generic(lines, root, exit_code)
+    -- A runner that exited 0 said it passed, and this parser reads prose:
+    -- `unittest` printing `ResourceWarning: Implicitly cleaning up
+    -- <HTTPError 404>` from the standard library was reported as three
+    -- failing tests next to the runner's own "OK". Where a real parser
+    -- exists it decides; here the exit code does.
+    if exit_code == 0 then
+        return {}
+    end
     local failures, seen = {}, {}
     for _, l in ipairs(lines) do
-        if l:lower():match("fail") or l:lower():match("error") or l:lower():match("assert") then
+        local lower = l:lower()
+        local warning = l:match("%f[%w][%w_]*Warning:%s") ~= nil
+        if not warning and (lower:match("fail") or lower:match("error") or lower:match("assert")) then
             local file, line = l:match("([%w_%-./]+%.%a+):(%d+)")
-            if file and not seen[l] then
+            -- A location in the standard library or in a dependency is where
+            -- the failure surfaced, not a test of this project that failed.
+            local outside = file ~= nil and file:sub(1, 1) == "/"
+                and (root == nil or file:sub(1, #root + 1) ~= root .. "/")
+            if file and not outside and not seen[l] then
                 seen[l] = true
                 failures[#failures + 1] = { test = l:gsub("^%s+", ""), file = file, line = tonumber(line) }
             end
@@ -262,7 +294,7 @@ local function detect_runner(cmd)
     return nil
 end
 
-local function parse_failures(runner, lines)
+local function parse_failures(runner, lines, root, exit_code)
     if runner == "go" then return parse_go(lines) end
     if runner == "pytest" then return parse_pytest(lines) end
     if runner == "js" then return parse_js(lines) end
@@ -275,7 +307,7 @@ local function parse_failures(runner, lines)
         if l:match("^test %S+ %.%.%. ") then return parse_cargo(lines) end
         if l:match("^%s*[✕✗×●] ") or l:match("^%s*Tests:%s+%d") then return parse_js(lines) end
     end
-    return parse_generic(lines), nil
+    return parse_generic(lines, root, exit_code), nil
 end
 
 -- Passed and failed counts from the runner's own summary line, when it
@@ -401,7 +433,7 @@ local function run_tests(args)
     -- A test run is one more way files appear (generated code, fixtures);
     -- the servers hear of them here rather than at the next edit.
     core.resync_open_buffers()
-    local failures, broken = parse_failures(runner, lines)
+    local failures, broken = parse_failures(runner, lines, root, result.code)
     annotate(root, failures)
     local passed, failed = parse_counts(lines)
     if failed == nil and #failures > 0 then failed = #failures end
