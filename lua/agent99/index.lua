@@ -2335,13 +2335,20 @@ local function classify_hit(bufnr, line, col, entry)
     if not node then
         return nil
     end
+    -- A double-quoted shell string is live code: `cd "$PROJECT_DIR"` expands
+    -- inside it, and calling it a string literal made kind=code skip exactly
+    -- the occurrences a rename has to change - three scripts were left
+    -- assigning the new name and reading the old one, reported as a clean
+    -- success. Only a single-quoted string (raw_string) is inert.
+    local ft = vim.bo[bufnr].filetype
+    local shell = ft == "sh" or ft == "bash" or ft == "zsh" or ft == "ksh"
     local n = node
     while n do
         local t = n:type()
         if t:find("comment", 1, true) then
             return "comment"
         end
-        if t:find("string", 1, true) then
+        if t:find("string", 1, true) and not (shell and t == "string") then
             return "string"
         end
         n = n:parent()

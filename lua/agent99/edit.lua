@@ -1495,6 +1495,13 @@ end
 -- build the reply with the post-edit report.
 local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_old, old_lines, count, fields, regions)
     local opts = post_edit_options(args)
+    -- The whole file as the edit left it, before any polish. Organizing
+    -- imports rewrites the import block, which is above the edited region
+    -- and so outside what the ledger records: undo_edit then reported
+    -- "remaining: 0" while leaving a reindented import block behind, and the
+    -- caller had to reach for git. If the polish touches anything above the
+    -- region, the ledger entry becomes the whole file.
+    local pre_polish = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
     local pfirst, pcount, done, extra_old, info
     if regions and #regions > 1 then
         -- Several edited regions far apart (chunks in different symbols):
@@ -1543,6 +1550,26 @@ local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_o
     if extra_old and #extra_old > 0 then
         old_lines = vim.list_extend(vim.list_slice(old_lines, 1, #old_lines), extra_old)
         last_old = last_old + #extra_old
+    end
+    -- Did the polish change anything above the region the ledger holds? The
+    -- lines above it were untouched by the edit itself, so pre_polish is the
+    -- pre-edit text there, and comparing is enough.
+    local after_polish = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local above_changed = false
+    for i = 1, math.min(first, pfirst) - 1 do
+        if pre_polish[i] ~= after_polish[i] then
+            above_changed = true
+            break
+        end
+    end
+    if above_changed then
+        local whole_old = vim.list_slice(pre_polish, 1, first - 1)
+        vim.list_extend(whole_old, old_lines)
+        vim.list_extend(whole_old, vim.list_slice(pre_polish, first + count))
+        old_lines = whole_old
+        first, pfirst = 1, 1
+        last_old = #whole_old
+        pcount = #after_polish
     end
     local new_lines = vim.api.nvim_buf_get_lines(bufnr, pfirst - 1, pfirst - 1 + pcount, false)
     record_edit(bufnr, ledger_path, kind, pfirst, last_old + (pfirst - first), old_lines, new_lines)
@@ -1610,9 +1637,37 @@ local function replace_symbol_body(args)
     end
     local new_lines = vim.split((args.body:gsub("\n+$", "")), "\n", { plain = true })
     local old = vim.api.nvim_buf_get_lines(bufnr, entry.first - 1, entry.last, false)
+    -- Written at the declaration's own indentation, which is what the tool
+    -- has always promised and did not do: a Python method replaced with a
+    -- body starting at column 0 landed at column 0, so it and the method
+    -- after it fell out of their class - the suite went from three tests to
+    -- one, and pyright, the diagnostics and run_tests all called it clean.
+    -- The whole block shifts by one delta, so relative indentation inside it
+    -- is the caller's business.
+    local reindented
+    local want = (old[1] or ""):match("^[ \t]*") or ""
+    local have = (new_lines[1] or ""):match("^[ \t]*") or ""
+    if want ~= have then
+        local shiftable = true
+        for _, l in ipairs(new_lines) do
+            if l ~= "" and l:sub(1, #have) ~= have then
+                shiftable = false
+                break
+            end
+        end
+        if shiftable then
+            local shifted = {}
+            for i, l in ipairs(new_lines) do
+                shifted[i] = l == "" and l or (want .. l:sub(#have + 1))
+            end
+            new_lines = shifted
+            reindented = ("the body was written at column %d and %s sits at column %d; "
+                .. "every line was shifted to match"):format(#have, entry.path, #want)
+        end
+    end
     if args.dry_run then
         return vim.tbl_extend("force",
-            { file = rel_path(vim.api.nvim_buf_get_name(bufnr)) },
+            { file = rel_path(vim.api.nvim_buf_get_name(bufnr)), reindented = reindented },
             preview_diff(old, new_lines, entry.path))
     end
     local conflict = primary_region_conflict(bufnr, entry.first, entry.last)
@@ -1621,7 +1676,7 @@ local function replace_symbol_body(args)
     local before = diag_snapshot()
     vim.api.nvim_buf_set_lines(bufnr, entry.first - 1, entry.last, false, new_lines)
     return finish_edit(bufnr, args, before, entry.path, "replace", entry.first, entry.last,
-        old, #new_lines, { replaced = entry.path })
+        old, #new_lines, { replaced = entry.path, reindented = reindented })
 end
 
 -- Join lines with each one's indentation dropped. Text that a format pass
@@ -2905,8 +2960,16 @@ local function replace_pattern(args)
             .. "match); those positions were left alone, and the count above may be short"
     end
     if total == 0 then
-        result.summary = "no replacements: nothing matched"
-            .. (skipped_total > 0 and ", except in comments and string literals" or "")
+        -- "nothing matched" is a claim about the project; with files left
+        -- unlooked-at it is a claim about a prefix of it. A 555-file glob
+        -- capped at 400 answered "nothing matched" while the only matching
+        -- file sat in the 155 it never opened.
+        result.summary = capped > 0
+            and ("no replacements in the %d files looked at, and %d further files were not "
+                .. "looked at (cap: %d) - this is not \"nothing matched\"; narrow with glob= "
+                .. "or files= to cover them"):format(#files, capped, MAX_PATTERN_FILES)
+            or "no replacements: nothing matched"
+                .. (skipped_total > 0 and ", except in comments and string literals" or "")
         if #alts == 0 and not args.literal then
             local traps = very_magic_traps(pattern)
             if #traps > 0 then

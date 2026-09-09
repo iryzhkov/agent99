@@ -256,7 +256,9 @@ func runGrep(ses session, args map[string]any) (string, error) {
 	ctxCancel, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var cmd *exec.Cmd
+	usedRg := false
 	if _, err := exec.LookPath("rg"); err == nil {
+		usedRg = true
 		// --sort path costs rg its parallelism but makes the output
 		// deterministic; without it two identical greps are not
 		// byte-identical, which defeats the duplicate-result guard.
@@ -266,6 +268,12 @@ func runGrep(ses session, args map[string]any) (string, error) {
 		if asText {
 			// A source file that happens to hold a NUL byte is still source.
 			cargs = append(cargs, "--text")
+		} else {
+			// Without this a file whose NUL comes before the first match is
+			// skipped in silence - a .go file with three matches around one
+			// NUL byte answered "(no matches)". With it, ripgrep says which
+			// file it gave up on, and the reply can pass that on.
+			cargs = append(cargs, "--binary")
 		}
 		if glob != "" {
 			cargs = append(cargs, "-g", glob)
@@ -364,6 +372,15 @@ func runGrep(ses session, args map[string]any) (string, error) {
 	if len(lines) > 0 && lines[len(lines)-1] == "--" {
 		lines = lines[:len(lines)-1]
 	}
+	// ripgrep announces a file it gave up on only when it had already found a
+	// match in it. A NUL in the first block makes it classify the file as
+	// binary and skip it in silence, and then exit 1: three matches in a .go
+	// file came back as "(no matches)", an empty answer that looks like an
+	// answer. Only an empty result is worth a second pass, and an empty
+	// search is the cheap one to repeat.
+	if len(lines) == 0 && len(stoppedEarly) == 0 && !asText && usedRg {
+		stoppedEarly = append(stoppedEarly, textOnlyMatches(pattern, glob, searchDir, searchTarget)...)
+	}
 	waitErr := cmd.Wait()
 	if capped {
 		// The searcher was stopped, so its exit status says nothing.
@@ -377,6 +394,9 @@ func runGrep(ses session, args map[string]any) (string, error) {
 		// note, so the caller sees both.
 		ee, isExit := waitErr.(*exec.ExitError)
 		if isExit && ee.ExitCode() == 1 && len(lines) == 0 {
+			if len(stoppedEarly) > 0 {
+				return binaryNote(stoppedEarly), nil
+			}
 			return "(no matches)", nil
 		}
 		detail := stderr.String()
@@ -419,18 +439,52 @@ func runGrep(ses session, args map[string]any) (string, error) {
 			"the first files; narrow with path= or glob= to annotate them)", unclassified))
 	}
 	if len(stoppedEarly) > 0 && !asText {
-		shown := stoppedEarly
-		if len(shown) > 3 {
-			shown = shown[:3]
-		}
-		notes = append(notes, fmt.Sprintf("... (%d file(s) hold a NUL byte, so the search stopped at the "+
-			"first match in each and the rest of them is unsearched: %s. Pass text=true to search them "+
-			"in full)", len(stoppedEarly), strings.Join(shown, ", ")))
+		notes = append(notes, binaryNote(stoppedEarly))
 	}
 	if len(lines) == 0 && len(notes) == 0 {
 		return "(no matches)", nil
 	}
 	return strings.Join(append(lines, notes...), "\n"), nil
+}
+
+// The files a search matches only when they are read as text: those holding
+// a NUL byte, which the searcher skips or stops at. Run only for a search
+// that came back empty, where the alternative is answering "(no matches)"
+// about a file full of them.
+func textOnlyMatches(pattern, glob, dir, target string) []string {
+	args := []string{"--text", "--files-with-matches", "-m", "1", "-S"}
+	if glob != "" {
+		args = append(args, "-g", glob)
+	}
+	args = append(args, "-e", pattern, target)
+	cmd := exec.Command("rg", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var files []string
+	for _, f := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if f == "" {
+			continue
+		}
+		if dir != "" {
+			f = filepath.Join(dir, f)
+		}
+		files = append(files, f)
+	}
+	return files
+}
+
+// What the reply says about files the search could not read in full.
+func binaryNote(files []string) string {
+	shown := files
+	if len(shown) > 3 {
+		shown = shown[:3]
+	}
+	return fmt.Sprintf("... (%d file(s) hold a NUL byte: they are read only as far as it, or not at "+
+		"all, so matches in them are missing from this answer: %s. Pass text=true to search them in "+
+		"full)", len(files), strings.Join(shown, ", "))
 }
 
 // The path out of ripgrep's "<path>: binary file matches (found "\0" byte

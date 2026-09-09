@@ -683,6 +683,26 @@ local function references_outside(bufnr, path, entry, lines, client, root, cache
         end
         return n
     end
+    -- The text search ran once for every name before this loop; a name it
+    -- did not cover (a batch that failed) is searched on its own here. It
+    -- searches the bare name: a method indexed as `(*Archiver).Candidates`
+    -- is written `a.Candidates(...)` at every call site, so a whole-word
+    -- search for the qualified spelling can never hit, and every method in
+    -- the file came back unreferenced. The bare name over-counts instead
+    -- (another type's method of the same name is a hit), which keeps live
+    -- code off the list rather than putting it on.
+    local function text_count()
+        local key = bare_name(entry.name)
+        if cache[key] == nil then
+            local found = textual_hits(root, { key })
+            cache[key] = found and found[key] or false
+        end
+        local hits = cache[key]
+        if hits == false then
+            return nil
+        end
+        return counts(hits, function(hit) return hit.file, hit.line end)
+    end
     if client then
         local lnum, _, col = name_line(lines, entry)
         if not lnum then
@@ -707,31 +727,57 @@ local function references_outside(bufnr, path, entry, lines, client, root, cache
         if type(result) ~= "table" then
             return nil
         end
-        return counts(result, function(loc)
+        local n = counts(result, function(loc)
             local uri = loc.uri or loc.targetUri
             local range = loc.range or loc.targetSelectionRange
             return uri and vim.uri_to_fname(uri) or path,
                 range and (range.start.line + 1) or 0
         end)
+        if n > 0 then
+            return n
+        end
+        -- Zero from the server is the answer that gets code deleted, and it
+        -- is also what a server whose module graph does not resolve says
+        -- about everything: on a monorepo with no node_modules installed,
+        -- tsserver reported a function with two live call sites in another
+        -- package as referenced by nobody. A zero is therefore cross-checked
+        -- against the text search, which knows nothing about modules; when
+        -- that cannot run either, the server's answer stands.
+        local text = text_count()
+        return text or 0
     end
-    -- The text search ran once for every name before this loop; a name it
-    -- did not cover (a batch that failed) is searched on its own here. It
-    -- searches the bare name: a method indexed as `(*Archiver).Candidates`
-    -- is written `a.Candidates(...)` at every call site, so a whole-word
-    -- search for the qualified spelling can never hit, and every method in
-    -- the file came back unreferenced. The bare name over-counts instead
-    -- (another type's method of the same name is a hit), which keeps live
-    -- code off the list rather than putting it on.
-    local key = bare_name(entry.name)
-    if cache[key] == nil then
-        local found = textual_hits(root, { key })
-        cache[key] = found and found[key] or false
+    return text_count()
+end
+
+-- A test the runner reaches by reflection, or a program's entry point. These
+-- have no caller by construction, so listing them is noise that buries the
+-- findings: 78 of one run's 78 entries were Go test functions, and they ate
+-- the file budget on the way.
+local function entry_point(entry, path)
+    local name = bare_name(entry.name)
+    if name == "main" or name == "init" or name == "setup" or name == "teardown" then
+        return true
     end
-    local hits = cache[key]
-    if hits == false then
-        return nil
+    if not core.is_test_path(rel_path(path)) then
+        return false
     end
-    return counts(hits, function(hit) return hit.file, hit.line end)
+    return name:match("^Test%u") ~= nil or name:match("^Benchmark%u") ~= nil
+        or name:match("^Example%u") ~= nil or name:match("^Fuzz%u") ~= nil
+        or name:match("^test_") ~= nil or name:match("^[Tt]est") ~= nil
+end
+
+-- A field set on an object this file did not declare: `vim.opt.number`,
+-- `os.environ["X"]`. Servers report those as symbols of the file, and a
+-- setting is not a definition anything could reference - 24 of 27 findings
+-- in a Neovim configuration were `vim.opt.*` lines. A field on an object the
+-- file does declare (`M.greet` after `local M = {}`) is a real declaration
+-- and stays.
+local function foreign_field(entry, declared_here)
+    local head = (entry.name or ""):match("^[^%.:]+")
+    if not head or head == entry.name then
+        return false
+    end
+    return not declared_here[head]
 end
 
 local function unreferenced_symbols(args)
@@ -776,8 +822,19 @@ local function unreferenced_symbols(args)
             local client = core.client_for(bufnr, "textDocument/references")
             methods[client and "language server" or "text search"] = true
             local entries = {}
+            -- Only undotted names count as declared here: seeding this from
+            -- every entry would let `vim.opt.number` declare `vim`, and so
+            -- vouch for itself.
+            local declared_here = {}
+            for _, e in ipairs(symbol_index(bufnr)) do
+                local name = e.name or ""
+                if name ~= "" and not name:find("[%.:]") then
+                    declared_here[name] = true
+                end
+            end
             for _, e in ipairs(symbol_index(bufnr)) do
                 if e.name and e.name ~= "" and not e.path:find("/", 1, true)
+                    and not entry_point(e, path) and not foreign_field(e, declared_here)
                     and checked < MAX_UNREFERENCED_SYMBOLS then
                     checked = checked + 1
                     entries[#entries + 1] = e
@@ -835,6 +892,10 @@ local function unreferenced_symbols(args)
     end
     if search_note then
         res.search_note = search_note
+    end
+    if checked >= MAX_UNREFERENCED_SYMBOLS then
+        res.symbols_note = ("stopped after %d symbols; the files after that were not fully "
+            .. "checked - narrow with a smaller glob or a files list"):format(MAX_UNREFERENCED_SYMBOLS)
     end
     if capped > 0 then
         res.note = ("%d further files were not checked (cap: %d)"):format(capped, MAX_UNREFERENCED_FILES)

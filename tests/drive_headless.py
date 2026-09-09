@@ -682,6 +682,23 @@ def group_index(c):
     names = [s["name"] for s in res.get("unreferenced", [])]
     check("a helper used only by its own test file is not a finding",
           "test_greet" not in names, res)
+    # Settings on an object the file did not declare are not declarations:
+    # 24 of 27 findings in a Neovim configuration were `vim.opt.*` lines.
+    settings = os.path.join(root, "lua", "testproj", "settings.lua")
+    with open(settings, "w") as f:
+        f.write("vim.opt.number = true\n"
+                "vim.opt.tabstop = 4\n"
+                "vim.g.mapleader = ' '\n"
+                "\n"
+                "function orphan_helper()\n"
+                "    return 1\n"
+                "end\n")
+    res = b.call("unreferenced_symbols", {"file": settings})
+    names = [s["name"] for s in res.get("unreferenced", [])]
+    check("a setting on a foreign object is not reported as unreferenced",
+          not any(n.startswith("vim.") for n in names)
+          and any("orphan_helper" in n for n in names), res)
+    os.remove(settings)
 
 
 def group_edit(c):
@@ -1188,6 +1205,23 @@ def group_edit(c):
         check("replace_pattern refuses a bad pattern", "does not compile" in str(e), e)
     reset(c)
 
+    # A double-quoted shell string is live code - `cd "$DIR"` expands inside
+    # it - so kind=code must not skip it: skipping left three scripts
+    # assigning a new name and reading the old one, reported as a success.
+    shellfile = os.path.join(root, "scripts", "paths.sh")
+    with open(shellfile, "w") as f:
+        f.write("#!/usr/bin/env bash\n"
+                "PROJECT_DIR=/tmp/x\n"
+                'cd "$PROJECT_DIR" || exit 1\n'
+                "echo 'literal $PROJECT_DIR stays'\n")
+    res = b.call("replace_pattern", {
+        "files": [shellfile], "pattern": "PROJECT_DIR", "replacement": "REPO_DIR",
+        "literal": True, "kind": "code", "dry_run": True})
+    check("a double-quoted shell string is code, a single-quoted one is not",
+          res.get("total_replacements") == 2 and "1 matches are inside" in (res.get("left_alone") or ""),
+          res)
+    os.remove(shellfile)
+
     # An alternation of lines of code: in very magic mode `=` makes the atom
     # before it optional, so the branch holding one matches nothing while
     # the reply still reports the files the other branch matched. Each
@@ -1269,6 +1303,79 @@ def group_edit(c):
               "no such file" in str(e) and "lua/testproj/util.lua" in str(e), e)
     reset(c)
 
+
+def group_indent(c):
+    """A body written at the wrong indentation: the tool says it matches the
+    file's, and silently did not - a Python method replaced at column 0 took
+    the method after it out of the class."""
+    b, root = c.b, c.root
+
+    reset(c)
+    klass = os.path.join(root, "lua", "testproj", "cls.py")
+    with open(klass, "w") as f:
+        f.write("class Suite:\n"
+                "    def test_alpha(self):\n"
+                "        return 1\n"
+                "\n"
+                "    def test_beta(self):\n"
+                "        return 2\n"
+                "\n"
+                "    def test_gamma(self):\n"
+                "        return 3\n")
+    res = b.call("find_symbol", {"file": klass, "name": "Suite/test_beta"})
+    if res.get("count", 0) == 0:
+        print("SKIP indentation check: no symbol for Suite/test_beta")
+        os.remove(klass)
+        return
+    res = b.call("replace_symbol_body", {
+        "file": klass, "name_path": "Suite/test_beta",
+        "body": "def test_beta(self):\n    return 22"})
+    text = open(klass).read()
+    check("a body written at column 0 is shifted to the declaration's column",
+          "    def test_beta(self):" in text and "\ndef test_beta" not in text
+          and "    def test_gamma(self):" in text
+          and "shifted to match" in (res.get("reindented") or ""), (res, text))
+    # A body already at the right indentation is left byte for byte.
+    res = b.call("replace_symbol_body", {
+        "file": klass, "name_path": "Suite/test_alpha",
+        "body": "    def test_alpha(self):\n        return 11"})
+    check("a body at the right column is untouched",
+          res.get("reindented") is None
+          and "        return 11" in open(klass).read(), res)
+    os.remove(klass)
+
+
+def group_polish(c):
+    """What the polish after an edit does to the record of that edit: an
+    import organizer rewrites lines above it, and undo has to take those
+    back too."""
+    b, root = c.b, c.root
+
+    reset(c)
+    goimp = os.path.join(root, "importer.go")
+    with open(goimp, "w") as f:
+        f.write("package sample\n"
+                "\n"
+                "import (\n"
+                "\t\"strings\"\n"
+                ")\n"
+                "\n"
+                "func use() string {\n"
+                "\treturn strings.ToUpper(\"x\")\n"
+                "}\n")
+    before_imp = open(goimp).read()
+    res = b.call("replace_symbol_body", {
+        "file": goimp, "name_path": "use",
+        "body": "func use() string {\n\treturn fmt.Sprintf(\"%s\", strings.ToUpper(\"x\"))\n}"})
+    if "organized imports" not in (res.get("polished") or ""):
+        print("SKIP import-polish undo check: no import organizer ran")
+    else:
+        check("the import polish added the import it needed",
+              "fmt" in open(goimp).read(), res)
+        b.call("undo_edit", {"count": 1})
+        check("undo takes back what the import polish changed too",
+              open(goimp).read() == before_imp, open(goimp).read())
+    os.remove(goimp)
 
 def group_verdict(c):
     """What an edit reports afterwards: new, pre-existing and fixed
@@ -1534,6 +1641,17 @@ def group_search(c):
     check("a file the search gave up on is named, not passed off as a result",
           "hold a NUL byte" in hit and "text=true" in hit
           and "WARNING" not in hit, hit)
+    # The NUL before the first match is the case that used to answer
+    # "(no matches)": ripgrep skipped the file in silence.
+    early = os.path.join(root, "lua", "testproj", "earlynul.lua")
+    with open(early, "wb") as f:
+        f.write(b'local a = "\x00"\n-- needle one\n-- needle two\n')
+    r = b.rpc("tools/call", {"name": "grep", "arguments": {
+        "pattern": "needle", "path": "lua/testproj/earlynul.lua"}})
+    early_hit = r["result"]["content"][0]["text"]
+    check("a file skipped as binary is named rather than answered as empty",
+          "hold a NUL byte" in early_hit and "(no matches)" not in early_hit, early_hit)
+    os.remove(early)
     r = b.rpc("tools/call", {"name": "grep", "arguments": {
         "pattern": "needle", "path": "lua/testproj/nul.lua", "text": True}})
     full = r["result"]["content"][0]["text"]
@@ -1884,6 +2002,8 @@ GROUPS = [
     ("workspace", group_workspace),
     ("index", group_index),
     ("edit", group_edit),
+    ("indent", group_indent),
+    ("polish", group_polish),
     ("verdict", group_verdict),
     ("search", group_search),
     ("files", group_files),
