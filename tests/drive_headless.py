@@ -717,9 +717,13 @@ def group_index(c):
     check("a setting on a foreign object is not reported as unreferenced",
           not any(n.startswith("vim.") for n in names)
           and any("orphan_helper" in n for n in names), res)
+    # Each skip reason carries its own justification: one sentence about
+    # methods and receivers used to explain locals too, which is nonsense on
+    # a module of plain functions.
     check("what was skipped is counted and named",
           res.get("symbols_skipped", 0) >= 3
-          and "fields on an object declared elsewhere" in res.get("symbols_skipped_note", ""), res)
+          and "fields on an object this file does not declare"
+          in res.get("symbols_skipped_note", ""), res)
     os.remove(settings)
     # A file holding nothing this tool checks used to come back with
     # "every top-level symbol in these files is referenced somewhere else"
@@ -1639,8 +1643,12 @@ def group_verdict(c):
           "saved" in res.get("note", "") and "diagnostics_after" in res, res)
     # tostring(name) is fine: nothing new; the file's unused-local hint
     # is below WARN and must not be reported either.
+    # startswith, not equality: a server that has not published anything yet
+    # gets its silence labelled as silence, and whether lua_ls has published
+    # this buffer's unused-local hint by now is a race. Both forms open with
+    # the same clause; neither may claim more than that.
     check("post-edit reports nothing new",
-          res.get("diagnostics_after") == "no new errors or warnings", res)
+          res.get("diagnostics_after", "").startswith("no new errors or warnings"), res)
     # An edit that plants an undefined global is reported as new; the
     # next edit elsewhere sees it as pre-existing rather than new again.
     res = b.call("replace_symbol_lines", {
@@ -2039,9 +2047,15 @@ def group_files(c):
     # and lua_ls sort and prune and add nothing, so three of four languages
     # were left non-runnable by a reply that read clean. The reply says what
     # was and was not done, and whether other files could be checked at all.
+    # Either the pass ran and sorts-and-prunes without adding, or no server
+    # offered one at all (lua_ls does not). Both readings must say that a name
+    # the moved code needs may now be unresolved; neither may claim an import
+    # was added. "sorted and pruned" over a diff that touched no require line
+    # was the wording this replaced.
+    imports = res.get("imports", "")
     check("move_symbols says what its import pass did and did not do",
-          "sorted and pruned" in res.get("imports", "")
-          and "gopls does" in res.get("imports", "")
+          ("an import pass ran" in imports or "no import pass ran" in imports)
+          and "unresolved" in imports
           and res.get("also_checked_note", "") != "", res)
     check("the symbol that stayed is untouched", "function M.greet" in left_text, left_text)
     check("the removal site is not left with a run of blank lines",

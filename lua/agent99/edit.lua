@@ -784,10 +784,13 @@ local last_publish = {}    -- [bufnr] = { at = ms, by = { [client.name] = ms } }
 -- error. Silence from a server that has been reporting all session is
 -- evidence; silence from one that has never reported anything is not.
 local ever_published = {}  -- [client.name] = true
--- How many edits each server has acknowledged, so that "it has reported
--- nothing" is only said of a server that has had chances to.
+-- How many change barriers each server has answered, so that "it has reported
+-- nothing" is only said of a server that has had a chance to. One is enough:
+-- a server that answered a barrier has taken the change in and stayed silent,
+-- and a caveat on the first edit of a session is a small price against the
+-- first edit being the one that breaks a file and reads as clean.
 local edits_acked = {}     -- [client.name] = count
-local SILENT_AFTER = 3
+local SILENT_AFTER = 1
 
 local function client_names_of(diags)
     local names = {}
@@ -820,8 +823,9 @@ vim.api.nvim_create_autocmd("DiagnosticChanged", {
 
 -- The servers attached to this buffer, named, when not one of them has ever
 -- published a diagnostic in this session; nil once any of them has.
-local function silent_server(bufnr, names)
+local function silent_server(bufnr, names, min_acks)
     if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then return nil end
+    min_acks = min_acks or SILENT_AFTER
     local list = {}
     for _, name in ipairs(names or {}) do list[#list + 1] = name end
     if #list == 0 then
@@ -829,11 +833,10 @@ local function silent_server(bufnr, names)
     end
     if #list == 0 then return nil end
     for _, name in ipairs(list) do
-        -- Silence on the first edit of a session says nothing: a server that
-        -- reports plenty has simply had nothing to report yet. Only once it
-        -- has acknowledged several edits and still produced nothing does its
-        -- silence stop being evidence.
-        if ever_published[name] or (edits_acked[name] or 0) < SILENT_AFTER then return nil end
+        -- Silence before the server has been asked anything says nothing. The
+        -- diagnostics tool waits for a publish itself, so it passes 0 and asks
+        -- only whether this server has ever reported anything at all.
+        if ever_published[name] or (edits_acked[name] or 0) < min_acks then return nil end
     end
     table.sort(list)
     return table.concat(list, " and ")
@@ -961,6 +964,14 @@ end
 local function wait_for_diagnostics(bufnr, root, wait_ms, settle_ms, since, acks, names)
     since = since or vim.uv.now()
     if not acks then acks, names = send_barriers(bufnr, root) end
+    -- Counted here rather than at the end of an edit, so that settling a
+    -- buffer before an edit counts too. Gating the "this server has reported
+    -- nothing" caveat on three finished edits meant the first edit of a
+    -- session never carried it - and the first edit is the one a probe used
+    -- to break a shell file, which came back "no new errors or warnings".
+    for _, name in ipairs(names or {}) do
+        edits_acked[name] = (edits_acked[name] or 0) + 1
+    end
     local settle = settle_for(root, names, settle_ms, wait_ms)
     local deadline = since + wait_ms
     local done, published = verdict_in(bufnr, since, acks, settle)
@@ -969,11 +980,33 @@ local function wait_for_diagnostics(bufnr, root, wait_ms, settle_ms, since, acks
         done, published = verdict_in(bufnr, since, acks, settle)
     end
     learn_from(bufnr, root, since, nil)
-    -- `done` is the whole point of the second return: false means the budget
-    -- ran out before the servers had said all they will, so whatever the
-    -- diagnostics show now is provisional and the caller must say so rather
-    -- than report a clean verdict it never obtained.
-    return published, done
+    -- How much the wait actually established, which is not the same question
+    -- as whether it finished:
+    --   "published" - the server published for this buffer after the change
+    --                 and then went quiet. This is a verdict.
+    --   "acked"     - every server answered the barrier and then said nothing.
+    --                 For a push-only server with a known lag that means
+    --                 clean; for one whose lag has never been measured it
+    --                 means only that the settle guess expired. pyright on a
+    --                 repository the size of black published 230 ms after a
+    --                 reply that had already called the edit clean.
+    --   "timeout"   - the budget ran out with the servers still talking.
+    local basis = "timeout"
+    if published then
+        basis = "published"
+    elseif done then
+        basis = "acked"
+        for _, name in ipairs(names or {}) do
+            local e = per_root(publish_lag, root)[name]
+            if not (e and e.n >= LEARN_AFTER) then
+                -- Nothing measured for this server yet, so the settle was a
+                -- guess and its expiry proves nothing.
+                basis = "unmeasured"
+                break
+            end
+        end
+    end
+    return published, done, basis
 end
 
 -- Reports not yet delivered: verdicts deferred by wait=false, and
@@ -1244,14 +1277,11 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     -- Whether the wait actually obtained a verdict. `settled` false means the
     -- budget expired first, and every "no new errors" below is then a guess
     -- about a server that had not finished answering.
-    local settled = true
+    local basis = "published"
     if attached then
-        local _, done = wait_for_diagnostics(bufnr, root, opts.wait_ms, opts.settle_ms,
+        local _, _, how = wait_for_diagnostics(bufnr, root, opts.wait_ms, opts.settle_ms,
             since, acks, names)
-        settled = done
-        for _, name in ipairs(names or {}) do
-            edits_acked[name] = (edits_acked[name] or 0) + 1
-        end
+        basis = how
     end
     local report = {}
     -- AGENT99_LINT_<FILETYPE> in the environment (handy for `claude mcp add
@@ -1320,6 +1350,22 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
             elseif d.bufnr == bufnr then
                 new_here[#new_here + 1] = ("%s line %d: %s"):format(
                     vim.diagnostic.severity[d.severity], d.lnum + 1, d.message)
+            elseif ctx.also and ctx.also[d.bufnr] then
+                -- A file this call did not edit, loaded only so the server
+                -- would check it. Everything it already had is its own
+                -- business, and reporting all of it charged a move with three
+                -- pre-existing warnings in a test file it never touched. Only
+                -- a diagnostic that names one of the symbols this call moved
+                -- can be this call's doing.
+                for _, name in ipairs(ctx.also_names or {}) do
+                    if (d.message or ""):find(name, 1, true) then
+                        new_here[#new_here + 1] = ("%s %s:%d: %s"):format(
+                            vim.diagnostic.severity[d.severity],
+                            vim.fn.fnamemodify(vim.api.nvim_buf_get_name(d.bufnr), ":."),
+                            d.lnum + 1, d.message)
+                        break
+                    end
+                end
             elseif ctx.own and ctx.own[d.bufnr] then
                 -- Another file this same call edited. Only errors are worth
                 -- reporting from files the edit did not touch, but a warning
@@ -1370,7 +1416,32 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         if b ~= bufnr then also_touched = also_touched + 1 end
     end
     local scope = also_touched > 0 and "the files this call edited" or "this file"
+    -- A move, a rename or a glob pattern: more than one file, and the kind of
+    -- change whose breakage lands in a file the reply is not looking at.
+    local structural = also_touched > 0 or (ctx.also and next(ctx.also) ~= nil) or false
     local silent = attached and silent_server(bufnr, names) or nil
+    -- Everything above counts errors and warnings only. In a JavaScript file
+    -- with no tsconfig the server has nothing stronger than a hint to say
+    -- with, and the hints dropped from one reply were the orphaned constants a
+    -- move had left behind - the whole of the evidence that the file no longer
+    -- ran. Collected before the verdict, because in that repository the hints
+    -- ARE the verdict.
+    local hints, strong_here = {}, false
+    local hint_bufs = { [bufnr or -1] = true }
+    for b in pairs(ctx.own or {}) do hint_bufs[b] = true end
+    for b in pairs(hint_bufs) do
+        if vim.api.nvim_buf_is_valid(b) then
+            for _, d in ipairs(vim.diagnostic.get(b)) do
+                if d.severity > vim.diagnostic.severity.WARN then
+                    hints[#hints + 1] = ("%s:%d: %s"):format(
+                        vim.fn.fnamemodify(vim.api.nvim_buf_get_name(b), ":."),
+                        d.lnum + 1, d.message)
+                else
+                    strong_here = true
+                end
+            end
+        end
+    end
     local not_analyzed = bufnr and not_analyzed_reason(bufnr) or nil
     if not_analyzed then
         -- Reporting "no new errors" here would be a straight lie: the server
@@ -1389,13 +1460,31 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     elseif not bufnr then
         report.diagnostics_after = #new_elsewhere == 0
             and "no new errors elsewhere in the project" or nil
-    elseif #new_here == 0 and not settled then
+    elseif #new_here == 0 and basis == "timeout" then
         -- The budget ran out before the servers had finished. Saying "no new
         -- errors" here asserts a verdict that was never given; whatever the
         -- server says next arrives under late_diagnostics on a later reply.
         report.diagnostics_after = ("nothing new so far, but the server had not finished "
             .. "answering within %d ms, so this verdict is provisional: anything that arrives "
             .. "later comes with a later reply under late_diagnostics"):format(opts.wait_ms)
+    elseif #new_here == 0 and basis == "unmeasured" and structural then
+        -- The servers answered the barrier and then stayed quiet for as long
+        -- as the settle guess allowed. For a server whose publish lag has
+        -- never been measured that expiry proves nothing: pyright published
+        -- two errors 230 ms after a reply that had already called a move
+        -- clean, and tsserver 66 ms after another.
+        --
+        -- Only for a structural change. A one-file edit whose settle expired
+        -- is the ordinary case and has been reliable; saying "provisional" on
+        -- every first edit in every workspace would be noise that teaches the
+        -- reader to skip the field, which is the failure this whole line of
+        -- work exists to prevent. A move, a rename or a glob pattern is where
+        -- the late answer actually lands, and where it costs the most.
+        report.diagnostics_after = "nothing new so far, but no server had published for this "
+            .. "file when the wait ended and none of them has been timed in this workspace "
+            .. "yet, so this verdict is provisional: what arrives later comes with a later "
+            .. "reply under late_diagnostics. A structural change is worth confirming with "
+            .. "check_project or diagnostics before it is treated as finished"
     elseif #new_here == 0 and silent then
         -- The servers on this file answered the barrier and then said nothing,
         -- and none of them has published a single diagnostic anywhere in this
@@ -1405,6 +1494,17 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
             .. "diagnostics at all in this session, so its silence is not yet evidence that "
             .. "this file is clean; check_project runs the project's own build or check")
             :format(silent)
+    elseif #new_here == 0 and #hints > 0 and not strong_here then
+        -- The server has hints for these files and has never had anything
+        -- stronger to say about them, so "errors or warnings" is an empty
+        -- category here and a clean line in it checks nothing. This is the
+        -- .mjs-with-no-tsconfig case, where every edit came back clean
+        -- including the one that broke three modules.
+        report.diagnostics_after = ("no new errors or warnings - but the server reports "
+            .. "nothing above hint severity for %s, so that is an empty category here and "
+            .. "this line checks nothing. The hints below are the whole of what it has to "
+            .. "say about these files; check_project runs the project's own build or check")
+            :format(scope)
     elseif #new_here == 0 then
         report.diagnostics_after = "no new errors or warnings"
     else
@@ -1437,25 +1537,6 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         report.not_checked_note = "this call edited these files as well and nothing analyzed "
             .. "them, so the verdict above does not cover them"
     end
-    -- Everything above counts errors and warnings only. In a JavaScript file
-    -- with no tsconfig the server has nothing stronger than a hint to say
-    -- with, and the two hints dropped from one reply were the orphaned
-    -- constants a move had left behind - the whole of the evidence that the
-    -- file no longer ran. Hints in the files this call edited are named here
-    -- rather than silently discarded.
-    local hints, hint_bufs = {}, { [bufnr or -1] = true }
-    for b in pairs(ctx.own or {}) do hint_bufs[b] = true end
-    for b in pairs(hint_bufs) do
-        if vim.api.nvim_buf_is_valid(b) then
-            for _, d in ipairs(vim.diagnostic.get(b)) do
-                if d.severity > vim.diagnostic.severity.WARN then
-                    hints[#hints + 1] = ("%s:%d: %s"):format(
-                        vim.fn.fnamemodify(vim.api.nvim_buf_get_name(b), ":."),
-                        d.lnum + 1, d.message)
-                end
-            end
-        end
-    end
     if #hints > 0 then
         local total = #hints
         if total > HINTS_LISTED then
@@ -1463,8 +1544,15 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
             hints[#hints + 1] = ("… +%d more"):format(total - HINTS_LISTED)
         end
         report.hints = hints
-        report.hints_note = ("%d hint-level diagnostics in %s; these are not errors or warnings "
-            .. "and are not counted above"):format(total, scope)
+        -- The old note called these "not errors or warnings", which reads as
+        -- "discount them". Where they are the only channel the server has,
+        -- that is exactly the wrong instruction.
+        report.hints_note = strong_here
+            and ("%d hint-level diagnostics in %s; below the severity counted above")
+                :format(total, scope)
+            or ("%d hint-level diagnostics in %s, and the server reports nothing above hint "
+                .. "severity for these files at all - so these are not noise below the "
+                .. "verdict, they are the verdict"):format(total, scope)
     end
     if #new_elsewhere > 0 then
         report.new_errors_elsewhere = new_elsewhere
@@ -4079,12 +4167,16 @@ local function move_symbols(args)
     -- what this move breaks in them is reported.
     local referrers = referring_files(from_buf, moving,
         { [vim.fn.fnamemodify(args.from, ":p")] = true, [to_path] = true })
-    local own, also_checked = { [from_buf] = true }, {}
+    local own, also, also_checked = { [from_buf] = true }, {}, {}
     for _, file in ipairs(referrers or {}) do
         local okb, b = pcall(load_buf, file)
         if okb then
             settle_before_edit(b)
-            own[b] = true
+            -- `also`, not `own`: this call did not edit these files, so only a
+            -- diagnostic naming one of the moved symbols is its doing. Filing
+            -- them under `own` charged one move with three pre-existing
+            -- warnings in a test file it had never touched.
+            also[b] = true
             also_checked[#also_checked + 1] = rel_path(file)
         end
     end
@@ -4137,9 +4229,15 @@ local function move_symbols(args)
 
     local opts = post_edit_options(args)
     local _, _, polished, _, info = polish_after_edit(to_buf, at + 1, #appended, opts)
+    local from_organized = false
     if opts.organize_imports then
-        organize_imports(from_buf)
+        from_organized = organize_imports(from_buf)
     end
+    -- Whether an import pass actually ran, rather than whether one was asked
+    -- for. lua_ls offers no organize-imports action at all, and the reply
+    -- claimed the imports had been "sorted and pruned" over a diff that
+    -- touched no require line in either file.
+    local polished_imports = from_organized or vim.tbl_contains(polished, "organized imports")
     if args.headless then
         save_all()
     end
@@ -4150,9 +4248,7 @@ local function move_symbols(args)
     -- that compiled, and retracted 115 ms later as late_diagnostics.
     settle_before_edit(to_buf)
     settle_before_edit(from_buf)
-    for b in pairs(own) do
-        if b ~= from_buf then settle_before_edit(b) end
-    end
+    for b in pairs(also) do settle_before_edit(b) end
 
     -- Whole-file entries for both, so undo_edit puts the split back. Both of
     -- them plus the destination's create belong to one undo step: undoing
@@ -4199,15 +4295,46 @@ local function move_symbols(args)
     -- meaning alone, so the moved code can arrive in the destination with no
     -- import for anything it uses, and a reply that reads clean over a tree
     -- that no longer runs is worse than one that says what was not done.
-    result.imports = "the imports of both files were sorted and pruned. Adding an import the "
-        .. "moved code needs is something only some servers do on that pass (gopls does, "
-        .. "pyright, tsserver and lua_ls do not), so check the verdict below for unresolved "
-        .. "names in either file before treating this move as finished"
+    result.imports = polished_imports
+        and ("an import pass ran on both files: it sorts and prunes. Adding an import the "
+            .. "moved code now needs is something only some servers do on that pass (gopls "
+            .. "does; pyright, tsserver and lua_ls do not), so a name the moved code uses "
+            .. "may be unresolved in %s, and a file that imported it from %s may still do so")
+            :format(rel_path(to_path), rel_path(vim.fn.fnamemodify(args.from, ":p")))
+        or ("no import pass ran on either file: this language server offers no "
+            .. "organize-imports action, so nothing was added, sorted or pruned. A name the "
+            .. "moved code uses is now unresolved in %s unless it was already imported there, "
+            .. "and a file that imported it from %s still does")
+            :format(rel_path(to_path), rel_path(vim.fn.fnamemodify(args.from, ":p")))
+    -- A symbol that was file-local is not reachable from where it was called
+    -- once it lives in another module, and no language server calls that an
+    -- error: a Lua `local function` moved across a module boundary compiled
+    -- fine, was exported by nobody, and its old call site became an undefined
+    -- global. Nothing else in this reply says so.
+    local locals = {}
+    for i, m in ipairs(moving) do
+        local first = (blocks[i] or {})[1] or ""
+        if first:match("^%s*local%s") or first:match("^%s*static%s") then
+            locals[#locals + 1] = m.path
+        end
+    end
+    if #locals > 0 then
+        result.still_file_local = locals
+        result.still_file_local_note = ("these were declared file-local and were moved across "
+            .. "a module boundary unchanged, so nothing outside %s can reach them and their "
+            .. "old call sites now resolve to nothing. Export them there and import them "
+            .. "where they are called, or move them back"):format(rel_path(to_path))
+    end
     if #also_checked > 0 then
         result.also_checked = also_checked
+        -- Not "anything this move broke in them is reported below": that is a
+        -- promise the verdict cannot keep when the server answers after the
+        -- reply has gone out, and a move that did break one of these files
+        -- came back clean. Say what was done, not what was guaranteed.
         result.also_checked_note = "these files reference the moved symbols. They were loaded "
-            .. "so the server would check them, and anything this move broke in them is "
-            .. "reported below; their own imports were not rewritten"
+            .. "so the server would look at them, and a diagnostic naming one of the moved "
+            .. "symbols in them is listed with this edit's own; their imports were not "
+            .. "rewritten, so check them before treating the move as finished"
     elseif referrers then
         result.also_checked_note = "the server reports no other file referencing the moved "
             .. "symbols, so only the two files above needed changing"
@@ -4216,9 +4343,13 @@ local function move_symbols(args)
             .. "nothing could be checked about other files that use the moved symbols; grep "
             .. "for their names before treating this move as finished"
     end
+    local moved_names = {}
+    for _, m in ipairs(moving) do
+        moved_names[#moved_names + 1] = m.path:match("[^%.:/]+$") or m.path
+    end
     return vim.tbl_extend("force", result,
         post_edit_report(to_buf, before, args.root, args.headless, opts, args.full_diagnostics,
-            { own = own }))
+            { own = own, also = also, also_names = moved_names }))
 end
 M.post_edit_options = post_edit_options
 M.organize_imports = organize_imports
@@ -4231,6 +4362,9 @@ M.settle_before_edit = settle_before_edit
 M.post_edit_report = post_edit_report
 M.take_carry = take_carry
 M.flush_deferred = flush_deferred
+-- For the diagnostics tool, which reports the same verdict from another door
+-- and used to certify a server's silence without saying whose silence it was.
+M.silent_server = silent_server
 M.code_actions = code_actions
 M.apply_code_action = apply_code_action
 M.replace_symbol_body = replace_symbol_body

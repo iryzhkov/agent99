@@ -365,6 +365,27 @@ local function never_ran(lines, code)
     return nil
 end
 
+-- Whether anything in the output looks like a test result at all. `echo ok`
+-- exits 0, and calling that "all passing" said something true about the
+-- command and nothing about the tests. This is deliberately generous: any
+-- recognised runner marker counts, so a suite whose output this cannot parse
+-- is not accused of having run nothing - it is only not credited with passing.
+local function ran_something(lines)
+    for _, l in ipairs(lines) do
+        if l:match("^ok%s+%S") or l:match("^%-%-%- PASS") or l:match("^%-%-%- FAIL")
+            or l:match("^FAIL%s") or l:match("^PASS%f[%W]") or l:match("^OK$")
+            or l:match("[1-9]%d* passed") or l:match("[1-9]%d* failed")
+            or l:match("Ran %d+ tests?") or l:match("^%d+ passing")
+            or l:match("^%D*tests%s+%d") or l:match("^%D*pass%s+%d")
+            or l:match("^%s*%d+%.%.%d+%s*$") or l:match("^%s*ok%s+%d")
+            or l:match("test result:") or l:match("%f[%w]Tests?:%s") then
+            return true
+        end
+    end
+    return false
+end
+
+
 -- A generic sweep for runners without a parser: any "path:line" on a line
 -- that also says fail/error/assert, so a failure still gets a location.
 local function parse_generic(lines, root, exit_code)
@@ -657,8 +678,18 @@ local function run_tests(args)
             if #lines > OUTPUT_MAX_LINES then out.output_truncated = #lines - OUTPUT_MAX_LINES end
             out.summary = #failures > 0 and ("%d failing"):format(#failures)
                 or ("exit %d; no failures parsed from the output, see output"):format(result.code)
+        elseif passed then
+            out.summary = ("all passing (%d)"):format(passed)
+        elseif not ran_something(lines) then
+            -- Exit 0 and nothing in the output that looks like a test result.
+            -- `echo ok` exits 0 too, and mapping that to "all passing" told a
+            -- caller something true about the command and nothing at all
+            -- about the tests.
+            out.summary = "exit 0, but nothing in the output identifies a test result, so this "
+                .. "is the command succeeding rather than a suite passing. Read the output "
+                .. "below, and pass a command whose counts this can parse if you want a number"
         else
-            out.summary = passed and ("all passing (%d)"):format(passed) or "all passing"
+            out.summary = "all passing"
         end
     end
     -- On a passing run the summary used to be the whole reply, so nothing said

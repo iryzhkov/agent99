@@ -535,19 +535,22 @@ local function check_project(args)
             .. "output says anything about the project, and no baseline was recorded or "
             .. "compared"):format(unusable)
     end
-    if guessed then
-        -- What this command checks is the command's own business, and saying
-        -- "type and reference checking" here contradicted an
-        -- about_this_command that read "luac -p is a syntax check only".
-        out.covers = "a static check: it does not run the tests, and it checks one build "
-            .. "configuration, so code behind another build tag or feature flag is not "
-            .. "analyzed. How deep the check goes is the command's own business - see "
-            .. "about_this_command. If that is the wrong gate for this project, pass a "
-            .. "better one: commands=[...] runs several (one per build configuration), "
-            .. "and remember=true makes it the default for this root."
-        out.about_this_command = guess_note
-        out.coverage = guess_covers
-    end
+    -- The caveat belongs on every run, not only a guessed one: an explicit
+    -- command got no coverage annotation at all, and the path an agent is
+    -- pushed onto when the guess fails was the one with no honesty machinery.
+    -- The "see about_this_command" clause is only added when that field is
+    -- actually in this reply; three probes went looking for a field that was
+    -- never emitted.
+    out.covers = "a static check: it does not run the tests, and it checks one build "
+        .. "configuration, so code behind another build tag or feature flag is not analyzed."
+        .. (guess_note and " How deep the check goes is the command's own business - see "
+            .. "about_this_command below." or " How deep it goes is this command's own "
+            .. "business; a syntax check and a type checker both come back \"clean\" here.")
+        .. (guessed and " If that is the wrong gate for this project, pass a better one: "
+            .. "commands=[...] runs several (one per build configuration), and remember=true "
+            .. "makes it the default for this root." or "")
+    out.about_this_command = guess_note
+    out.coverage = guess_covers
     if #server_errors > 0 then
         local shown = vim.list_slice(server_errors, 1, 5)
         if #server_errors > 5 then

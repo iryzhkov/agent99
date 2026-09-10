@@ -322,6 +322,11 @@ local function diagnostics(args)
             out[#out + 1] = entry
         end
     end
+    -- An empty answer is only as good as the server behind it. The edit tools
+    -- hedge here; this one used to return {"count": 0, "diagnostics": []} for
+    -- a shell file that `bash -n` rejects outright, which is the same lie
+    -- through a different door.
+    local silent = total == 0 and edit.silent_server(bufnr, nil, 0) or nil
     return {
         count = total,
         diagnostics = out,
@@ -329,6 +334,9 @@ local function diagnostics(args)
             and "quick_fixes lists code actions the language server can apply for you: "
             .. "call code_actions with this file and line (the col above is optional), "
             .. "then apply_code_action, instead of editing by hand"
+            or silent and ("nothing is reported for this file, but %s has published no "
+                .. "diagnostics at all in this session, so this is not evidence that the file "
+                .. "is clean; check_project runs the project's own build or check"):format(silent)
             or nil,
     }
 end
@@ -957,17 +965,30 @@ local function unreferenced_symbols(args)
     table.sort(method_names)
     -- The skipped set, in the order a reader wants it: the deliberate policy
     -- exclusions first, the housekeeping ones after.
+    -- Each reason carries its own justification. One sentence about methods
+    -- and receivers used to explain all of them, which was nonsense on a
+    -- module of plain functions whose 85 "skipped declarations" were locals
+    -- inside those functions.
     local SKIP_LABEL = {
-        method_or_field = "methods and fields on an object declared elsewhere",
-        nested = "declarations nested inside another symbol",
+        method_or_field = "methods, and fields on an object this file does not declare",
+        nested = "names declared inside another symbol (locals, parameters, nested functions)",
         entry_point = "entry points and tests, which have no caller by construction",
         anonymous = "anonymous declarations",
     }
-    local skipped_total, skipped_parts = 0, {}
+    local SKIP_WHY = {
+        method_or_field = "a method is reached through its receiver, and a zero-reference "
+            .. "answer for one says more about the server than about the code",
+        nested = "this tool reports top-level symbols only; a local is scoped to the symbol "
+            .. "around it and its own server already warns when it is unused",
+        entry_point = "nothing calls them by name, so a zero-reference answer means nothing",
+        anonymous = "nothing can reference them and nothing can delete them by name",
+    }
+    local skipped_total, skipped_parts, skipped_why = 0, {}, {}
     for _, k in ipairs({ "method_or_field", "nested", "entry_point", "anonymous" }) do
         if skipped[k] then
             skipped_total = skipped_total + skipped[k]
             skipped_parts[#skipped_parts + 1] = ("%d %s"):format(skipped[k], SKIP_LABEL[k])
+            skipped_why[#skipped_why + 1] = SKIP_WHY[k]
         end
     end
     local skipped_text = table.concat(skipped_parts, ", ")
@@ -979,9 +1000,29 @@ local function unreferenced_symbols(args)
         method = #method_names > 0 and table.concat(method_names, " and ") or nil,
     }
     if skipped_total > 0 then
-        res.symbols_skipped_note = ("not examined: %s. A method is reached through its receiver, "
-            .. "and a zero-reference answer for one says more about the server than about the "
-            .. "code, so this tool does not check them."):format(skipped_text)
+        res.symbols_skipped_note = ("not examined: %s - %s."):format(
+            skipped_text, table.concat(skipped_why, "; "))
+    end
+    -- The answer is only as strong as what produced it, and "referenced
+    -- somewhere else" from a whole-word text search is a much weaker claim
+    -- than the same sentence backed by the language server. The method was
+    -- reported as a bare field and the summary read identically either way.
+    if res.method == "text search" then
+        res.method_note = "no language server answered reference requests for these files, so "
+            .. "this rests on a whole-word text search: a name that appears in a comment, a "
+            .. "string or a stale call site counts as a reference"
+    elseif res.method == "language server and text search" then
+        res.method_note = "some of these files were answered by the language server and some "
+            .. "by a whole-word text search, which is the weaker of the two"
+    end
+    -- A server that cannot resolve the project's imports answers about one
+    -- package and calls it the project. references says so where it answers;
+    -- this tool rests on the same data and used to assert flatly.
+    local missing = core.deps_missing(root)
+    if missing then
+        res.may_be_incomplete = "the language server cannot resolve this project's imports ("
+            .. missing .. ") so references from other packages are invisible to it; a symbol "
+            .. "listed here may be used from one of them"
     end
     if #unknown > 0 then
         res.not_answered = unknown
@@ -1002,9 +1043,13 @@ local function unreferenced_symbols(args)
         -- referenced somewhere else" whenever nothing was found, including
         -- when nothing had been looked at: a Go file of three methods came
         -- back with that sentence and symbols_checked: 0.
+        -- "All N declarations in these files" counted every name the symbol
+        -- index reported, locals included, and sent a reader looking for four
+        -- declarations that do not exist in a four-declaration file.
         res.summary = skipped_total > 0
-            and ("nothing was checked: all %d declarations in these files were skipped (%s), so "
-                .. "this reply is not evidence that they are used"):format(skipped_total, skipped_text)
+            and ("nothing was checked: every one of the %d names indexed in these files is "
+                .. "something this tool does not check (%s), so this reply is not evidence "
+                .. "that any of them is used"):format(skipped_total, skipped_text)
             or "nothing was checked: no declaration in these files was eligible"
     elseif #dead > 0 then
         res.summary = "nothing outside its own body mentions these names. A symbol that is "
@@ -1016,7 +1061,7 @@ local function unreferenced_symbols(args)
             .. "somewhere else"):format(checked)
         if skipped_total > 0 then
             res.summary = res.summary
-                .. ("; %d further declarations were not checked (%s)"):format(skipped_total, skipped_text)
+                .. ("; %d further indexed names were not checked (%s)"):format(skipped_total, skipped_text)
         end
     end
     return res
@@ -1061,11 +1106,44 @@ local dispatch_table = {
         -- used in 6, and rename_symbol went on to break the other 3. The
         -- caveat belongs here, where the answer is read, not only in the
         -- reply to open_workspace.
-        local missing = core.deps_missing(args.root or vim.fn.getcwd())
+        local root = args.root or vim.fn.getcwd()
+        local missing = core.deps_missing(root)
         if missing then
             result.may_be_incomplete = "the language server cannot resolve this project's "
                 .. "imports (" .. missing .. ") so references from other packages are missing "
                 .. "from this answer; grep for the name to see them"
+        end
+        -- "Only the declaration" is the answer a server gives for genuinely
+        -- dead code and the answer it gives while its workspace index is still
+        -- building, and the two are indistinguishable from the reply. A shell
+        -- function with eleven call sites in six files came back as count: 1,
+        -- and the identical call later in the same session came back as 11.
+        -- That is a delete-it-and-ship-it answer, so the one case where it
+        -- matters is checked against a plain text search before answering.
+        if (result.count or 0) <= 1 and #(result.files or {}) <= 1 then
+            local name = args.symbol
+            if type(name) ~= "string" or name == "" then
+                local hit = result.files and result.files[1] and result.files[1].hits[1]
+                name = hit and hit.text and hit.text:match("[%w_]+") or nil
+            end
+            local found = name and textual_hits(root, { name })
+            local elsewhere, seen = {}, {}
+            local here = result.files and result.files[1] and result.files[1].file
+            for _, h in ipairs(found and found[name] or {}) do
+                if h.file ~= here and not seen[h.file] then
+                    seen[h.file] = true
+                    elsewhere[#elsewhere + 1] = rel_path(h.file)
+                end
+            end
+            if #elsewhere > 0 then
+                table.sort(elsewhere)
+                result.text_search_disagrees = elsewhere
+                result.text_search_note = ("the server reports no reference outside the "
+                    .. "declaration, but a plain text search finds %q in %d other file(s). A "
+                    .. "server whose workspace index is still building answers exactly like "
+                    .. "one that has found nothing, so do not read this as dead code: check "
+                    .. "those files, or ask again in a moment."):format(name, #elsewhere)
+            end
         end
         return result
     end,
