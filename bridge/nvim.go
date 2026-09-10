@@ -60,7 +60,17 @@ func remoteExpr(sock, expr string) (string, error) {
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			return "", fmt.Errorf("nvim RPC failed: no answer from %s within %s (is the instance wedged?)",
+			// "Is the instance wedged?" names one cause and it is
+			// usually the wrong one: a language server answering its
+			// first request on a large project routinely takes longer
+			// than this, and two of those timeouts in a row were
+			// followed by a third call that answered normally. Say
+			// what is known - no answer yet, the request is still
+			// running - and leave the diagnosis to the retry.
+			return "", fmt.Errorf("nvim RPC failed: no answer from %s within %s. The request "+
+				"was not cancelled and is still running in that Neovim; a language server "+
+				"answering its first request on a big project takes longer than this, so "+
+				"retry before treating the instance as wedged",
 				sock, remoteExprTimeout)
 		}
 		detail := strings.TrimSpace(errb.String())

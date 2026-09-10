@@ -264,6 +264,71 @@ check("no names means nothing is the move's doing",
 check("a nil message is not a match",
     edit.mentions_name(nil, { "shout" }) == false, "matched")
 
+-- The honest hedge, and what it is gated on. A server's silence about a file
+-- is only evidence once that server has published something about THAT file:
+-- gating it per server instead made one diagnostic in one file answer for
+-- every other file in the project, which is how a file nothing had analysed
+-- came back flatly clean. Driven through the same DiagnosticChanged path a
+-- real publish takes, with a namespace named the way vim.lsp names its own.
+local function hedge_buffer(path, filetype)
+    local b = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(b, path)
+    vim.bo[b].filetype = filetype
+    return b
+end
+
+local function publish(bufnr, server, message)
+    local ns = vim.api.nvim_create_namespace("nvim.lsp." .. server .. ".1")
+    vim.api.nvim_exec_autocmds("DiagnosticChanged", {
+        buffer = bufnr,
+        data = {
+            diagnostics = {
+                {
+                    bufnr = bufnr, lnum = 0, col = 0, namespace = ns,
+                    severity = vim.diagnostic.severity.ERROR, message = message,
+                },
+            },
+        },
+    })
+end
+
+local analysed = hedge_buffer("/tmp/agent99-unit-hedge/analysed.zig", "zig")
+local untouched = hedge_buffer("/tmp/agent99-unit-hedge/untouched.zig", "zig")
+
+local who, how = edit.silent_server(untouched, { "fakels" }, 0)
+check("a server that has published nothing hedges, and says so of the session",
+    who == "fakels" and how == "at all in this session", { who, how })
+
+publish(analysed, "fakels", "something is wrong here")
+
+who, how = edit.silent_server(analysed, { "fakels" }, 0)
+check("the file the server did publish for is not hedged", who == nil, { who, how })
+
+who, how = edit.silent_server(untouched, { "fakels" }, 0)
+check("a diagnostic in one file does not certify another file",
+    who == "fakels", { who, how })
+check("and the hedge narrows to what is actually unknown about this file",
+    how == "for this file in this session", { who, how })
+
+-- Two servers on one file: the hedge is gone only when one of them has
+-- spoken about this file. The other having spoken about some other file is
+-- exactly the evidence that is not evidence.
+local both = hedge_buffer("/tmp/agent99-unit-hedge/both.zig", "zig")
+who = edit.silent_server(both, { "fakels", "otherls" }, 0)
+check("both servers silent about this file still hedges, naming both",
+    who == "fakels and otherls", who)
+publish(both, "otherls", "and here")
+check("one of them publishing for this file ends the hedge",
+    edit.silent_server(both, { "fakels", "otherls" }, 0) == nil, who)
+
+-- Liveness. A server that published and is no longer running leaves its
+-- diagnostics in the editor with nothing refreshing them, so "0 elsewhere" is
+-- no longer an answer about the project. No LSP client is running under the
+-- unit tests, so every server that has published here counts as stopped.
+local gone = edit.stopped_servers()
+check("a server that published and is not running is reported as stopped",
+    vim.tbl_contains(gone, "fakels") and vim.tbl_contains(gone, "otherls"), gone)
+
 if failures > 0 then
     io.stdout:write(("unit_edit: %d failed\n"):format(failures))
     vim.cmd("cquit 1")

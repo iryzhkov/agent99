@@ -821,6 +821,38 @@ local last_publish = {}    -- [bufnr] = { at = ms, by = { [client.name] = ms } }
 -- error. Silence from a server that has been reporting all session is
 -- evidence; silence from one that has never reported anything is not.
 local ever_published = {}  -- [client.name] = true
+
+-- Which files each server has published for, by absolute path, whether the
+-- publish carried diagnostics or emptied the list. A publish says the server
+-- has an opinion about THAT file and about nothing else, so this is what the
+-- hedge above has to be gated on. Gating it on `ever_published` alone flipped
+-- every file in a project from honestly hedged to flatly clean the moment one
+-- unrelated file got a diagnostic: zls hedged correctly on a file it had
+-- never analysed, one edit elsewhere made it publish for a different file,
+-- and the same query on the still-unanalysed file came back bare.
+local published_for = {}   -- [client.name] = { [path] = true }
+
+local function note_published_for(name, path)
+    if not (name and path and path ~= "") then return end
+    local per = published_for[name] or {}
+    published_for[name] = per
+    per[path] = true
+end
+
+-- Servers that published in this session and are no longer running. Their
+-- diagnostics are still in the editor and nothing is refreshing them, so
+-- neither what they said nor what they did not say is current. After gopls
+-- was killed an edit still answered "1 errors were there before the edit (1
+-- in this file, 0 elsewhere)": a positive claim of cleanliness about the rest
+-- of the project, sourced from a server that had stopped existing.
+local function stopped_servers()
+    local out = {}
+    for name in pairs(ever_published) do
+        if #vim.lsp.get_clients({ name = name }) == 0 then out[#out + 1] = name end
+    end
+    table.sort(out)
+    return out
+end
 -- How many change barriers each server has answered, so that "it has reported
 -- nothing" is only said of a server that has had a chance to. One is enough:
 -- a server that answered a barrier has taken the change in and stayed silent,
@@ -864,6 +896,15 @@ local function wrap_publish_handler(client)
         or vim.lsp.handlers["textDocument/publishDiagnostics"]
     if not inner then return end
     client.handlers["textDocument/publishDiagnostics"] = function(lsp_err, params, ctx, cfg)
+        -- Every publish, whether or not it carries a version and whether or
+        -- not it carries any diagnostics: an empty set for a file is the
+        -- server saying it looked at that file and found nothing, which is
+        -- the evidence the hedge needs and the thing it cannot infer from a
+        -- publish about some other file.
+        if params and params.uri then
+            local okf, fname = pcall(vim.uri_to_fname, params.uri)
+            if okf then note_published_for(client.name, fname) end
+        end
         local version = params and params.version
         if version then
             stamps_version[client.name] = true
@@ -934,7 +975,15 @@ vim.api.nvim_create_autocmd("DiagnosticChanged", {
         last_publish[ev.buf] = rec
         rec.at = now
         local names = client_names_of(ev.data and ev.data.diagnostics)
-        for name in pairs(names) do ever_published[name] = true end
+        local path = vim.api.nvim_buf_get_name(ev.buf)
+        for name in pairs(names) do
+            ever_published[name] = true
+            -- A publish this server made about this file, which is what says
+            -- its silence about the file means something. Recorded here as
+            -- well as in the publish handler: a server that attached before
+            -- agent99 wrapped its handler still lands here.
+            note_published_for(name, path)
+        end
         if next(names) == nil then
             -- A cleared set names nobody; credit every attached server.
             for _, c in ipairs(vim.lsp.get_clients({ bufnr = ev.buf })) do
@@ -946,7 +995,14 @@ vim.api.nvim_create_autocmd("DiagnosticChanged", {
 })
 
 -- The servers attached to this buffer, named, when not one of them has ever
--- published a diagnostic in this session; nil once any of them has.
+-- published anything about THIS FILE; nil once one of them has. Returns the
+-- names and how wide the silence is ("at all in this session", or "for this
+-- file in this session"), so the caveat says what it actually knows.
+--
+-- The gate used to be per server: one diagnostic in one file made every other
+-- file in the project answer flatly clean, hedge and all, though nothing had
+-- looked at them. That is the mechanism by which several other defects read
+-- as successes.
 local function silent_server(bufnr, names, min_acks)
     if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then return nil end
     min_acks = min_acks or SILENT_AFTER
@@ -956,14 +1012,30 @@ local function silent_server(bufnr, names, min_acks)
         for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do list[#list + 1] = c.name end
     end
     if #list == 0 then return nil end
+    local path = vim.api.nvim_buf_get_name(bufnr)
+    -- How wide the silence is: a server that has published nothing anywhere
+    -- all session is a stronger caveat than one that has simply never spoken
+    -- about this file, and the two read differently to whoever gets the reply.
+    local anywhere = true
     for _, name in ipairs(list) do
         -- Silence before the server has been asked anything says nothing. The
         -- diagnostics tool waits for a publish itself, so it passes 0 and asks
-        -- only whether this server has ever reported anything at all.
-        if ever_published[name] or (edits_acked[name] or 0) < min_acks then return nil end
+        -- only whether this server has ever said anything about this file.
+        if (edits_acked[name] or 0) < min_acks then return nil end
+        -- Published for THIS file - with diagnostics or with an empty list -
+        -- so its silence about the file now is a verdict rather than an
+        -- absence. Published only about other files is not: that is the whole
+        -- of what one diagnostic in one file used to prove about all of them.
+        -- `last_publish` is deliberately not consulted here: it credits every
+        -- server attached to a buffer whenever that buffer's diagnostics are
+        -- cleared, whoever cleared them, which is the same over-crediting one
+        -- step smaller.
+        if (published_for[name] or {})[path] then return nil end
+        if ever_published[name] then anywhere = false end
     end
     table.sort(list)
-    return table.concat(list, " and ")
+    return table.concat(list, " and "),
+        anywhere and "at all in this session" or "for this file in this session"
 end
 
 -- Publish lag learned over the session, per workspace root and server: the
@@ -1363,7 +1435,7 @@ end
 
 -- After a report on bufnr went out, remember what it showed so anything
 -- the server adds afterwards can be told apart and delivered.
-local function watch_after_report(bufnr, root, names, opts, label)
+local function watch_after_report(bufnr, root, names, opts, label, extra)
     -- The report just accounted for every buffer's diagnostics (new errors
     -- elsewhere, the ones that went away), so what the other watched
     -- buffers show now is no longer "late" for their own reports. This
@@ -1375,15 +1447,31 @@ local function watch_after_report(bufnr, root, names, opts, label)
     for b, w in pairs(watched) do
         if b ~= bufnr and w.client == me and vim.api.nvim_buf_is_valid(b) then
             w.after, w.reported_at = buf_snapshot(b), now
+            -- And the label with them. It names the reply the next late
+            -- report is measured from, so leaving it behind while the
+            -- snapshot moved on is how one late report came to name a call
+            -- several edits earlier that had already been reverted.
+            w.label, w.root = label, root
+            w.names = names or w.names
+            w.settle_ms, w.wait_ms = opts.settle_ms, opts.wait_ms
         end
     end
-    if not bufnr then return end
-    watched[bufnr] = {
-        reported_at = now, after = buf_snapshot(bufnr),
-        names = names or {}, root = root, label = label,
-        settle_ms = opts.settle_ms, wait_ms = opts.wait_ms,
-        client = me,
-    }
+    local function watch(b)
+        watched[b] = {
+            reported_at = now, after = buf_snapshot(b),
+            names = names or {}, root = root, label = label,
+            settle_ms = opts.settle_ms, wait_ms = opts.wait_ms,
+            client = me,
+        }
+    end
+    if bufnr then watch(bufnr) end
+    -- Every other file this call wrote, and every file it loaded to ask about
+    -- - the closure. A late publish lands in those as readily as in the file
+    -- the call was addressed to, and watching only that one is why a move
+    -- across four dependents reported the late diagnostics of one of them.
+    for b in pairs(extra or {}) do
+        if b ~= bufnr and vim.api.nvim_buf_is_valid(b) then watch(b) end
+    end
 end
 
 -- Diagnostics that arrived on watched buffers since their report: a diff of
@@ -1410,8 +1498,13 @@ local function collect_late()
             end
             for _, n in pairs(w.after) do gone = gone + n end
             if #added > 0 or gone > 0 then
+                -- `since_reply` is the reply this delta is measured from, not
+                -- a cause: the field used to be called `after` and named the
+                -- edit, which read as "this edit did it" and was wrong as
+                -- often as it was right - it once named a call that had
+                -- already been reverted.
                 local item = {
-                    after = w.label,
+                    since_reply = w.label,
                     file = vim.api.nvim_buf_get_name(bufnr),
                     arrived = ("%d ms after that reply"):format(lp.at - w.reported_at),
                 }
@@ -1482,6 +1575,12 @@ local function take_carry()
     local id = require("agent99.client").current()
     local out = carries[id] or {}
     carries[id] = {}
+    if type(out.late_diagnostics) == "table" and #out.late_diagnostics > 0 then
+        out.late_diagnostics_note = "each of these is the difference between what the reply "
+            .. "named in since_reply showed for that file and what the server published "
+            .. "afterwards; which call the server was reacting to is not something the editor "
+            .. "can tell, so the name is when, not why"
+    end
     local pending = out.still_pending
     if type(pending) == "table" then
         out.still_pending = ("%d edit(s) await the server's verdict, which comes with a later reply: %s")
@@ -1844,7 +1943,8 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     -- A move, a rename or a glob pattern: more than one file, and the kind of
     -- change whose breakage lands in a file the reply is not looking at.
     local structural = also_touched > 0 or caller_also
-    local silent = attached and silent_server(bufnr, names) or nil
+    local silent, silent_scope
+    if attached then silent, silent_scope = silent_server(bufnr, names) end
     -- Everything above counts errors and warnings only. In a JavaScript file
     -- with no tsconfig the server has nothing stronger than a hint to say
     -- with, and the hints dropped from one reply were the orphaned constants a
@@ -1949,13 +2049,16 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
             .. "with check_project or diagnostics before it is treated as finished"):format(covers)
     elseif #new_here == 0 and silent then
         -- The servers on this file answered the barrier and then said nothing,
-        -- and none of them has published a single diagnostic anywhere in this
-        -- session. That is what bash-language-server does for a file holding a
-        -- deliberate syntax error, so the silence is not a verdict.
+        -- and none of them has ever published anything about this file. That
+        -- is what bash-language-server does for a file holding a deliberate
+        -- syntax error, so the silence is not a verdict. The caveat says
+        -- whether the server has been quiet everywhere or only here: a
+        -- diagnostic it published about some other file is no evidence about
+        -- this one, which is what the old per-server gate treated it as.
         report.diagnostics_after = ("no new errors or warnings%s, but %s has published no "
-            .. "diagnostics at all in this session, so its silence is not yet evidence that "
+            .. "diagnostics %s, so its silence is not yet evidence that "
             .. "this file is clean; check_project runs the project's own build or check")
-            :format(covers, silent)
+            :format(covers, silent, silent_scope)
     elseif #new_here == 0 and #hints > 0 and not strong_here then
         -- The server has hints for these files and has never had anything
         -- stronger to say about them, so "errors or warnings" is an empty
@@ -2030,6 +2133,18 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     if #new_elsewhere > 0 then
         report.new_errors_elsewhere = new_elsewhere
     end
+    -- A server that has stopped answers for nothing, and the counts below are
+    -- read as claims about the project. After gopls was killed mid-session an
+    -- edit still reported "1 errors were there before the edit (1 in this
+    -- file, 0 elsewhere)": the list it counted was a corpse's.
+    local stopped = stopped_servers()
+    if #stopped > 0 then
+        report.servers_stopped = ("%s published diagnostics in this session and %s no longer "
+            .. "running; what %s reported is still in the editor and nothing is refreshing it, "
+            .. "so no count in this reply is evidence about the files %s was analyzing")
+            :format(table.concat(stopped, " and "), #stopped == 1 and "is" or "are",
+                #stopped == 1 and "it" or "they", #stopped == 1 and "it" or "they")
+    end
     local prior = {}
     if preexisting.errors > 0 then prior[#prior + 1] = preexisting.errors .. " errors" end
     if preexisting.warnings > 0 then prior[#prior + 1] = preexisting.warnings .. " warnings" end
@@ -2065,24 +2180,50 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         local elsewhere = #prior_items - here
         local where = here == 0 and ("none of them in %s"):format(scope)
             or ("%d in %s, %d elsewhere"):format(here, scope, elsewhere)
-        -- "New to this list" read as "new because of you", and usually it is
-        -- not: the list grows as the language server is asked about more of
-        -- the project, and one edit brought in 61 entries from files it had
+        -- "0 elsewhere" reads as a statement about the rest of the project,
+        -- and it is only ever a statement about what the editor is holding.
+        -- Said with a server dead it is not even that.
+        if #stopped > 0 then
+            where = where .. ("; that is what the editor still holds, and %s stopped running "
+                .. "during this session"):format(table.concat(stopped, " and "))
+        end
+        -- "New to this list" read as "new because of you", and often it is
+        -- not: the list also grows as the language server is asked about more
+        -- of the project, and one edit brought in 61 entries from files it had
         -- never opened. An entry in a file this call edited is the one that
         -- deserves that reading, so it is counted apart from the rest.
+        --
+        -- What this says is the delta and nothing else. It used to name the
+        -- cause - "the server has been asked about more of the project, which
+        -- is not a change this call made" - and that clause was attached to
+        -- errors the previous call had created, errors another live agent had
+        -- just typed, errors this same client had created moments earlier, an
+        -- error created while gopls was dead, and errors caused by the very
+        -- edit being undone. The bridge cannot tell those apart from a widened
+        -- scope, and asserting the innocent one tells the reader to stop
+        -- looking exactly when looking would have paid.
         local how_new
         if full then
             how_new = "all listed"
         elseif entered_here == 0 then
-            how_new = ("%d entered this list since the last reply, none of them in %s: the "
-                .. "server has been asked about more of the project, which is not a change "
-                .. "this call made"):format(entered, scope)
+            how_new = ("%d entered this list since the last reply, none of them in %s")
+                :format(entered, scope)
         elseif entered_here == entered then
             how_new = ("%d new to this list since the last reply, all of them in %s")
                 :format(entered, scope)
         else
             how_new = ("%d entered this list since the last reply, %d of them in %s")
                 :format(entered, entered_here, scope)
+        end
+        -- One cause the bridge can actually distinguish, now that every edit
+        -- carries a client id: somebody else is editing this workspace, and
+        -- their edits land in the same editor and the same diagnostics.
+        if not full and entered > 0 then
+            local okd, others = pcall(function() return require("agent99.edits").others() end)
+            if okd and others and others.clients > 0 then
+                how_new = how_new .. ("; %d other client%s has edits in this workspace")
+                    :format(others.clients, others.clients == 1 and "" or "s")
+            end
         end
         if full or entered > 0 then
             report.preexisting = ("%s were there before the edit (%s); %s"):format(
@@ -2117,7 +2258,12 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     if fixed > 0 then
         report.fixed = fixed .. " diagnostics from before the edit are gone"
     end
-    watch_after_report(bufnr, root, names, opts, label)
+    -- Watched together: the files this call edited and the files it loaded to
+    -- ask about. A late publish in any of them belongs to this reply.
+    local watch_too = {}
+    for b in pairs(ctx.own or {}) do watch_too[b] = true end
+    for b in pairs(ctx.also or {}) do watch_too[b] = true end
+    watch_after_report(bufnr, root, names, opts, label, watch_too)
     return report
 end
 
@@ -5017,6 +5163,10 @@ M.flush_deferred = flush_deferred
 -- For the diagnostics tool, which reports the same verdict from another door
 -- and used to certify a server's silence without saying whose silence it was.
 M.silent_server = silent_server
+-- Exported for tests/unit_edit.lua: which servers have gone away since they
+-- published. A count that says "0 elsewhere" is theirs, and it stops being an
+-- answer the moment they stop running.
+M.stopped_servers = stopped_servers
 M.code_actions = code_actions
 M.apply_code_action = apply_code_action
 M.replace_symbol_body = replace_symbol_body

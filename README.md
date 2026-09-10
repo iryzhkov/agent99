@@ -655,7 +655,24 @@ charged to the wrong edit. Independently of that switch, diagnostics that
 arrive after a report went out (a server re-checking the workspace on its
 own schedule, lua_ls does so three seconds after a change) are carried in
 the next reply under `late_diagnostics`, so a short estimate delays a
-diagnostic rather than losing it.
+diagnostic rather than losing it. Every file the call wrote or loaded is
+watched, not only the one it was addressed to, and each entry names under
+`since_reply` the reply its delta is measured from — when, not why: which
+call the server was reacting to is not something the editor can tell.
+
+A clean verdict is only as good as the server behind it, so it says what the
+silence is worth. A server that has never published anything about the file
+being reported on gets a caveat naming it, and the caveat distinguishes a
+server that has been quiet all session from one that has simply never spoken
+about this file: a diagnostic it published about some other file is no
+evidence about this one. A server that published earlier and is no longer
+running is named under `servers_stopped`, because the counts a reply gives
+for the rest of the project are its counts and nothing is refreshing them.
+The pre-existing list is reported as a delta — how many entered it since the
+last reply, and how many of those are in a file this call edited — with no
+cause attached to the rest: the bridge cannot tell a server widening its
+scope from another client's edit, and asserting the innocent one told the
+reader to stop looking exactly when looking would have paid.
 
 What a format pass did comes back with the edit rather than having to be
 found with `git diff`: `polished` says what ran, `polish_diff` is the

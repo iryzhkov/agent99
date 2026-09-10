@@ -326,7 +326,8 @@ local function diagnostics(args)
     -- hedge here; this one used to return {"count": 0, "diagnostics": []} for
     -- a shell file that `bash -n` rejects outright, which is the same lie
     -- through a different door.
-    local silent = total == 0 and edit.silent_server(bufnr, nil, 0) or nil
+    local silent, silent_scope
+    if total == 0 then silent, silent_scope = edit.silent_server(bufnr, nil, 0) end
     return {
         count = total,
         diagnostics = out,
@@ -335,8 +336,9 @@ local function diagnostics(args)
             .. "call code_actions with this file and line (the col above is optional), "
             .. "then apply_code_action, instead of editing by hand"
             or silent and ("nothing is reported for this file, but %s has published no "
-                .. "diagnostics at all in this session, so this is not evidence that the file "
-                .. "is clean; check_project runs the project's own build or check"):format(silent)
+                .. "diagnostics %s, so this is not evidence that the file "
+                .. "is clean; check_project runs the project's own build or check")
+                :format(silent, silent_scope)
             or nil,
     }
 end

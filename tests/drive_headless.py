@@ -1958,6 +1958,34 @@ def group_verdict(c):
     check("post-edit reports fixed",
           "1 diagnostics" in res.get("fixed", ""), res)
 
+    # An entry that enters the pre-existing list from a file this call did not
+    # touch is reported as a delta and nothing else. The reply used to name a
+    # cause for it - "the server has been asked about more of the project,
+    # which is not a change this call made" - and that clause was observed on
+    # errors the previous call had created, on errors another live agent had
+    # just typed, on an error created while the server was dead, and on the
+    # errors an undo was putting back. Here it would be attached to an error
+    # this same client planted one call earlier, which is the shape that reads
+    # as an alibi.
+    b.call("replace_symbol_lines", {
+        "file": util, "name_path": "M.shout", "first_line": 2, "last_line": 2,
+        "text": "    return upper_missing(name)",
+    })
+    res = b.call("replace_symbol_lines", {
+        "file": main_lua, "name_path": "run", "first_line": 2, "last_line": 2,
+        "text": '    print(util.greet("world!"))',
+    })
+    pre = res.get("preexisting", "")
+    check("an entry from another file is reported as a delta",
+          "entered this list since the last reply, none of them in this file" in pre, res)
+    check("and no cause is asserted for it",
+          "not a change this call made" not in json.dumps(res)
+          and "asked about more of the project" not in json.dumps(res), res)
+    b.call("replace_symbol_lines", {
+        "file": util, "name_path": "M.shout", "first_line": 2, "last_line": 2,
+        "text": "    return string.upper(M.greet(name))",
+    })
+
     # undo_edit takes back the newest edit, saves, and refuses to go
     # past a region that changed since.
     res = b.call("insert_after_symbol", {
