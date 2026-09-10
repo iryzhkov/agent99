@@ -42,10 +42,12 @@ class Bridge:
         assert self.proc.stdin is not None and self.proc.stdout is not None
         self.next_id = 0
 
-    def rpc(self, method, params=None):
+    def rpc(self, method, params=None, meta=None):
         self.next_id += 1
         msg = {"jsonrpc": "2.0", "id": self.next_id, "method": method}
         if params is not None:
+            if meta:
+                params = dict(params, _meta=meta)
             msg["params"] = params
         self.proc.stdin.write(json.dumps(msg) + "\n")
         self.proc.stdin.flush()
@@ -54,8 +56,12 @@ class Bridge:
         assert reply["id"] == self.next_id, reply
         return reply
 
-    def call(self, name, arguments):
-        reply = self.rpc("tools/call", {"name": name, "arguments": arguments})
+    # client= says which agent the call is for, the way a harness that runs
+    # several agents over one connection would. Without it the whole
+    # connection is one client, which is what a normal session is.
+    def call(self, name, arguments, client=None):
+        meta = {"agent99/client": client} if client else None
+        reply = self.rpc("tools/call", {"name": name, "arguments": arguments}, meta=meta)
         result = reply["result"]
         text = result["content"][0]["text"]
         if result.get("isError"):

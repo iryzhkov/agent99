@@ -28,6 +28,10 @@ type session struct {
 	// started: nobody is at the keyboard, so edits are saved to disk and
 	// the tools word their replies accordingly.
 	Headless bool
+	// Client is who the call is for (see client.go). One instance serves
+	// every client that opened its root, and the editor keys the undo
+	// ledger, the baselines and the disclosed-diagnostics set by it.
+	Client string
 }
 
 // Sticky pointers, so that a call with nothing to route on lands where the

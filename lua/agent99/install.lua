@@ -17,6 +17,12 @@ local enabled_lsp_configs_for, DATA_FILETYPES = core.enabled_lsp_configs_for, co
 -- report only lines that are new since the baseline and lines that went
 -- away, so "is the project still green after my refactor" is one call
 -- with a short answer.
+--
+-- Keyed by client as well as by root and command (agent99/client.lua). Per
+-- root alone, a client that had never recorded a baseline inherited whatever
+-- another client had recorded, and was then told how many lines were "new
+-- since the baseline" - a baseline taken over a tree in a state it had never
+-- seen, describing a change it had not made.
 local check_baseline = {}
 
 local CHECK_MAX_LINES = 60
@@ -565,7 +571,10 @@ local function check_project(args)
             errors = shown,
         }
     end
-    local key = root .. "\0" .. cmd
+    -- Per client, per root, per command. Two clients checking one root each
+    -- compare against what they themselves last saw, and neither is handed
+    -- the other's idea of "before".
+    local key = require("agent99.client").key(root, cmd)
     local base = check_baseline[key]
     if unusable then
         out.output = vim.list_slice(lines, 1, CHECK_MAX_LINES)
@@ -601,8 +610,17 @@ local function check_project(args)
             out.summary = ("%d new lines since the baseline"):format(#new)
         end
     else
+        local replaced = base ~= nil
         check_baseline[key] = lines
-        out.baseline = "recorded; later calls report only what changed"
+        -- What the baseline is keyed by, said out loud: it used to read as
+        -- "the baseline for this project", and a client that had recorded
+        -- none of its own was silently compared against another client's.
+        out.baseline = (replaced
+            and "re-recorded, replacing this client's previous baseline for this command; "
+            or "recorded; ")
+            .. "later calls report only what changed. It is yours and this command's: "
+            .. "another command in this root, and another client checking it, each have "
+            .. "their own"
         out.output = vim.list_slice(lines, 1, CHECK_MAX_LINES)
         if #lines > CHECK_MAX_LINES then out.output_truncated = #lines - CHECK_MAX_LINES end
         if #lines == 0 and exit == 0 then out.summary = "clean" end

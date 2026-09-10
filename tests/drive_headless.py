@@ -2278,6 +2278,157 @@ def group_tests(c):
     b.call("close_workspace", {"root": goroot})
 
 
+def group_clients(c):
+    """Per-client identity: one bridge, one root, two clients. Each client's
+    undo ledger, check_project and run_tests baselines and set of already
+    disclosed diagnostics are its own, and the workspace replies say when a
+    root is shared. Every check here is on the wording as well as on the
+    files: the defect this covers arrived as a successful reply.
+
+    The client id rides in _meta on the tools/call request (see
+    bridge/client.go for what the transport can and cannot tell apart), which
+    is what lets one process act as two clients here."""
+    b, root = c.b, c.root
+    util = c.util
+
+    restart(c)
+    # restart() opened the workspace as the connection's own client; A and B
+    # then join the same instance. The second must say so and name the other.
+    res = b.call("open_workspace", {"root": root}, client="A")
+    check("open_workspace reports the client count",
+          res.get("already_open") is True and res.get("clients", 0) >= 2, res)
+    res = b.call("open_workspace", {"root": root}, client="B")
+    check("open_workspace on an already-open root names the other holder",
+          res.get("already_open") is True and res.get("clients", 0) >= 3
+          and "A" in (res.get("shared") or "")
+          and "yours alone" in (res.get("shared") or ""), res)
+
+    # Two clients edit two symbols in one file; A undoes. The old ledger was
+    # one stack per root, so A's undo took B's edit off disk and reported
+    # success, and B was never told.
+    b.call("replace_symbol_body", {
+        "file": util, "name_path": "M.greet",
+        "body": 'function M.greet(name)\n    local a_marker = 1\n    return "hello, " .. name\nend',
+    }, client="A")
+    b.call("replace_symbol_body", {
+        "file": util, "name_path": "M.shout",
+        "body": 'function M.shout(name)\n    local b_marker = 1\n    return string.upper(M.greet(name))\nend',
+    }, client="B")
+    with open(util) as f:
+        both = f.read()
+    check("both clients' edits are on disk", "a_marker" in both and "b_marker" in both, both)
+    res = b.call("undo_edit", {}, client="A")
+    with open(util) as f:
+        after = f.read()
+    check("A's undo takes back A's edit and leaves B's on disk",
+          "a_marker" not in after and "b_marker" in after, after)
+    check("A's undo names A's own symbol",
+          [item.get("symbol") for item in res.get("undone", [])] == ["M.greet"], res)
+    check("A's undo says what it left alone",
+          "1 other client(s)" in (res.get("other_clients") or "")
+          and "1 undo step(s)" in (res.get("other_clients") or ""), res)
+
+    # A client that has edited nothing has an empty ledger of its own, and is
+    # told that the steps it can see are not its to undo.
+    res = b.call("undo_edit", {}, client="C")
+    check("a client that edited nothing has nothing to undo",
+          res.get("undone") == []
+          and "no symbol edits recorded for you" in (res.get("note") or "")
+          and "will not reach them" in (res.get("other_clients") or ""), res)
+    # B's edit is still B's to undo.
+    res = b.call("undo_edit", {}, client="B")
+    with open(util) as f:
+        after = f.read()
+    check("B can still undo its own edit",
+          "b_marker" not in after
+          and [item.get("symbol") for item in res.get("undone", [])] == ["M.shout"], res)
+
+    # Baselines. A records one; B, which never recorded one, must not be
+    # compared against it - it used to be handed A's, and told how many lines
+    # were "new since the baseline" over a change it had not made.
+    marker = os.path.join(root, "marker.txt")
+    with open(marker, "w") as f:
+        f.write("one\n")
+    cmd = {"command": "cat marker.txt", "workspace": root}
+    res = b.call("check_project", cmd, client="A")
+    check("A records its own check_project baseline",
+          res.get("baseline", "").startswith("recorded")
+          and "yours and this command's" in res.get("baseline", ""), res)
+    with open(marker, "w") as f:
+        f.write("one\ntwo\n")
+    res = b.call("check_project", cmd, client="B")
+    check("B does not inherit A's check_project baseline",
+          "baseline_lines" not in res and "since the baseline" not in (res.get("summary") or "")
+          and res.get("baseline", "").startswith("recorded"), res)
+    res = b.call("check_project", cmd, client="A")
+    check("A's second call compares against A's own baseline",
+          res.get("baseline_lines") == 1 and res.get("new") == ["two"]
+          and res.get("summary") == "1 new lines since the baseline", res)
+    res = b.call("check_project", dict(cmd, reset=True), client="A")
+    check("re-recording says it replaced the client's own baseline",
+          "re-recorded, replacing this client's previous baseline" in res.get("baseline", ""), res)
+
+    # The same for run_tests, where the baseline is the set of failing tests.
+    if shutil.which("go"):
+        goroot = os.path.join(c.work, "clientgo")
+        os.makedirs(goroot, exist_ok=True)
+        with open(os.path.join(goroot, "go.mod"), "w") as f:
+            f.write("module scratch\n\ngo 1.22\n")
+        with open(os.path.join(goroot, "calc.go"), "w") as f:
+            f.write("package scratch\n\nfunc Mul(a, b int) int { return a*b + 1 }\n")
+        with open(os.path.join(goroot, "calc_test.go"), "w") as f:
+            f.write("package scratch\n\nimport \"testing\"\n\n"
+                    "func TestMul(t *testing.T) {\n\tif got := Mul(3, 3); got != 9 {\n"
+                    "\t\tt.Fatalf(\"Mul(3,3) = %d, want 9\", got)\n\t}\n}\n")
+        b.call("open_workspace", {"root": goroot}, client="A")
+        res = b.call("run_tests", {"workspace": goroot}, client="A")
+        check("A records its own run_tests baseline",
+              res.get("baseline", "").startswith("recorded")
+              and "yours and this command's" in res.get("baseline", ""), res)
+        res = b.call("run_tests", {"workspace": goroot}, client="B")
+        check("B does not inherit A's run_tests baseline",
+              "baseline_failures" not in res and "fixed" not in res
+              and res.get("baseline", "").startswith("recorded"), res)
+        res = b.call("run_tests", {"workspace": goroot}, client="A")
+        check("A's second run compares against A's own baseline",
+              res.get("baseline_failures") == 1 and res.get("new_failures") == []
+              and "still failing as at the baseline" in (res.get("summary") or ""), res)
+        b.call("close_workspace", {"root": goroot}, client="A")
+
+    # The disclosure set: "new to this list" means new to what this client
+    # has been shown. It was per root, so one client's reply discharged
+    # another's disclosure - an agent was told "none new to this list" about
+    # errors only the other agent had ever seen.
+    broken = os.path.join(root, "lua", "testproj", "broken.lua")
+    with open(broken, "w") as f:
+        f.write("local M = {}\n\nfunction M.oops(\n\nreturn M\n")
+    b.call("diagnostics", {"file": broken}, client="A")
+    body = 'function M.greet(name)\n    return "hello, " .. name\nend'
+    res = b.call("replace_symbol_body", {"file": util, "name_path": "M.greet", "body": body},
+                 client="A")
+    listed = "\n".join(res.get("preexisting_new_to_list") or [])
+    check("A is shown the pre-existing error", "broken.lua" in listed, res)
+    res = b.call("replace_symbol_body", {"file": util, "name_path": "M.greet", "body": body},
+                 client="B")
+    listed = "\n".join(res.get("preexisting_new_to_list") or [])
+    check("B is shown it too, rather than told none is new to the list",
+          "broken.lua" in listed
+          and "none new to this list" not in (res.get("preexisting") or ""), res)
+    res = b.call("replace_symbol_body", {"file": util, "name_path": "M.greet", "body": body},
+                 client="A")
+    check("A, having been shown it, is not shown it again",
+          "none new to this list" in (res.get("preexisting") or "")
+          and not res.get("preexisting_new_to_list"), res)
+
+    # Closing a shared root says whose workspace it was taking with it.
+    res = b.call("close_workspace", {"root": root}, client="B")
+    holders = (res.get("was_shared") or {}).get(os.path.realpath(root)) or []
+    check("close_workspace names the other clients using the root",
+          "A" in holders and "closing one closes it for them too" in (res.get("was_shared_note") or ""),
+          res)
+    c.opened = False
+
+
 def group_lifecycle(c):
     """The headless instance ends with the workspace and with the server."""
     b, root, work = c.b, c.root, c.work
@@ -2316,6 +2467,7 @@ GROUPS = [
     ("search", group_search),
     ("files", group_files),
     ("tests", group_tests),
+    ("clients", group_clients),
     ("lifecycle", group_lifecycle),
 ]
 

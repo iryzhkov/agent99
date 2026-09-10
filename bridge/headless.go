@@ -108,6 +108,10 @@ func liveLocked() map[string]*headlessWorkspace {
 			os.Remove(ws.Socket)
 			delete(workspaces, root)
 			forgetRoot(root)
+			// The per-client state this instance held - ledger, baselines,
+			// what each client had been shown - died with it, so the roster
+			// of clients using it means nothing now.
+			forgetHolders(root)
 			// Nobody asked for this one to go, so the work that was being
 			// done in it probably is not finished. lifecycle.go starts it
 			// again on the next call that needs it.
@@ -372,6 +376,7 @@ func closeWorkspaces(roots []string) []string {
 	for _, ws := range targets {
 		delete(workspaces, ws.Root)
 		forgetRoot(ws.Root)
+		forgetHolders(ws.Root)
 		// An explicit close means it. The idle sweep marks its own roots
 		// reopenable after calling this, because that close is the server's
 		// decision rather than the agent's.

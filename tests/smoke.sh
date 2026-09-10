@@ -6,7 +6,7 @@
 # Usage: tests/smoke.sh [suite ...]
 #   suites: unit mcp headless multi debug (default: all of them, in that order)
 #   the headless suite also takes one family of tools at a time:
-#   headless:workspace, :index, :edit, :verdict, :search, :files, :lifecycle
+#   headless:workspace, :index, :edit, :verdict, :search, :files, :clients, :lifecycle
 # While iterating on one area run only the suite that covers it, e.g.
 # `tests/smoke.sh headless:edit` after a change to the symbol edit tools;
 # run the full set before committing, since the suites share the Lua and
@@ -23,7 +23,7 @@ export PATH="$PATH:$HOME/.local/share/nvim/mason/bin"
 export AGENT99_DEBUG_VERDICT=1
 
 ALL_SUITES="unit mcp headless multi debug"
-HEADLESS_GROUPS="workspace index edit indent ambiguity undo multifile polish verdict search files tests lifecycle"
+HEADLESS_GROUPS="workspace index edit indent ambiguity undo multifile polish verdict search files tests clients lifecycle"
 HEADLESS_ARGS=""
 if [ $# -eq 0 ]; then
     SUITES="$ALL_SUITES"

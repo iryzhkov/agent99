@@ -1166,9 +1166,18 @@ end
 -- Reports not yet delivered: verdicts deferred by wait=false, and
 -- diagnostics that arrived after a report went out. Both ride on the next
 -- reply, whatever tool produces it.
-local deferred = {}   -- [bufnr] = { since, acks, names, before, root, headless, opts, full, label }
-local watched = {}    -- [bufnr] = { reported_at, after, names, root, label, settle_ms, wait_ms }
-local carry = {}      -- what the next reply takes along
+local deferred = {}   -- [bufnr] = { since, acks, names, before, root, headless, opts, full, label, client }
+local watched = {}    -- [bufnr] = { reported_at, after, names, root, label, settle_ms, wait_ms, client }
+-- What the next reply takes along, per client: a verdict deferred by one
+-- client's wait=false edit belongs to that client, and used to ride out on
+-- whichever client's reply left the editor first.
+local carries = {}    -- [client] = { late_diagnostics, deferred_verdicts, still_pending }
+
+local function carry_for(id)
+    id = id or require("agent99.client").current()
+    if not carries[id] then carries[id] = {} end
+    return carries[id]
+end
 
 local WATCH_MS = 60 * 1000
 
@@ -1201,10 +1210,14 @@ end
 local function watch_after_report(bufnr, root, names, opts, label)
     -- The report just accounted for every buffer's diagnostics (new errors
     -- elsewhere, the ones that went away), so what the other watched
-    -- buffers show now is no longer "late" for their own reports.
+    -- buffers show now is no longer "late" for their own reports. This
+    -- client's reports only: another client has not been shown any of it,
+    -- and discharging its watches here is how it came to be told "none new
+    -- to this list" about text it had never seen.
+    local me = require("agent99.client").current()
     local now = vim.uv.now()
     for b, w in pairs(watched) do
-        if b ~= bufnr and vim.api.nvim_buf_is_valid(b) then
+        if b ~= bufnr and w.client == me and vim.api.nvim_buf_is_valid(b) then
             w.after, w.reported_at = buf_snapshot(b), now
         end
     end
@@ -1213,6 +1226,7 @@ local function watch_after_report(bufnr, root, names, opts, label)
         reported_at = now, after = buf_snapshot(bufnr),
         names = names or {}, root = root, label = label,
         settle_ms = opts.settle_ms, wait_ms = opts.wait_ms,
+        client = me,
     }
 end
 
@@ -1247,8 +1261,11 @@ local function collect_late()
                 }
                 if #added > 0 then item.new = added end
                 if gone > 0 then item.gone = gone .. " diagnostics reported then are no longer there" end
-                carry.late_diagnostics = carry.late_diagnostics or {}
-                carry.late_diagnostics[#carry.late_diagnostics + 1] = item
+                -- To the client whose report this is late for, whoever's
+                -- call happens to be running now.
+                local into = carry_for(w.client)
+                into.late_diagnostics = into.late_diagnostics or {}
+                into.late_diagnostics[#into.late_diagnostics + 1] = item
                 -- A near miss teaches: the server took a little longer than
                 -- the settle allowed, so the settle grows. A publish far
                 -- beyond it is the server's own re-check and only delivered.
@@ -1279,15 +1296,22 @@ function flush_deferred(wait)
             if ripe or wait then
                 deferred[bufnr] = nil
                 local opts = vim.tbl_extend("force", d.opts, { wait = true })
-                local report = post_edit_report(bufnr, d.before, d.root, d.headless, opts, d.full,
-                    { since = d.since, acks = d.acks, names = d.names, label = d.label })
+                -- As the client that made the edit: the report says what is
+                -- new to *its* list, and another client's call happening to
+                -- be the one running must not consume or widen it.
+                local report = require("agent99.client").as_client(d.client, function()
+                    return post_edit_report(bufnr, d.before, d.root, d.headless, opts, d.full,
+                        { since = d.since, acks = d.acks, names = d.names, label = d.label })
+                end)
                 report.edit = d.label
                 report.file = vim.api.nvim_buf_get_name(bufnr)
-                carry.deferred_verdicts = carry.deferred_verdicts or {}
-                carry.deferred_verdicts[#carry.deferred_verdicts + 1] = report
+                local into = carry_for(d.client)
+                into.deferred_verdicts = into.deferred_verdicts or {}
+                into.deferred_verdicts[#into.deferred_verdicts + 1] = report
             else
-                carry.still_pending = carry.still_pending or {}
-                carry.still_pending[#carry.still_pending + 1] = d.label
+                local into = carry_for(d.client)
+                into.still_pending = into.still_pending or {}
+                into.still_pending[#into.still_pending + 1] = d.label
             end
         end
     end
@@ -1298,8 +1322,9 @@ end
 local function take_carry()
     collect_late()
     flush_deferred(false)
-    local out = carry
-    carry = {}
+    local id = require("agent99.client").current()
+    local out = carries[id] or {}
+    carries[id] = {}
     local pending = out.still_pending
     if type(pending) == "table" then
         out.still_pending = ("%d edit(s) await the server's verdict, which comes with a later reply: %s")
@@ -1386,16 +1411,28 @@ end
 -- the project-wide diagnostic diff below is exactly what the caller wants
 -- to see (what did removing this file break?), so the report still runs.
 -- Signatures of the pre-existing diagnostics as last reported, with their
--- counts, so the next report names only what is new to the list. The hint
--- about full_diagnostics goes out once per session.
-local last_prior_sigs = {}
+-- counts, so the next report names only what is new to the list; the
+-- signatures carried over one extra reply because they left the list without
+-- being fixed (a server re-analyzing a file drops its diagnostics and
+-- publishes them again a moment later - carried once, so a diagnostic that is
+-- really gone stops being remembered on the reply after that); and whether
+-- the once-per-session hint about full_diagnostics has gone out.
+--
+-- All three are per client. "New to this list" means new to what *you* have
+-- been shown, and while this was per root one client's reply discharged
+-- another's disclosure: an agent was told "none new to this list" about four
+-- warnings only the other agent had ever been shown.
+local prior_state_by_client = {}
 
--- Signatures carried over one extra reply because they left the list without
--- being fixed - a server re-analyzing a file drops its diagnostics and
--- publishes them again a moment later. Carried once, so a diagnostic that is
--- really gone stops being remembered on the reply after that.
-local carried_prior_sigs = {}
-local preexisting_hinted = false
+local function prior_state()
+    local id = require("agent99.client").current()
+    local state = prior_state_by_client[id]
+    if not state then
+        state = { last = {}, carried = {}, hinted = false }
+        prior_state_by_client[id] = state
+    end
+    return state
+end
 
 -- Whether a diagnostic message names one of these symbols. Whole-word, so a
 -- moved `add` is not found inside `address` and a file's unrelated error is
@@ -1447,6 +1484,9 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         deferred[bufnr] = {
             since = since, acks = acks, names = names, before = before, root = root,
             headless = headless, opts = opts, full = full, label = label,
+            -- Whose edit it was: the verdict is owed to that client, and
+            -- rode out on whichever client's next reply left first.
+            client = require("agent99.client").current(),
             -- The version the servers were told about, so the deferred check
             -- can use the same exact signal the waiting path does.
             version = vim.lsp.util.buf_versions and vim.lsp.util.buf_versions[bufnr] or nil,
@@ -1782,9 +1822,11 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     end)
     local seen_now = {}
     for _, item in ipairs(prior_items) do seen_now[item.sig] = (seen_now[item.sig] or 0) + 1 end
+    -- What this client has been shown, not what the editor has shown anyone.
+    local disclosed = prior_state()
     if #prior > 0 then
         local listed, here, entered, entered_here = {}, 0, 0, 0
-        local budget = vim.deepcopy(last_prior_sigs)
+        local budget = vim.deepcopy(disclosed.last)
         for _, item in ipairs(prior_items) do
             if item.here then here = here + 1 end
             local known = (budget[item.sig] or 0) > 0
@@ -1831,23 +1873,23 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
             report.preexisting = ("%s were there before the edit (%s), none new to this list"):format(
                 table.concat(prior, " and "), where)
         end
-        if not preexisting_hinted then
+        if not disclosed.hinted then
             report.preexisting = report.preexisting .. "; full_diagnostics=true lists them all"
-            preexisting_hinted = true
+            disclosed.hinted = true
         end
     end
     -- The same churn empties a file's list and fills it again, and every
     -- return read as "new to this list". What the last two replies saw
     -- counts as seen, so a diagnostic has to be genuinely new to be named.
-    for sig, n in pairs(last_prior_sigs) do
-        if not seen_now[sig] and (carried_prior_sigs[sig] or 0) == 0 then
+    for sig, n in pairs(disclosed.last) do
+        if not seen_now[sig] and (disclosed.carried[sig] or 0) == 0 then
             seen_now[sig] = n
-            carried_prior_sigs[sig] = n
+            disclosed.carried[sig] = n
         else
-            carried_prior_sigs[sig] = nil
+            disclosed.carried[sig] = nil
         end
     end
-    last_prior_sigs = seen_now
+    disclosed.last = seen_now
     if fixed > 0 then
         report.fixed = fixed .. " diagnostics from before the edit are gone"
     end
@@ -3121,14 +3163,25 @@ end
 local function undo_edit(args)
     local edits = require("agent99.edits")
     local count = (not args.all) and (tonumber(args.count) or 1) or nil
+    -- What the other clients sharing this editor have pending, read before
+    -- anything is undone: their entries are in their own ledgers and are
+    -- never reached from here, and a reply that says nothing about them
+    -- reads as "there was nothing else to undo".
+    local others = edits.others()
     if edits.count() == 0 then
-        return {
+        local out = {
             undone = {},
-            note = "no symbol edits recorded in this run; apply_code_action edits are "
-                .. "not tracked here - reverse a server's own action with another code "
-                .. "action or an edit (an action offered by a refused edit is tracked: it "
-                .. "re-runs that edit tool)",
+            note = "no symbol edits recorded for you in this workspace; apply_code_action "
+                .. "edits are not tracked here - reverse a server's own action with another "
+                .. "code action or an edit (an action offered by a refused edit is tracked: "
+                .. "it re-runs that edit tool)",
         }
+        if others.clients > 0 then
+            out.other_clients = ("%d other client(s) sharing this workspace have %d undo step(s) "
+                .. "of their own on it. Those are not yours and undo_edit will not reach them; "
+                .. "what they wrote is still in the files"):format(others.clients, others.steps)
+        end
+        return out
     end
     local last_bufnr
     local before = diag_snapshot()
@@ -3146,8 +3199,14 @@ local function undo_edit(args)
         out[#out + 1] = item
         last_bufnr = e.bufnr or last_bufnr
     end
-    -- Steps left, not files left: one rename across seven files is one.
+    -- Steps left, not files left: one rename across seven files is one. Left
+    -- of this client's own edits: another client's stand whatever this says.
     local result = { undone = out, remaining = edits.operations() }
+    if others.clients > 0 then
+        result.other_clients = ("%d other client(s) share this workspace and had %d undo step(s) "
+            .. "on it, which this call did not touch: the ledger is per client, so undo_edit "
+            .. "only ever reaches your own edits"):format(others.clients, others.steps)
+    end
     if #dropped > 0 then
         result.dropped = dropped
         result.dropped_note = "skip=true: these entries could not be undone and were forgotten, "

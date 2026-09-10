@@ -1306,6 +1306,13 @@ local function relativize(value, key)
 end
 
 function M.dispatch(tool, args)
+    -- Which client this call is for, before anything runs: the undo ledger,
+    -- the two baselines and the set of diagnostics already disclosed are
+    -- kept per (root, client), and this editor serves every client that
+    -- opened its root. The id rides in the arguments, put there by the
+    -- bridge (bridge/client.go); a call that carries none is the editor's
+    -- own.
+    require("agent99.client").enter(args and args.client)
     local fn = dispatch_table[tool]
     if not fn then
         -- The debugger tools live in their own module; they share the

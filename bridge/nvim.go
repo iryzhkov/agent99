@@ -88,14 +88,25 @@ func envSocket() string {
 }
 
 // nvimCall runs one tool in the instance listening on sock.
-func nvimCall(sock, tool string, args map[string]any) (any, error) {
+func nvimCall(ses session, tool string, args map[string]any) (any, error) {
+	sock := ses.Socket
 	if sock == "" {
 		return nil, errors.New("no Neovim to talk to: call open_workspace(root) first, " +
 			"or launch the bridge with $AGENT99_NVIM (or $NVIM) pointing at a running Neovim")
 	}
-	if args == nil {
-		args = map[string]any{}
+	// Which client the call is for travels with it: the editor keeps the
+	// undo ledger, the two baselines and the set of diagnostics already
+	// shown per (root, client), and without this they would be per root and
+	// shared by every agent talking to this instance. Copied rather than
+	// added to the caller's map, so nothing else sees a key it did not set.
+	withClient := make(map[string]any, len(args)+1)
+	for k, v := range args {
+		withClient[k] = v
 	}
+	if _, ok := withClient["client"]; !ok && ses.Client != "" {
+		withClient["client"] = ses.Client
+	}
+	args = withClient
 	payload, err := json.Marshal(map[string]any{"tool": tool, "args": args})
 	if err != nil {
 		return nil, err

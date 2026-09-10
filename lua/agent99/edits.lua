@@ -3,10 +3,43 @@
 -- finishes (for the summary notification) and keeps it for :Agent99Revert.
 -- Everything lives in editor buffers (unsaved), so reverting is just
 -- restoring the recorded lines in reverse order.
+--
+-- One ledger per client, not one per editor. This Neovim serves every client
+-- that opened its root, and with a single stack `undo_edit()` with no
+-- arguments popped whatever the newest edit in the editor was: one agent's
+-- undo reverted another agent's edit, reported success, and never told the
+-- agent whose work had gone. See agent99/client.lua for where the id that
+-- keys these comes from.
 
 local M = {}
 
-local current = {}
+local client = require("agent99.client")
+
+local ledgers = {}    -- [client] = { entry, ... }, newest last
+local groups = {}     -- [client] = { seq = n, open = n or nil }
+
+local function ledger()
+    return client.slot(ledgers)
+end
+
+local function group_state()
+    local id = client.current()
+    if not groups[id] then groups[id] = { seq = 0 } end
+    return groups[id]
+end
+
+-- How many undo steps a list of entries holds: tool calls, not files
+-- touched.
+local function count_steps(entries)
+    local seen, n = {}, 0
+    for _, e in ipairs(entries) do
+        if e.group == nil or not seen[e.group] then
+            if e.group ~= nil then seen[e.group] = true end
+            n = n + 1
+        end
+    end
+    return n
+end
 
 -- One tool call is one undo step, however many files or ledger entries it
 -- took. A rename across seven files was seven entries, so undo_edit(count=1)
@@ -14,26 +47,26 @@ local current = {}
 -- three, and undoing one of those restored the destination while the symbol
 -- stayed deleted from the source - the function was then in neither file.
 -- Entries recorded inside the same group are undone together, in order.
-local group_seq = 0
-local open_group = nil
 
 --- Record everything `fn` writes as one undo step.
 function M.as_one_step(fn)
-    local outer = open_group
-    group_seq = group_seq + 1
-    open_group = group_seq
+    local state = group_state()
+    local outer = state.open
+    state.seq = state.seq + 1
+    state.open = state.seq
     local ok, res = pcall(fn)
-    open_group = outer
+    state.open = outer
     if not ok then error(res, 0) end
     return res
 end
 
 local function stamp(entry)
-    if open_group then
-        entry.group = open_group
+    local state = group_state()
+    if state.open then
+        entry.group = state.open
     else
-        group_seq = group_seq + 1
-        entry.group = group_seq
+        state.seq = state.seq + 1
+        entry.group = state.seq
     end
 end
 
@@ -41,6 +74,7 @@ end
 --- entry = { file, bufnr, name_path, kind, first, last, old_lines, new_count }
 function M.record(entry)
     stamp(entry)
+    local current = ledger()
     current[#current + 1] = entry
     -- Live UI: show the edit in the code window as it happens.
     pcall(function()
@@ -48,15 +82,16 @@ function M.record(entry)
     end)
 end
 
---- Number of edits recorded for the running request.
+--- Number of edits this client has recorded.
 function M.count()
-    return #current
+    return #ledger()
 end
 
---- Return the recorded edits and start a fresh ledger.
+--- Return this client's recorded edits and start it a fresh ledger.
 function M.take()
-    local out = current
-    current = {}
+    local id = client.current()
+    local out = ledgers[id] or {}
+    ledgers[id] = {}
     return out
 end
 
@@ -67,32 +102,45 @@ end
 function M.record_file_op(entry)
     entry.file_op = true
     stamp(entry)
+    local current = ledger()
     current[#current + 1] = entry
 end
 
---- How many undo steps the ledger holds: tool calls, not files touched.
+--- How many undo steps this client's ledger holds: tool calls, not files
+--- touched.
 function M.operations()
-    local seen, n = {}, 0
-    for _, e in ipairs(current) do
-        if e.group == nil or not seen[e.group] then
-            if e.group ~= nil then seen[e.group] = true end
-            n = n + 1
-        end
-    end
-    return n
+    return count_steps(ledger())
 end
 
---- Undo the newest `n` recorded edits (all of them when n is nil), newest
---- first, and drop them from the ledger. Each edit is checked against the
---- buffer first: the lines it wrote must still be there, or something else
---- has changed that region since and blindly restoring would clobber it.
---- File operations carry their own check inside their undo function.
+--- What the other clients using this editor have pending: how many of them,
+--- and how many undo steps between them. A reply that undid nothing, or that
+--- undid only this client's own work, can then say what it left alone
+--- instead of being silent about it.
+function M.others()
+    local id, clients, steps = client.current(), 0, 0
+    for who, entries in pairs(ledgers) do
+        if who ~= id and #entries > 0 then
+            clients = clients + 1
+            steps = steps + count_steps(entries)
+        end
+    end
+    return { clients = clients, steps = steps }
+end
+
+--- Undo the newest `n` edits this client recorded (all of them when n is
+--- nil), newest first, and drop them from its ledger. Another client's
+--- entries are not in this ledger and are never reached. Each edit is checked
+--- against the buffer first: the lines it wrote must still be there, or
+--- something else has changed that region since and blindly restoring would
+--- clobber it. File operations carry their own check inside their undo
+--- function.
 --- Returns the list of undone entries and the list of refusals.
 --- `skip` drops an entry that refuses to undo instead of stopping there:
 --- one region changed by hand made every older edit unreachable, and the
 --- only way out was git.
 function M.undo_last(n, skip)
     local undone, refused, dropped = {}, {}, {}
+    local current = ledger()
     local todo = n or M.operations()
     -- `todo` counts steps; a step is every entry sharing the newest group.
     local step_group = nil
@@ -171,6 +219,18 @@ function M.undo_last(n, skip)
         end
         undone[#undone + 1] = e
         current[#current] = nil
+        -- Restoring rarely puts back as many lines as the edit wrote, so
+        -- everything below it moves. Entries in every ledger follow, this
+        -- client's and the other clients' both: their regions are checked
+        -- against the buffer before an undo, and one left pointing at the old
+        -- row is refused as "changed since" over an edit its owner never
+        -- made. Under one shared LIFO stack this could not happen - the
+        -- newest edit was always the one undone - and with a ledger per
+        -- client it can, whenever the edit undone sits above another's.
+        if not e.file_op then
+            local delta = #(e.old_lines or {}) - e.new_count
+            M.shift(e.bufnr, e.first + e.new_count - 1, delta)
+        end
         ::continue::
     end
     return undone, refused, dropped
@@ -215,10 +275,16 @@ end
 --- does not refuse them as "changed since".
 function M.shift(bufnr, after, delta)
     if delta == 0 then return end
-    for _, e in ipairs(current) do
-        if not e.file_op and e.bufnr == bufnr and e.first > after then
-            e.first = e.first + delta
-            if e.last then e.last = e.last + delta end
+    -- Every client's entries, not only this one's: the buffer is shared, so
+    -- text moving down moves what another client's entry points at too, and
+    -- leaving those behind would make its undo refuse them as "changed since"
+    -- over an edit it never made.
+    for _, entries in pairs(ledgers) do
+        for _, e in ipairs(entries) do
+            if not e.file_op and e.bufnr == bufnr and e.first > after then
+                e.first = e.first + delta
+                if e.last then e.last = e.last + delta end
+            end
         end
     end
 end

@@ -401,12 +401,12 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "undo_edit",
-		Description: "Undo the newest symbol edit(s) of this run (count, or all), restoring the previous source, and removing a file the run created. Refuses if the region changed since. A language server's own code action is not covered; an action offered by a refused edit is, since it re-runs that edit tool.",
+		Description: "Undo the newest symbol edit(s) you made through this connection (count, or all), restoring the previous source, and removing a file it created. The ledger is per client: edits another agent made in the same workspace are in its own ledger and are never reached from here, and a reply says how many steps they have. Agents that share one MCP connection - the subagents of one session - count as one client and share this ledger. Refuses if the region changed since. A language server's own code action is not covered; an action offered by a refused edit is, since it re-runs that edit tool.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"count": map[string]any{"type": "integer", "description": "How many of the newest edits to undo (default 1)."},
-				"all":   map[string]any{"type": "boolean", "description": "Undo every edit of this run."},
+				"all":   map[string]any{"type": "boolean", "description": "Undo every edit of yours this workspace still holds."},
 				"skip":  map[string]any{"type": "boolean", "description": "Forget an entry that refuses to undo (its region changed since) and carry on with the older ones, instead of stopping there."},
 			},
 			"required": []string{},

@@ -506,7 +506,8 @@ func runAgent() {
 				}
 				freshCalls++
 				started := time.Now()
-				out, err := callTool(name, args, session{Root: p.Root, Socket: envSocket()})
+				out, err := callTool(name, args, session{Root: p.Root,
+					Socket: envSocket(), Client: processClientID()})
 				tookMs := time.Since(started).Milliseconds()
 				if err == nil && stateChangingTools[name] {
 					// Buffers changed: older results are stale, so both

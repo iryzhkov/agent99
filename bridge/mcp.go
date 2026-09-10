@@ -51,7 +51,11 @@ var workspaceTools = []tool{
 		Description: "Start a headless Neovim in the given project root and route tool calls " +
 			"in that tree to it: its language servers back definition/references/hover/" +
 			"diagnostics/symbol edits and the rest. Call this once per project before any " +
-			"LSP tool. Reopening the same root is a no-op. Several projects can be open at " +
+			"LSP tool. A root already open joins that instance instead of starting one, and " +
+			"the reply says so (already_open, clients, shared): its buffers and language " +
+			"servers are shared with the other clients using it, while your undo ledger, " +
+			"your check_project and run_tests baselines and the diagnostics you have been " +
+			"shown are your own. Several projects can be open at " +
 			"once, as long as no root contains another; each call is routed to the workspace " +
 			"owning the path it names, so pass absolute paths (or workspace=<root>) once more " +
 			"than one is open. Symbol edits made through this server are saved to disk at once.",
@@ -66,7 +70,9 @@ var workspaceTools = []tool{
 	{
 		Name: "close_workspace",
 		Description: "Stop a headless Neovim started by open_workspace, freeing its language " +
-			"servers. With one workspace open the root is optional.",
+			"servers. With one workspace open the root is optional. A workspace other " +
+			"clients are using is closed for them too - the reply names them under " +
+			"was_shared - so close a root you opened rather than one you found open.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -83,15 +89,31 @@ func embeddedMode() bool {
 
 // openWorkspaceResult is what a client gets back for an opened workspace:
 // where it is, and what its Neovim can actually serve.
-func openWorkspaceResult(ws *headlessWorkspace) map[string]any {
+func openWorkspaceResult(ws *headlessWorkspace, client string, wasOpen bool) map[string]any {
+	ses := ws.session()
+	ses.Client = client
 	result := map[string]any{
 		"root":   ws.Root,
 		"socket": ws.Socket,
 		"pid":    ws.cmd.Process.Pid,
 	}
+	// Reopening the same root is a no-op, and used to be reported as one:
+	// the full first-time reply, with nothing saying the instance was
+	// already there, whose it was, or that its buffers and language servers
+	// are now shared. An agent reading that had no way to know it had
+	// joined another agent's workspace.
+	if wasOpen {
+		result["already_open"] = true
+	}
+	if holders := holdersOf(ws.Root); len(holders) > 0 {
+		result["clients"] = len(holders)
+	}
+	if note := sharedNote(ws.Root, client); note != "" {
+		result["shared"] = note
+	}
 	// Tell the client up front which languages the instance can actually
 	// serve, instead of letting symbol tools come back quietly empty.
-	if support, err := nvimCall(ws.Socket, "workspace_support", map[string]any{"root": ws.Root}); err == nil {
+	if support, err := nvimCall(ses, "workspace_support", map[string]any{"root": ws.Root}); err == nil {
 		if m, ok := support.(map[string]any); ok {
 			result["languages"] = m["languages"]
 			if note, ok := m["note"].(string); ok && note != "" {
@@ -104,7 +126,7 @@ func openWorkspaceResult(ws *headlessWorkspace) map[string]any {
 	// The tree is the check that the right project was opened and the hint
 	// which subdirectory to map next; it costs one wc pass, so it is cheap
 	// enough for every open.
-	if tree, err := nvimCall(ws.Socket, "workspace_tree", map[string]any{"root": ws.Root}); err == nil {
+	if tree, err := nvimCall(ses, "workspace_tree", map[string]any{"root": ws.Root}); err == nil {
 		if m, ok := tree.(map[string]any); ok {
 			result["tree"] = m["tree"]
 			result["file_count"] = m["file_count"]
@@ -267,9 +289,9 @@ func jsonResult(v any) map[string]any {
 	return textResult(string(pretty), false)
 }
 
-func callMCPTool(name string, arguments map[string]any) map[string]any {
+func callMCPTool(name string, arguments map[string]any, client string) map[string]any {
 	started := time.Now()
-	res, root := dispatchMCPTool(name, arguments)
+	res, root := dispatchMCPTool(name, arguments, client)
 	logFriction(name, root, arguments, res, started)
 	return res
 }
@@ -277,7 +299,7 @@ func callMCPTool(name string, arguments map[string]any) map[string]any {
 // dispatchMCPTool runs one tool call and reports which workspace answered it,
 // empty when the call failed before it was routed anywhere. The second return
 // exists for the friction spool: where a call ran is part of reading it later.
-func dispatchMCPTool(name string, arguments map[string]any) (map[string]any, string) {
+func dispatchMCPTool(name string, arguments map[string]any, client string) (map[string]any, string) {
 	if arguments == nil {
 		arguments = map[string]any{}
 	}
@@ -287,17 +309,44 @@ func dispatchMCPTool(name string, arguments map[string]any) (map[string]any, str
 			return textResult("Error: open_workspace is not available while embedded in Neovim", true), ""
 		}
 		root, _ := arguments["root"].(string)
+		// Whether this call started the instance or joined one that was
+		// already up, asked before opening: afterwards the two are
+		// indistinguishable, which is how "reopening is a no-op" came to be
+		// reported as a first-time open.
+		wasOpen := root != "" && workspaceFor(realPath(absPath(root))) != nil
 		ws, err := openWorkspace(root)
 		if err != nil {
 			return textResult("Error: "+err.Error(), true), ""
 		}
-		return jsonResult(openWorkspaceResult(ws)), ws.Root
+		noteHolder(ws.Root, client)
+		return jsonResult(openWorkspaceResult(ws, client, wasOpen)), ws.Root
 	case "close_workspace":
 		roots, err := closeTargets(arguments)
 		if err != nil {
 			return textResult("Error: "+err.Error(), true), ""
 		}
+		// Who else was using each root, read before it is closed: the
+		// instance is gone by the time the reply is built, and a close that
+		// takes another agent's buffers and language servers with it used to
+		// say only "closed".
+		shared := map[string][]string{}
+		for _, root := range roots {
+			if others := otherHolders(root, client); len(others) > 0 {
+				labels := make([]string, 0, len(others))
+				for _, id := range others {
+					labels = append(labels, shortClient(id))
+				}
+				shared[root] = labels
+			}
+		}
 		result := map[string]any{"closed": closeWorkspaces(roots)}
+		if len(shared) > 0 {
+			result["was_shared"] = shared
+			result["was_shared_note"] = "these roots were in use by other clients as well, and " +
+				"closing one closes it for them too: the Neovim, its buffers and its language " +
+				"servers are gone, and their next call naming a path inside it is served " +
+				"somewhere else"
+		}
 		if open := openRoots(); len(open) > 0 {
 			result["workspaces"] = open
 		}
@@ -321,6 +370,12 @@ func dispatchMCPTool(name string, arguments map[string]any) (map[string]any, str
 	ses, err := resolveSession(name, arguments)
 	if err != nil {
 		return textResult("Error: "+err.Error(), true), ""
+	}
+	ses.Client = client
+	// A workspace opened for this call, or revived for it, is held by this
+	// client as surely as one it opened by name.
+	if ses.Headless {
+		noteHolder(ses.Root, client)
 	}
 	// Busy from here until the reply, so the idle sweep cannot close the
 	// workspace under a long call; touched again on the way out either way.
@@ -374,7 +429,10 @@ func mcpHandle(method string, params map[string]any) (map[string]any, bool) {
 	case "tools/call":
 		name, _ := params["name"].(string)
 		arguments, _ := params["arguments"].(map[string]any)
-		return callMCPTool(name, arguments), true
+		// _meta is where a caller can say which agent it is speaking for
+		// (client.go); with no such field the whole connection is one
+		// client, which is what this process is.
+		return callMCPTool(name, arguments, callClient(metaClient(params))), true
 	}
 	return nil, false
 }

@@ -22,8 +22,12 @@ local FAILURES_MAX = 40
 -- Commands remembered per root, shared with later sessions.
 local test_override, save_test_override = install.command_store("test_commands")
 
--- Baselines per root and command: the failing test names (or, when nothing
--- parsed as a test, the output lines) of the last run.
+-- Baselines per client, root and command: the failing test names (or, when
+-- nothing parsed as a test, the output lines) of the last run. The client is
+-- part of the key because this editor serves several of them: without it a
+-- client that had never run the tests inherited another client's baseline,
+-- and "N new failures since the baseline" described the other client's
+-- change (agent99/client.lua).
 local baselines = {}
 
 local function exists(root, name)
@@ -611,7 +615,10 @@ local function run_tests(args)
     -- Baseline by test name: a rerun says which tests started failing and
     -- which stopped, and the noise (durations, temp paths) never counts.
     -- Where nothing parsed as a test, the output lines stand in.
-    local key = root .. "\0" .. cmd
+    -- Per client, per root, per command: a client that has never run these
+    -- tests has no baseline, rather than inheriting one recorded by another
+    -- client over a tree in a state it never saw.
+    local key = require("agent99.client").key(root, cmd)
     local function names_of(list)
         local names = {}
         for _, f in ipairs(list) do names[#names + 1] = f.test end
@@ -671,8 +678,14 @@ local function run_tests(args)
         end
         baselines[key] = now_set
     else
+        local replaced = base ~= nil
         baselines[key] = now_set
-        out.baseline = "recorded; later calls report which tests started or stopped failing"
+        out.baseline = (replaced
+            and "re-recorded, replacing this client's previous baseline for this command; "
+            or "recorded; ")
+            .. "later calls report which tests started or stopped failing. It is yours and "
+            .. "this command's: another command in this root, and another client running "
+            .. "it, each have their own"
         if result.code ~= 0 or #failures > 0 then
             out.output = vim.list_slice(lines, 1, OUTPUT_MAX_LINES)
             if #lines > OUTPUT_MAX_LINES then out.output_truncated = #lines - OUTPUT_MAX_LINES end
