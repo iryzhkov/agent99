@@ -398,6 +398,29 @@ def group_index(c):
           any("decls" in l for l in tree), tree)
     res = b.call("workspace_tree", {"budget": 5})
     check("workspace_tree honours the budget", len(res.get("tree", [])) <= 5, res)
+    # A directory line used to be emitted whether or not the budget had room
+    # for it, and the summary line a partly-listed directory still needs was
+    # spent by then: one more directory in the tree turned budget=5 into six
+    # lines. The budget is a promise about the size of the reply, so it is
+    # checked at the size where it used to break.
+    extra_dir = os.path.join(root, "vendor", "thirdparty")
+    os.makedirs(extra_dir, exist_ok=True)
+    with open(os.path.join(extra_dir, "dep.lua"), "w") as f:
+        f.write("local D = {}\n\nfunction D.dep() end\n\nreturn D\n")
+    for budget in (5, 6, 7, 8):
+        res = b.call("workspace_tree", {"budget": budget})
+        check("workspace_tree honours budget=%d with one more directory" % budget,
+              len(res.get("tree", [])) <= budget, res)
+    # And the "+N more files" line says what it is N of.
+    res = b.call("workspace_tree", {"budget": 12})
+    more = [l for l in res.get("tree", []) if "more files" in l]
+    check("the omitted-files note names shown and total",
+          all(re.search(r"… \+(\d+) more files \((\d+) of (\d+) shown\)", l)
+              and int(re.search(r"\((\d+) of (\d+) shown\)", l).group(2))
+              - int(re.search(r"\((\d+) of (\d+) shown\)", l).group(1))
+              == int(re.search(r"\+(\d+) more", l).group(1))
+              for l in more), res)
+    os.remove(os.path.join(extra_dir, "dep.lua"))
     res = b.call("workspace_tree", {"path": "lua/testproj", "depth": 1})
     check("workspace_tree zooms by path",
           res.get("root", "").endswith("lua/testproj")
@@ -1886,6 +1909,13 @@ def group_verdict(c):
     check("full_diagnostics lists them again",
           res3.get("preexisting") is None
           or ("all listed" in res3.get("preexisting") and isinstance(res3.get("preexisting_list"), list)), res3)
+    # "all listed" and "… +92 more" used to sit in the same object, and
+    # full_diagnostics=true is the flag whose whole purpose is to defeat the
+    # cap - the loudest wrong count in any reply.
+    listed = res3.get("preexisting_list") or []
+    check("full_diagnostics does not claim to list all and then stop",
+          not ("all listed" in (res3.get("preexisting") or "")
+               and any(l.startswith("… +") for l in listed)), res3)
 
     # A fresh editor, not just fresh files: the undo checks below count what
     # the ledger holds, and the timings compare edits made in one session.
@@ -2393,6 +2423,22 @@ def group_search(c):
     text = reply["result"]["content"][0]["text"]
     check("list_files hides binaries",
           "blob.bin" not in text and "not listed" in text, text)
+    # The cap used to say only that it stopped: a 1,261-file glob answered
+    # with 500 files and no remainder, so a caller could not tell whether one
+    # file was missed or three quarters of them.
+    many = os.path.join(root, "many")
+    os.makedirs(many, exist_ok=True)
+    for i in range(520):
+        with open(os.path.join(many, "f%03d.txt" % i), "w") as f:
+            f.write("x\n")
+    reply = b.rpc("tools/call", {"name": "list_files",
+                                 "arguments": {"glob": "many/**/*.txt"}})
+    text = reply["result"]["content"][0]["text"]
+    check("list_files names its remainder",
+          "500 of 520 files listed; 20 more are not shown" in text
+          and len([l for l in text.splitlines() if l.startswith("many/")]) == 500,
+          text.splitlines()[-1])
+    shutil.rmtree(many)
     # A single-file target keeps the filename, so hits stay annotated.
     reply = b.rpc("tools/call", {"name": "grep", "arguments": {
         "pattern": "M.greet", "path": "lua/testproj/util.lua", "context": 0}})

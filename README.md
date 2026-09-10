@@ -634,6 +634,33 @@ publishes the packages that depend on it about a second later, in a second
 wave, while lua_ls publishes once and never comes back. A server seen to have
 no second wave stops being waited for after three edits.
 
+### When a reply is cut short
+
+Every tool that caps its output reports the cut the same way: how many
+entries were shown, how many exist, and how many were dropped. Object-shaped
+replies (`references`, `debug_stack`, `debug_variables`) carry `shown`,
+`total` and `dropped` as numbers; a truncation inside a list of strings ends
+the list with `… +470 more declarations (150 of 620 shown)` and how to reach
+the rest.
+
+Two rules behind that shape, both of them lessons:
+
+- The count is taken after every filter has run, by a pass that goes where
+  the emitting pass stopped. A count of what was left over at the cut point
+  describes the cut, not the loss: `skim` counted the not-yet-emitted
+  siblings of the ancestors at its cut point, which told a 100k-line JSON
+  file that 215 keys were missing when 75,206 were.
+- A note is never suppressed because the count came out at zero. A file that
+  is one nesting chain has no remaining siblings, so that count computed to
+  0 and took the warning with it — 2,850 declarations dropped in silence, in
+  the reply where the loss was worst.
+
+Where a total genuinely cannot be known — `ts_query` stops at its match cap
+and never opens the files after it — the reply says how far it got and that
+the rest is unknown, rather than offering a number. Where a bounded counting
+pass ran out of its own budget, the total is reported as a floor and the
+reply says the count stopped early.
+
 ### Extras
 
 `AGENT99_LINT_<FILETYPE>` in the server's environment (`claude mcp add -e

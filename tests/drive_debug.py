@@ -142,6 +142,32 @@ def main():
         check("debug_stack collapses external frames",
               any("<external" in f for f in res.get("frames", [])), res)
 
+        # The truncation contract, against oracles taken from the same
+        # stopped frame. `truncated` used to be DAP's `totalFrames`, which
+        # delve fills with its own default stack cap: the same ten-frame
+        # stack reported "truncated": 50 at every depth. And
+        # `debug_variables`' remainder was of the nodes it had materialised
+        # before it stopped walking, so raising max by that number did not
+        # reach the rest.
+        deep = b.call("debug_stack", {"depth": 100, "all_frames": True})
+        real_depth = len([f for f in deep.get("frames", []) if not f.startswith("+")])
+        check("a full stack claims no remainder",
+              "dropped" not in deep and "truncated" not in deep, deep)
+        for depth in (1, 2, 3):
+            res = b.call("debug_stack", {"depth": depth, "all_frames": True})
+            check("debug_stack(depth=%d) counts the frames it dropped" % depth,
+                  res.get("shown") == depth and res.get("total") == real_depth
+                  and res.get("dropped") == real_depth - depth, res)
+        every = b.call("debug_variables", {"depth": 3, "max": 200})
+        all_entries = len(every.get("variables", []))
+        check("an uncapped variables call claims no remainder",
+              "dropped" not in every and "truncated" not in every, every)
+        if all_entries > 1:
+            res = b.call("debug_variables", {"depth": 3, "max": 1})
+            check("debug_variables counts every entry, not the ones it opened",
+                  res.get("shown") == 1 and res.get("total") == all_entries
+                  and res.get("dropped") == all_entries - 1, res)
+
         # 6. Editing while stopped is reported on the next stop.
         res = b.call("replace_symbol_lines", {
             "file": main_go, "name_path": "worker", "first_line": 2, "last_line": 2,

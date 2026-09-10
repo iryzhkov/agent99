@@ -10,6 +10,7 @@
 local M = {}
 
 local core = require("agent99.core")
+local cap = require("agent99.cap")
 local err, sleep, load_buf, rel_path = core.err, core.sleep, core.load_buf, core.rel_path
 local get_client, request = core.get_client, core.request
 local has_parser, expand_glob, decl_line = core.has_parser, core.expand_glob, core.decl_line
@@ -457,61 +458,76 @@ local function ts_outline(bufnr)
         -- Headings, not the grammar's sections: see md_sections.
         local sections = md_sections(bufnr) or {}
         for i, s in ipairs(sections) do
-            if i > MAX_SKIM_ENTRIES then
-                out[#out + 1] = ("… +%d more declarations after line %d; find_symbol or "
-                    .. "read_file with offset reach them")
-                    :format(#sections - MAX_SKIM_ENTRIES, sections[MAX_SKIM_ENTRIES].first)
-                break
-            end
+            if i > MAX_SKIM_ENTRIES then break end
             local span = s.last > s.first and ("%d-%d"):format(s.first, s.last) or tostring(s.first)
             out[#out + 1] = ("%s%s: %s"):format(
                 string.rep("  ", s.depth), span, decl_line(bufnr, s.first))
         end
+        if #sections > MAX_SKIM_ENTRIES then
+            out[#out + 1] = cap.note(MAX_SKIM_ENTRIES, #sections, "declarations",
+                "find_symbol or read_file with offset reach them",
+                (" after line %d"):format(sections[MAX_SKIM_ENTRIES].first))
+        end
         return out
     end
+    -- Every declaration-shaped node in the file, counted whether or not it
+    -- is emitted, and reached without recursion.
+    --
+    -- The walk used to stop descending past the cap unless it was still at
+    -- the top level, so what it counted was the not-yet-emitted siblings of
+    -- the ancestors at the cut point and nothing below them. That count was
+    -- wrong by up to 350x - it told a 100k-line JSON file that 215 keys were
+    -- missing when 75206 were - and in a file that is one nesting chain it
+    -- computed to 0, which suppressed the note entirely: 2850 declarations
+    -- dropped in silence. Descending everywhere is also why the stack is
+    -- explicit; a 3000-deep chain is exactly the file this now walks in full.
     local last_row = -1
-    local extra, extra_last_row = 0, -1
-    local function walk(node, depth)
+    local total = 0
+    local stack = {}
+    local function push_children(node, depth)
+        local kids = {}
         for child in node:iter_children() do
-            if child:named() then
-                if wanted_node(child, ft) then
-                    local srow, _, erow, ecol = child:range()
+            if child:named() then kids[#kids + 1] = child end
+        end
+        for i = #kids, 1, -1 do
+            stack[#stack + 1] = { node = kids[i], depth = depth }
+        end
+    end
+    push_children(trees[1]:root(), 0)
+    while #stack > 0 do
+        local item = stack[#stack]
+        stack[#stack] = nil
+        local child, depth = item.node, item.depth
+        if wanted_node(child, ft) then
+            local srow, _, erow, ecol = child:range()
+            -- A wrapper and its inner node often start on the same row (e.g.
+            -- declaration + definition); it is one declaration either way,
+            -- so it is counted once and emitted once.
+            if srow ~= last_row then
+                last_row = srow
+                total = total + 1
+                if #out < MAX_SKIM_ENTRIES then
                     if ecol == 0 and erow > srow then
                         erow = erow - 1
                     end
                     erow = last_written_line(bufnr, srow + 1, erow + 1) - 1
-                    -- A wrapper and its inner node often start on the same
-                    -- row (e.g. declaration + definition); emit it once.
-                    if #out >= MAX_SKIM_ENTRIES then
-                        -- Past the cap, count everything left out: counting
-                        -- only depth<=1 told a QML file with 62 objects below
-                        -- the cut that 2 were missing.
-                        if srow ~= extra_last_row then
-                            extra_last_row = srow
-                            extra = extra + 1
-                        end
-                    elseif srow ~= last_row then
-                        last_row = srow
-                        local span = erow > srow
-                            and ("%d-%d"):format(srow + 1, erow + 1)
-                            or tostring(srow + 1)
-                        out[#out + 1] = ("%s%s: %s"):format(
-                            string.rep("  ", depth), span, decl_line(bufnr, srow + 1))
-                    end
-                    if #out < MAX_SKIM_ENTRIES or depth < 1 then
-                        walk(child, depth + 1)
-                    end
-                elseif not data_opaque(child:type(), ft) then
-                    walk(child, depth)
+                    local span = erow > srow
+                        and ("%d-%d"):format(srow + 1, erow + 1)
+                        or tostring(srow + 1)
+                    out[#out + 1] = ("%s%s: %s"):format(
+                        string.rep("  ", depth), span, decl_line(bufnr, srow + 1))
                 end
             end
+            push_children(child, depth + 1)
+        elseif not data_opaque(child:type(), ft) then
+            push_children(child, depth)
         end
     end
-    walk(trees[1]:root(), 0)
-    if extra > 0 then
-        local last_line = tonumber(out[#out]:match("^%s*(%d+)")) or 0
-        out[#out + 1] = ("… +%d more declarations after line %d; find_symbol or "
-            .. "read_file with offset reach them"):format(extra, last_line)
+    if total > #out then
+        local last_line = tonumber((out[#out] or ""):match("^%s*(%d+)")) or 0
+        out[#out + 1] = cap.note(#out, total, "declarations",
+            "find_symbol or read_file with offset reach them",
+            (" after line %d"):format(last_line))
     end
     return out
 end
@@ -547,10 +563,12 @@ local function ts_query(args)
 
     local compiled, first_query_error = {}, nil
     local matches, skipped = {}, {}
+    local files_searched = 0
     for _, f in ipairs(files) do
         if #matches >= MAX_QUERY_MATCHES then
             break
         end
+        files_searched = files_searched + 1
         local okb, bufnr = pcall(load_buf, f)
         if not okb then
             skipped[#skipped + 1] = f .. " (unreadable)"
@@ -613,7 +631,13 @@ local function ts_query(args)
         res.skipped = skipped
     end
     if #matches >= MAX_QUERY_MATCHES then
-        res.note = ("truncated at %d matches"):format(MAX_QUERY_MATCHES)
+        -- No total here, and none invented: the search stops at the cap, so
+        -- the files after it were never opened and nothing in this reply
+        -- knows how many matches they hold. What it can say is where it
+        -- stopped.
+        res.note = ("stopped at the cap of %d matches, having searched %d of %d files; how many "
+            .. "more there are is not known - narrow with files= or glob=, or make the query "
+            .. "more specific"):format(MAX_QUERY_MATCHES, files_searched, #files + files_capped)
     end
     if files_capped > 0 then
         -- Silence here answered a 555-file glob out of the first 50 files and
@@ -666,12 +690,8 @@ local function skim(args)
                 table.sort(flat, function(a, b)
                     return (tonumber(a:match("^%s*(%d+)")) or 0) < (tonumber(b:match("^%s*(%d+)")) or 0)
                 end)
-                if #flat > MAX_SKIM_ENTRIES then
-                    local extra = #flat - MAX_SKIM_ENTRIES
-                    flat = vim.list_slice(flat, 1, MAX_SKIM_ENTRIES)
-                    flat[#flat + 1] = ("… +%d more declarations; find_symbol or read_file with "
-                        .. "offset reach them"):format(extra)
-                end
+                flat = cap.list(flat, MAX_SKIM_ENTRIES, "declarations",
+                    "find_symbol or read_file with offset reach them")
                 return #flat > 0 and flat or nil
             end
             local outline
@@ -786,7 +806,7 @@ local function top_level_outline(path, budget, missing)
     if not okt or not trees or not trees[1] then
         return nil, #lines
     end
-    local out, extra = {}, 0
+    local out, total = {}, 0
     local last_row = -1
     -- Emit declaration-shaped nodes, descending one level into the ones that
     -- hold other declarations. Stopping at the top level suits Go, where
@@ -804,9 +824,11 @@ local function top_level_outline(path, budget, missing)
                         -- Several declarations on one line (a one-line JSON
                         -- object) are one line of the map.
                     elseif #out >= budget then
-                        extra = extra + 1
+                        last_row = srow
+                        total = total + 1
                     else
                         last_row = srow
+                        total = total + 1
                         local text = (lines[srow + 1] or ""):gsub("^%s+", "")
                         if #text > MAP_TEXT_MAX then
                             text = text:sub(1, MAP_TEXT_MAX) .. "…"
@@ -823,10 +845,11 @@ local function top_level_outline(path, budget, missing)
         end
     end
     walk(trees[1]:root(), 0)
-    if extra > 0 then
-        out[#out + 1] = ("… +%d more declarations (skim the file for all of them)"):format(extra)
+    if total > #out then
+        out[#out + 1] = cap.note(#out, total, "declarations",
+            "skim the file for all of them")
     end
-    return out, #lines
+    return out, #lines, nil, total
 end
 
 -- Every project file under `target`, relative to it and path-sorted: git's
@@ -1185,21 +1208,66 @@ local function workspace_tree(args)
             over = used + taken + summary_lines() - budget
         end
     end
-    local omitted = {}
-    for _, fe in ipairs(candidates) do
-        if not shown_files[fe.entry] then
-            omitted[fe.node] = (omitted[fe.node] or 0) + 1
+    -- What the render will actually cost, and which directories owe a
+    -- summary line, recomputed from the current selection.
+    local omitted, shown_of, n_omit_lines = {}, {}, 0
+    local function recount()
+        omitted, shown_of, n_omit_lines = {}, {}, 0
+        for _, fe in ipairs(candidates) do
+            local reachable = ancestors_shown(fe.node)
+            if shown_files[fe.entry] and not reachable then
+                shown_files[fe.entry] = nil
+                taken = taken - 1
+            end
+            if reachable and not shown_files[fe.entry] then
+                omitted[fe.node] = (omitted[fe.node] or 0) + 1
+            end
+        end
+        -- Counted over the directory's own files, not over the candidate
+        -- list: the highest-ranked root files are shown before the ranking
+        -- round and are in no candidate list, so counting candidates told
+        -- the root "0 of 4 shown" with a file of its own on the line above.
+        for node, _ in pairs(omitted) do
+            local any = 0
+            for _, f in ipairs(node.dir.direct) do
+                if shown_files[f] then any = any + 1 end
+            end
+            if any == 0 then omitted[node] = nil else shown_of[node] = any end
+        end
+        for _ in pairs(omitted) do n_omit_lines = n_omit_lines + 1 end
+        return used + taken + n_omit_lines
+    end
+    -- The give-back above can only return file lines. When the budget went
+    -- on directories there is no file left to give back, and the summary
+    -- line a partly-listed directory still needs takes the reply past the
+    -- budget anyway: adding one fixture directory to the test project turned
+    -- a budget=5 call into six lines. A directory line is a line like any
+    -- other, so the lowest-ranked ones go back too, and the files under them
+    -- stop being reachable with them.
+    while recount() > budget do
+        local victim
+        for i = #dir_nodes, 1, -1 do
+            if shown_dirs[dir_nodes[i]] then
+                victim = dir_nodes[i]
+                break
+            end
+        end
+        if not victim then break end
+        for _, n in ipairs(dir_nodes) do
+            if shown_dirs[n] then
+                local a = n
+                while a and a ~= tree do
+                    if a == victim then
+                        shown_dirs[n] = nil
+                        used = used - 1
+                        dirs_cut = dirs_cut + 1
+                        break
+                    end
+                    a = a.parent
+                end
+            end
         end
     end
-    for node, _ in pairs(omitted) do
-        local any = false
-        for _, f in ipairs(node.dir.direct) do
-            if shown_files[f] then any = true break end
-        end
-        if not any then omitted[node] = nil end
-    end
-    local n_omit_lines = 0
-    for _ in pairs(omitted) do n_omit_lines = n_omit_lines + 1 end
 
     -- Render in tree order.
     local out = {}
@@ -1281,7 +1349,9 @@ local function workspace_tree(args)
             end
         end
         if omitted[node] then
-            out[#out + 1] = ("%s… +%d more files"):format(("  "):rep(node.depth), omitted[node])
+            local shown = shown_of[node] or 0
+            out[#out + 1] = ("  "):rep(node.depth)
+                .. cap.note(shown, shown + omitted[node], "files", nil)
         end
         for _, kid in ipairs(node.kids) do
             if shown_dirs[kid] then
@@ -1407,7 +1477,7 @@ local function workspace_map(args)
             sleep(0) -- yield so the editor stays responsive on big repos
         end
         local entry = { file = rel }
-        local outline, nlines, skip = top_level_outline(target .. "/" .. rel,
+        local outline, nlines, skip, decl_total = top_level_outline(target .. "/" .. rel,
             MAP_FILE_MAX, missing)
         if skip then
             entry.skipped = skip
@@ -1417,6 +1487,7 @@ local function workspace_map(args)
         end
         if outline and #outline > 0 then
             entry.outline = outline
+            entry.decl_total = decl_total
         end
         out[#out + 1] = entry
     end
@@ -1433,18 +1504,23 @@ local function workspace_map(args)
         local share = math.floor((MAX_MAP_ENTRIES - entries) / (#order - k + 1))
         local keep = math.max(MAP_FILE_MIN, share)
         if #outline > keep then
-            local last = outline[#outline]
-            local extra = #outline - keep
-            local more = last:match("^… %+(%d+) more") -- fold a cap line from the parse
-            if more then extra = extra + tonumber(more) - 1 end
+            -- The parse's own cap line is one of `outline`'s entries and is
+            -- not a declaration; the file's true declaration count came back
+            -- from the parse and is what this second cut counts against, so
+            -- cutting twice cannot make the number describe the first cut.
+            local shown = keep
+            local total = out[i].decl_total
+                or (#outline - (outline[#outline]:match("^… %+%d+ more") and 1 or 0))
             local cut = { unpack(outline, 1, keep) }
-            cut[#cut + 1] = ("… +%d more declarations (skim the file for all of them)"):format(extra)
+            cut[#cut + 1] = cap.note(shown, total, "declarations",
+                "skim the file for all of them")
             out[i].outline = cut
             cut_files = cut_files + 1
             entries = entries + keep + 1
         else
             entries = entries + #outline
         end
+        out[i].decl_total = nil
     end
     local notes = {}
     if glob_note then
@@ -2124,7 +2200,7 @@ local MAX_BODY_LINES = 200
 -- loading its buffer and parsing it, which is far too much work to do for
 -- every file in a project when a symbol can only be declared in a file that
 -- spells its name somewhere.
-local function files_mentioning(root, text, cap)
+local function files_mentioning(root, text, limit)
     if vim.fn.executable("rg") == 0 or type(root) ~= "string" or root == ""
         or type(text) ~= "string" or text == "" then
         return {}, false
@@ -2141,8 +2217,8 @@ local function files_mentioning(root, text, cap)
     if vim.v.shell_error > 1 then
         return {}, false
     end
-    if cap and #files > cap then
-        files = vim.list_slice(files, 1, cap)
+    if limit and #files > limit then
+        files = vim.list_slice(files, 1, limit)
     end
     return files, true
 end

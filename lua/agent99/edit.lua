@@ -18,6 +18,7 @@ local position_params, fresh_buf, enabled_lsp_configs_for =
 local resolve_symbol, doc_block_start, decl_block_top =
     index.resolve_symbol, index.doc_block_start, index.decl_block_top
 local closure = require("agent99.closure")
+local cap = require("agent99.cap")
 
 -- Neovim 0.12 moved the diff to vim.text.diff and deprecated vim.diff; one
 -- name for it here keeps the rest of the file indifferent to the version.
@@ -694,6 +695,10 @@ end
 -- Pre-existing diagnostics in the edited file are listed rather than counted,
 -- up to this many; past it the rest become a tally.
 local PREEXISTING_LISTED = 10
+-- full_diagnostics=true exists to defeat that cap, so its list is far
+-- longer; it is still a list with an end, and the reply says so rather than
+-- claiming "all listed" above a "+92 more".
+local FULL_PREEXISTING_LISTED = 60
 -- Hints in the edited files are named rather than dropped, but a server that
 -- hints on every unused local would fill a reply on its own.
 local HINTS_LISTED = 5
@@ -1409,6 +1414,12 @@ end
 
 local WATCH_MS = 60 * 1000
 
+-- Late diagnostics ride along on whatever reply comes next, and that reply is
+-- about something else. They get a budget for the same reason every other
+-- list does.
+local LATE_DIAGNOSTICS_FILES = 6
+local LATE_DIAGNOSTICS_PER_FILE = 8
+
 local function edit_label(kind, bufnr)
     -- Undoing a create_file wipes the buffer, and the entries undone after
     -- it in the same step still name it: labelling threw "Invalid buffer id"
@@ -1576,10 +1587,28 @@ local function take_carry()
     local out = carries[id] or {}
     carries[id] = {}
     if type(out.late_diagnostics) == "table" and #out.late_diagnostics > 0 then
+        -- One entry per file watched, and every file a call wrote or loaded
+        -- is watched, so a structural edit across a package can carry a dozen
+        -- of them with a diagnostic list each. Capped like every other list,
+        -- and the cap says what it left out.
+        local total = #out.late_diagnostics
+        for _, item in ipairs(out.late_diagnostics) do
+            if type(item.new) == "table" then
+                item.new = cap.list(item.new, LATE_DIAGNOSTICS_PER_FILE, "new diagnostics",
+                    "diagnostics(file=) lists them all")
+            end
+        end
+        out.late_diagnostics = vim.list_slice(out.late_diagnostics,
+            1, math.min(total, LATE_DIAGNOSTICS_FILES))
         out.late_diagnostics_note = "each of these is the difference between what the reply "
             .. "named in since_reply showed for that file and what the server published "
             .. "afterwards; which call the server was reacting to is not something the editor "
             .. "can tell, so the name is when, not why"
+        if total > LATE_DIAGNOSTICS_FILES then
+            out.late_diagnostics_note = out.late_diagnostics_note .. "; "
+                .. cap.note(LATE_DIAGNOSTICS_FILES, total, "files",
+                    "diagnostics(file=) reads the rest")
+        end
     end
     local pending = out.still_pending
     if type(pending) == "table" then
@@ -1923,16 +1952,10 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
             fixed = fixed + n
         end
     end
-    if #new_here > 15 then
-        local extra = #new_here - 15
-        new_here = vim.list_slice(new_here, 1, 15)
-        new_here[#new_here + 1] = ("… +%d more new diagnostics in this file"):format(extra)
-    end
-    if #new_elsewhere > 10 then
-        local extra = #new_elsewhere - 10
-        new_elsewhere = vim.list_slice(new_elsewhere, 1, 10)
-        new_elsewhere[#new_elsewhere + 1] = ("… +%d more"):format(extra)
-    end
+    new_here = cap.list(new_here, 15, "new diagnostics in this file",
+        "diagnostics(file=) lists them all")
+    new_elsewhere = cap.list(new_elsewhere, 10, "new diagnostics elsewhere",
+        "diagnostics(file=) lists a file's own")
     -- A glob replace_pattern or a move edits several files at once, and
     -- "this file" is then the wrong noun for what the reply is describing.
     local also_touched = 0
@@ -2115,10 +2138,7 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     end
     if #hints > 0 then
         local total = #hints
-        if total > HINTS_LISTED then
-            hints = vim.list_slice(hints, 1, HINTS_LISTED)
-            hints[#hints + 1] = ("… +%d more"):format(total - HINTS_LISTED)
-        end
+        hints = cap.list(hints, HINTS_LISTED, "hints", "diagnostics(file=) lists them all")
         report.hints = hints
         -- The old note called these "not errors or warnings", which reads as
         -- "discount them". Where they are the only channel the server has,
@@ -2202,8 +2222,16 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         -- edit being undone. The bridge cannot tell those apart from a widened
         -- scope, and asserting the innocent one tells the reader to stop
         -- looking exactly when looking would have paid.
+        -- full_diagnostics=true is the flag whose whole purpose is to defeat
+        -- the cap, so it gets a far larger list - but it still has one, and
+        -- "all listed" beside a "… +92 more" in the same object was the
+        -- loudest wrong count in the reply. Say which of the two it is.
+        local list_cap = full and FULL_PREEXISTING_LISTED or PREEXISTING_LISTED
         local how_new
-        if full then
+        if full and #listed > list_cap then
+            how_new = ("the first %d are listed, %d more are not")
+                :format(list_cap, #listed - list_cap)
+        elseif full then
             how_new = "all listed"
         elseif entered_here == 0 then
             how_new = ("%d entered this list since the last reply, none of them in %s")
@@ -2228,11 +2256,9 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         if full or entered > 0 then
             report.preexisting = ("%s were there before the edit (%s); %s"):format(
                 table.concat(prior, " and "), where, how_new)
-            if #listed > PREEXISTING_LISTED then
-                local extra = #listed - PREEXISTING_LISTED
-                listed = vim.list_slice(listed, 1, PREEXISTING_LISTED)
-                listed[#listed + 1] = ("… +%d more"):format(extra)
-            end
+            listed = cap.list(listed, list_cap, "diagnostics",
+                full and "narrow with diagnostics(file=) for one file"
+                    or "full_diagnostics=true lists more of them")
             report[full and "preexisting_list" or "preexisting_new_to_list"] = listed
         else
             report.preexisting = ("%s were there before the edit (%s), none new to this list"):format(

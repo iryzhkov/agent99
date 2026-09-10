@@ -30,6 +30,14 @@ local LOCALS_MAX = 12
 local VARIABLES_MAX = 40
 local STACK_MAX = 6
 local STACK_DEPTH_DEFAULT = 12
+-- How far a stack is walked purely to learn its real depth. DAP's
+-- `totalFrames` is whatever the adapter chooses to put there - delve fills it
+-- with its own default cap, a constant 50 - so the depth has to be measured
+-- rather than believed.
+local STACK_TOTAL_PROBE = 2000
+-- How many extra `variables` requests the counting walk may spend after the
+-- rendering has stopped. Past it the count is reported as a floor.
+local VARIABLES_COUNT_REQUESTS = 400
 local VALUE_CLIP = 120
 local SOURCE_CONTEXT = 2
 
@@ -43,6 +51,8 @@ end
 local function I()
     return require("agent99.lsp")._internal
 end
+
+local cap = require("agent99.cap")
 
 local function has_dap()
     local ok, dap = pcall(require, "dap")
@@ -2415,8 +2425,29 @@ local function debug_stack(args)
     local st = request(s, "stackTrace", { threadId = thread, startFrame = 0, levels = depth })
     local frames = st.stackFrames or {}
     local out = { thread = thread, frames = format_stack(frames, root, depth, args.all_frames == true) }
-    if st.totalFrames and st.totalFrames > #frames then
-        out.truncated = st.totalFrames - #frames
+    -- `truncated` used to be `totalFrames - #frames`, and delve answers
+    -- `totalFrames` with its own default stack cap: the same stopped thread,
+    -- ten frames deep, reported "truncated": 50 at depth=3, depth=6 and
+    -- depth=8 alike - a constant that reads as a count. The depth is measured
+    -- instead, and only when the reply came back full, which is the only case
+    -- where anything can be missing.
+    local total, floor = #frames, false
+    if #frames >= depth then
+        local e, all = try_request(s, "stackTrace",
+            { threadId = thread, startFrame = 0, levels = STACK_TOTAL_PROBE })
+        if not e and all and all.stackFrames and #all.stackFrames > #frames then
+            total = #all.stackFrames
+            floor = total >= STACK_TOTAL_PROBE
+        end
+    end
+    local cut = cap.fields(#frames, total, {
+        unit = "frames", floor = floor,
+        reach = "debug_stack(depth=N) reaches them",
+    })
+    if cut then
+        out.shown, out.total, out.dropped = cut.shown, cut.total, cut.dropped
+        out.truncated = cut.note
+        if cut.total_is_floor then out.total_is_floor = true end
     end
     return out
 end
@@ -2433,9 +2464,26 @@ local function debug_variables(args)
     local out = { frame = (tonumber(args.frame) or 0), variables = {} }
     local lines = out.variables
     local total = 0
+    -- The walk used to stop descending once it had rendered `max` entries, so
+    -- what it counted was the nodes it had materialised before it stopped:
+    -- `max=3` on a frame with 46 entries answered "truncated": 9, because it
+    -- had never opened the 30-entry map or the four children behind it. A
+    -- caller who raised max to 12 believed they now had everything. Counting
+    -- carries on past the rendering; it costs one `variables` request per
+    -- container, and it has its own budget so a huge object graph cannot turn
+    -- one reply into a thousand round trips.
+    local budget = VARIABLES_COUNT_REQUESTS
+    local exhausted = false
 
     local function walk(ref, prefix, level)
         if ref == 0 or level > depth then return end
+        if #lines >= max then
+            if budget <= 0 then
+                exhausted = true
+                return
+            end
+            budget = budget - 1
+        end
         local e, vars = try_request(s, "variables", { variablesReference = ref })
         if e or not vars then return end
         for _, v in ipairs(vars.variables or {}) do
@@ -2445,12 +2493,12 @@ local function debug_variables(args)
                 walk(v.variablesReference, prefix, level)
             elseif not is_noise(v) then
                 total = total + 1
+                local name = prefix .. tostring(v.name)
                 if #lines < max then
-                    local name = prefix .. tostring(v.name)
                     lines[#lines + 1] = render_var(vim.tbl_extend("force", v, { name = name }))
-                    if (v.variablesReference or 0) > 0 and level < depth then
-                        walk(v.variablesReference, name .. ".", level + 1)
-                    end
+                end
+                if (v.variablesReference or 0) > 0 and level < depth then
+                    walk(v.variablesReference, name .. ".", level + 1)
                 end
             end
         end
@@ -2458,6 +2506,7 @@ local function debug_variables(args)
     if args.expand then
         local r = request(s, "evaluate", { expression = args.expand, frameId = frame.id, context = "watch" })
         out.expand = args.expand
+        total = total + 1
         lines[#lines + 1] = render_var({
             name = args.expand,
             type = r.type,
@@ -2479,8 +2528,14 @@ local function debug_variables(args)
             end
         end
     end
-    if total > #lines then
-        out.truncated = total - #lines
+    local cut = cap.fields(#lines, total, {
+        unit = "entries", floor = exhausted,
+        reach = "raise max, or expand one path with expand=\"name.field\"",
+    })
+    if cut then
+        out.shown, out.total, out.dropped = cut.shown, cut.total, cut.dropped
+        out.truncated = cut.note
+        if cut.total_is_floor then out.total_is_floor = true end
         out.note = "raise max, or expand one path with expand=\"name.field\""
     end
     return out

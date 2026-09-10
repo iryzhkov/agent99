@@ -7,6 +7,7 @@
 local M = {}
 
 local core = require("agent99.core")
+local cap = require("agent99.cap")
 local err, await, sleep, load_buf, rel_path = core.err, core.await, core.sleep, core.load_buf, core.rel_path
 local project_files, better_sample, has_parser = core.project_files, core.better_sample, core.has_parser
 local enabled_lsp_configs_for, DATA_FILETYPES = core.enabled_lsp_configs_for, core.DATA_FILETYPES
@@ -558,10 +559,8 @@ local function check_project(args)
     out.about_this_command = guess_note
     out.coverage = guess_covers
     if #server_errors > 0 then
-        local shown = vim.list_slice(server_errors, 1, 5)
-        if #server_errors > 5 then
-            shown[#shown + 1] = ("… +%d more"):format(#server_errors - 5)
-        end
+        local shown = cap.list(server_errors, 5, "diagnostics",
+            "diagnostics(file=) lists a file's own")
         out.server_disagrees = {
             note = ("the check passed, but the language server still reports %d error%s "
                 .. "in this root. The check is the ground truth for what it covers; the "

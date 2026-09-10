@@ -82,7 +82,7 @@ var lspTools = []tool{
 	positionTool("implementation",
 		"Implementations of the interface/abstract symbol at a position."),
 	positionTool("references",
-		"Every reference to the symbol at a position, project-wide, grouped by file, each tagged with its enclosing symbol. Check before changing a signature."),
+		"Every reference to the symbol at a position, project-wide, grouped by file, each tagged with its enclosing symbol. Check before changing a signature. Past the location cap the reply carries shown/total/dropped and names in files_omitted the files no location above comes from."),
 	positionTool("hover",
 		"Signature and docs of the symbol at a position, as the editor shows them."),
 	positionTool("expand_symbol",
@@ -734,7 +734,7 @@ var debugTools = []tool{
 	},
 	{
 		Name:        "debug_stack",
-		Description: "Stack of the stopped thread, one line per frame; frames outside the workspace collapse into <external ×N> unless all_frames.",
+		Description: "Stack of the stopped thread, one line per frame; frames outside the workspace collapse into <external ×N> unless all_frames. A stack deeper than depth= comes back with shown/total/dropped measured against the real depth, not against the adapter's totalFrames.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -746,7 +746,7 @@ var debugTools = []tool{
 	},
 	{
 		Name:        "debug_variables",
-		Description: "Locals and arguments of a frame as `name: type = value` lines (clipped), one level deep; expand drills into one path by expression.",
+		Description: "Locals and arguments of a frame as `name: type = value` lines (clipped), one level deep; expand drills into one path by expression. Past max= the reply carries shown/total/dropped counted over the whole frame within depth=, so raising max by dropped reaches everything.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

@@ -20,6 +20,7 @@
 local M = {}
 
 local core = require("agent99.core")
+local cap = require("agent99.cap")
 local err, sleep = core.err, core.sleep
 local load_buf, rel_path, fresh_buf = core.load_buf, core.rel_path, core.fresh_buf
 local get_client, request, resync_open_buffers = core.get_client, core.request, core.resync_open_buffers
@@ -58,6 +59,21 @@ local function format_locations(result)
         result = { result }
     end
     local out, total = {}, #result
+    -- Every file the result names, in the order they first appear, counted
+    -- before the cut. The cap is on locations, and the unit that matters for
+    -- the task this tool is advertised for - "check before changing a
+    -- signature" - is the file: a reply saying "truncated to first 100 of
+    -- 201 locations" left five whole files out and named none of them, and
+    -- read as "I have seen the files, just not every line".
+    local file_order, seen_file = {}, {}
+    for _, loc in ipairs(result) do
+        local path = vim.uri_to_fname(loc.uri or loc.targetUri)
+        if not seen_file[path] then
+            seen_file[path] = true
+            file_order[#file_order + 1] = path
+        end
+    end
+    local shown_file = {}
     for i, loc in ipairs(result) do
         if i > MAX_LOCATIONS then break end
         local uri = loc.uri or loc.targetUri
@@ -68,11 +84,25 @@ local function format_locations(result)
         if range["end"].line ~= range.start.line then
             item.end_line = range["end"].line + 1
         end
+        shown_file[path] = true
         out[#out + 1] = item
     end
     local res = { count = total, locations = out }
     if total > MAX_LOCATIONS then
-        res.note = ("truncated to first %d of %d locations"):format(MAX_LOCATIONS, total)
+        local missing = {}
+        for _, path in ipairs(file_order) do
+            if not shown_file[path] then missing[#missing + 1] = path end
+        end
+        local cut = cap.fields(#out, total, {
+            unit = "locations",
+            reach = "narrow with a more specific position, or read the files named below",
+        })
+        res.shown, res.total, res.dropped, res.note = cut.shown, cut.total, cut.dropped, cut.note
+        if #missing > 0 then
+            res.files = cap.fields(#file_order - #missing, #file_order, { unit = "files" })
+            res.files_omitted = cap.list(missing, 20, "files",
+                "none of their locations are above")
+        end
     end
     return res
 end
@@ -1359,5 +1389,9 @@ M._internal = {
     symbol_index = index.symbol_index,
     innermost_entry = index.innermost_entry,
     decl_line = core.decl_line,
+    -- Unit-checked: the location cap has to name the files it dropped, and
+    -- driving 201 real references through a language server to see that is
+    -- not a check anyone would run.
+    format_locations = format_locations,
 }
 return M

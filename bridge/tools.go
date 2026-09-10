@@ -967,8 +967,13 @@ func runListFiles(ses session, args map[string]any) (string, error) {
 	sort.Strings(files)
 	var notes []string
 	if len(files) > maxListFiles {
-		notes = append(notes, fmt.Sprintf("... (truncated at %d files; narrow it with path= or glob=, "+
-			"or use workspace_map for files with their declarations)", maxListFiles))
+		// Saying only that it stopped left a caller unable to tell whether
+		// one file was missed or three quarters of them: a 1,261-file glob
+		// answered with 500 and this note. Every capped reply names its
+		// remainder, and this one now does too.
+		notes = append(notes, fmt.Sprintf("... (%d of %d files listed; %d more are not shown - "+
+			"narrow it with path= or glob=, or use workspace_map for files with their declarations)",
+			maxListFiles, len(files), len(files)-maxListFiles))
 		files = files[:maxListFiles]
 	}
 	if skipped > 0 {
