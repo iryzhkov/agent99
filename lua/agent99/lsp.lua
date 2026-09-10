@@ -603,12 +603,13 @@ local function textual_hits(root, names)
     local cmd
     if vim.fn.executable("rg") == 1 then
         -- -o prints the matched word itself, which is what attributes each
-        -- hit to its name when many are searched at once. rg skips .git and
-        -- ignored files on its own.
-        cmd = { "rg", "--no-heading", "--line-number", "--only-matching",
-            "--word-regexp", "--fixed-strings" }
+        -- hit to its name when many are searched at once. core.rg_walk adds
+        -- the shared walk: hidden directories are searched, ignored files
+        -- and .git are not.
+        cmd = core.rg_walk({ "rg", "--no-heading", "--line-number",
+            "--only-matching", "--word-regexp", "--fixed-strings" })
     elseif vim.fn.executable("grep") == 1 then
-        cmd = { "grep", "-rnwIoF", "--exclude-dir=.git" }
+        cmd = core.grep_walk({ "grep", "-rnwIoF" })
     else
         return nil
     end

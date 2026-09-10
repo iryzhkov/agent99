@@ -209,6 +209,23 @@ func runReadFile(ses session, args map[string]any) (string, error) {
 	return strings.Join(out, "\n"), nil
 }
 
+// The walk every search shares, in the two searchers' spellings.
+//
+// A leading dot means "not interesting to a person browsing", and it used to
+// mean "not part of the project" to ripgrep here. It is not: a monorepo that
+// vendors its dependencies under `.repos/` keeps most of its source there,
+// and `git ls-files` - which is what the workspace census, workspace_tree,
+// workspace_map and list_files walk - has always listed those files. On one
+// real tree the searchers answered over 11,110 of 13,374 TypeScript files
+// fewer than the census the same workspace had just printed.
+//
+// Only .gitignore decides what is left out now. `.git` is not in .gitignore
+// and is not source, so it is named here: without this, --hidden hands back
+// the object store.
+var rgWalkArgs = []string{"--hidden", "--glob", "!.git/"}
+
+var grepWalkArgs = []string{"--exclude-dir=.git"}
+
 func runGrep(ses session, args map[string]any) (string, error) {
 	root := ses.Root
 	pattern, _ := args["pattern"].(string)
@@ -288,6 +305,7 @@ func runGrep(ses session, args map[string]any) (string, error) {
 		// -H keeps the filename even for a single-file target, which the
 		// annotator's path:line:col parsing depends on.
 		cargs := []string{"-H", "-n", "--column", "--no-heading", "-S", "--sort", "path", ctxArg}
+		cargs = append(cargs, rgWalkArgs...)
 		if asText {
 			// A source file that happens to hold a NUL byte is still source.
 			cargs = append(cargs, "--text")
@@ -306,6 +324,7 @@ func runGrep(ses session, args map[string]any) (string, error) {
 		cmd = exec.CommandContext(ctxCancel, "rg", cargs...)
 	} else {
 		cargs := []string{"-rnHE", ctxArg}
+		cargs = append(cargs, grepWalkArgs...)
 		if asText {
 			cargs = append(cargs, "-a")
 		} else {
@@ -491,7 +510,8 @@ func runGrep(ses session, args map[string]any) (string, error) {
 
 // Whether a glob matches any file at all in the search scope.
 func globMatchesAnything(glob, dir string, targets []string) bool {
-	args := append([]string{"--files", "-g", glob}, targets...)
+	args := append([]string{"--files", "-g", glob}, rgWalkArgs...)
+	args = append(args, targets...)
 	cmd := exec.Command("rg", args...)
 	cmd.Dir = dir
 	out, err := cmd.Output()
@@ -515,6 +535,7 @@ func rel(root, path string) string {
 // about a file full of them.
 func textOnlyMatches(pattern, glob, dir string, targets []string) []string {
 	args := []string{"--text", "--files-with-matches", "-m", "1", "-S"}
+	args = append(args, rgWalkArgs...)
 	if glob != "" {
 		args = append(args, "-g", glob)
 	}
@@ -913,7 +934,11 @@ func runListFiles(ses session, args map[string]any) (string, error) {
 				return nil
 			}
 			if d.IsDir() {
-				if strings.HasPrefix(d.Name(), ".") && path != target {
+				// Only .git, for the reason rgWalkArgs gives: a leading dot
+				// is not a statement about whether a directory holds source,
+				// and skipping all of them made this walk disagree with the
+				// git one above it and with every search.
+				if d.Name() == ".git" && path != target {
 					return filepath.SkipDir
 				}
 				return nil

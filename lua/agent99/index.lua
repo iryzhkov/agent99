@@ -656,16 +656,7 @@ end
 -- the filesystem otherwise. git lists tracked files before untracked ones;
 -- a sorted list is easier to scan and stable across runs.
 local function list_project_files(target)
-    local files = vim.fn.systemlist({ "git", "-C", target,
-        "ls-files", "--cached", "--others", "--exclude-standard" })
-    if vim.v.shell_error ~= 0 then
-        files = {}
-        for _, f in ipairs(vim.fn.globpath(target, "**/*", true, true)) do
-            if vim.fn.isdirectory(f) == 0 then
-                files[#files + 1] = f:sub(#target + 2)
-            end
-        end
-    end
+    local files = core.project_files(target)
     table.sort(files)
     return files
 end
@@ -1937,10 +1928,14 @@ local function files_mentioning(root, text, cap)
         or type(text) ~= "string" or text == "" then
         return {}, false
     end
-    local files = vim.fn.systemlist({
+    local cmd = core.rg_walk({
         "rg", "--files-with-matches", "--fixed-strings", "--max-count", "1",
-        "--sort", "path", "--", text, root,
+        "--sort", "path",
     })
+    cmd[#cmd + 1] = "--"
+    cmd[#cmd + 1] = text
+    cmd[#cmd + 1] = root
+    local files = vim.fn.systemlist(cmd)
     -- 1 is "no matches", which is an answer; anything above it is a failure.
     if vim.v.shell_error > 1 then
         return {}, false

@@ -80,8 +80,14 @@ vim.fn.delete(copy_root, "rf")
 -- A few vendored files of another language are not that language's project.
 -- A TypeScript monorepo carrying seven Python fixtures was answered with
 -- `pyright`, which passed in 0.2s and called 13k unchecked .ts files green.
+-- The TypeScript side has to be big enough for seven files to be the
+-- handful this is about: the guess is a share of the tree, and 7 of 209
+-- is 3.3%, over the threshold. This tree used to pass for the wrong
+-- reason - project_files walked with globpath, which skips a leading dot,
+-- so the seven files under .repos/ were not counted at all and any share
+-- would have done.
 local mono = { ["tsconfig.base.json"] = "{}", ["package.json"] = "{}" }
-for i = 1, 200 do
+for i = 1, 700 do
     mono[("apps/web/src/mod%d.ts"):format(i)] = "export const x = 1"
 end
 for i = 1, 7 do

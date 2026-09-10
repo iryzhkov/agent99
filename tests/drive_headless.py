@@ -56,6 +56,28 @@ def seed(root):
     with open(os.path.join(root, "blob.bin"), "wb") as f:
         f.write(b"\x00\x01" * 64)
 
+# A source file under a leading-dot directory: the shape of a monorepo that
+# vendors its dependencies under `.repos/`, where the searchers used to skip
+# 11,110 of 13,374 files the census had just counted. Written by the checks
+# that need it rather than kept in tests/testproj, so every other check still
+# sees the project's usual shape.
+VENDORED_REL = os.path.join("scripts", ".vendored", "vendorlib.lua")
+
+
+def seed_dot_directory(root):
+    path = os.path.join(root, VENDORED_REL)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("local V = {}\n"
+                "\n"
+                "function V.vendored_only_symbol(x)\n"
+                "    return x\n"
+                "end\n"
+                "\n"
+                "return V\n")
+    return path
+
+
 
 def reset(c):
     """Put the scratch project back the way a group expects to find it: every
@@ -739,6 +761,38 @@ def group_index(c):
           and res.get("summary", "").startswith("nothing was checked")
           and "referenced somewhere else" not in res.get("summary", ""), res)
     os.remove(only_fields)
+
+    reset(c)
+    seed_dot_directory(root)
+    # find_symbol used to skip every leading-dot directory while the census
+    # counted the files in it, and then said so as a fact: "no file under
+    # <root> mentions X". The sentence is the finding here - an error is a
+    # plausible-looking reply, so a check that only catches the exception
+    # passes against the bug.
+    err_text = ""
+    try:
+        res = b.call("find_symbol", {"name": "vendored_only_symbol"})
+    except RuntimeError as e:
+        res, err_text = {}, str(e)
+    check("find_symbol reaches a symbol declared under a leading-dot directory",
+          res.get("count", 0) >= 1
+          and any("scripts/.vendored/vendorlib.lua" in m.get("file", "")
+                  for m in res.get("matches", [])), res or err_text)
+    check("and does not claim no file mentions it",
+          "mentions" not in err_text, err_text)
+    # The same through a glob: expand_glob walked with globpath, whose "*"
+    # skips a leading dot, so a glob could not reach the directory either.
+    res = b.call("find_symbol", {"name": "vendored_only_symbol", "glob": "**/*.lua"})
+    check("a glob reaches it too",
+          res.get("count", 0) >= 1, res)
+    # unreferenced_symbols' file universe is the same glob expansion, so its
+    # cap note read as precise while being measured against a fraction of
+    # the tree. A symbol nothing calls, in a directory nothing walked, is
+    # exactly the case that ends in a deletion.
+    res = b.call("unreferenced_symbols", {"glob": "**/*.lua"})
+    names = [s["name"] for s in res.get("unreferenced", [])]
+    check("unreferenced_symbols examines files under a leading-dot directory",
+          any("vendored_only_symbol" in n for n in names), res)
 
 
 def group_edit(c):
@@ -2125,6 +2179,32 @@ def group_search(c):
         "pattern": "M.greet", "path": "lua/testproj/util.lua", "context": 0}})
     text = reply["result"]["content"][0]["text"]
     check("single-file grep annotated", "util.lua:" in text and "[M.greet" in text, text)
+
+    # A leading dot on a directory used to mean "not part of the project" to
+    # the searchers and "part of the project" to the census, so grep answered
+    # "(no matches)" about a file list_files had just printed. The counts are
+    # what this asserts on: "(no matches)" is a clean, plausible reply, and a
+    # check on the exit code passes against the bug.
+    reset(c)
+    seed_dot_directory(root)
+    hidden = grep_text(pattern="vendored_only_symbol")
+    check("grep searches a leading-dot directory",
+          "scripts/.vendored/vendorlib.lua" in hidden and "(no matches)" not in hidden, hidden)
+    reply = b.rpc("tools/call", {"name": "list_files", "arguments": {"glob": "**/*.lua"}})
+    listed = reply["result"]["content"][0]["text"]
+    check("list_files still lists the same file, so the two agree",
+          "scripts/.vendored/vendorlib.lua" in listed, listed)
+    # .gitignore does not list .git, so --hidden alone would hand back the
+    # object store: every search names it as the one exclusion of its own.
+    os.makedirs(os.path.join(root, ".git"), exist_ok=True)
+    with open(os.path.join(root, ".git", "COMMIT_EDITMSG"), "w") as f:
+        f.write("vendored_only_symbol\n")
+    with_git = grep_text(pattern="vendored_only_symbol")
+    check("grep does not walk .git",
+          ".git/" not in with_git and "scripts/.vendored/vendorlib.lua" in with_git, with_git)
+    reply = b.rpc("tools/call", {"name": "list_files", "arguments": {}})
+    listed = reply["result"]["content"][0]["text"]
+    check("list_files does not walk .git either", "COMMIT_EDITMSG" not in listed, listed)
 
 
 def group_files(c):

@@ -66,14 +66,64 @@ local function is_test_path(path)
         or path:find("/__tests__/") or path:find("/testdata/")
 end
 
+-- The walk every search shares.
+--
+-- A leading dot means "not interesting to a person browsing", and it used to
+-- mean "not part of the project" to every searcher agent99 runs. It is not:
+-- a monorepo that vendors its dependencies under `.repos/` keeps most of its
+-- source there, and `git ls-files` - which is what the census, workspace_tree,
+-- workspace_map and list_files walk - has always listed those files. The
+-- searchers disagreed with the census by 11,110 files out of 13,374 on one
+-- real tree, and said so as fact: "no file under <root> mentions X".
+--
+-- So every searcher walks hidden files too, and only .gitignore decides what
+-- is left out. `.git` is not in .gitignore and is not source, so it is named
+-- here instead: without this, --hidden hands back the object store.
+local RG_WALK = { "--hidden", "--glob", "!.git/" }
+local GREP_WALK = { "--exclude-dir=.git" }
+
+-- Append the shared walk to a command being built for `rg` or for POSIX grep.
+local function with_walk(cmd, walk)
+    for _, a in ipairs(walk) do
+        cmd[#cmd + 1] = a
+    end
+    return cmd
+end
+
+function M.rg_walk(cmd) return with_walk(cmd, RG_WALK) end
+
+function M.grep_walk(cmd) return with_walk(cmd, GREP_WALK) end
+
 local function project_files(root)
     local files = vim.fn.systemlist({ "git", "-C", root,
         "ls-files", "--cached", "--others", "--exclude-standard" })
     if vim.v.shell_error ~= 0 then
+        -- Not a repository, so there is no ignore file to honour and no
+        -- git to walk with. globpath cannot do this job: its "*" skips a
+        -- leading dot, so the fallback used to be blind to exactly the
+        -- directories --hidden was added for. Walk it by hand instead,
+        -- with the same one exclusion the searchers make.
         files = {}
-        for _, f in ipairs(vim.fn.globpath(root, "**/*", true, true)) do
-            if vim.fn.isdirectory(f) == 0 then
-                files[#files + 1] = f:sub(#root + 2)
+        local stack = { "" }
+        while #stack > 0 do
+            local rel = table.remove(stack)
+            local dir = rel == "" and root or (root .. "/" .. rel)
+            local handle = vim.uv.fs_scandir(dir)
+            while handle do
+                local name, kind = vim.uv.fs_scandir_next(handle)
+                if not name then break end
+                local child = rel == "" and name or (rel .. "/" .. name)
+                if kind == "directory" then
+                    if name ~= ".git" then
+                        stack[#stack + 1] = child
+                    end
+                elseif kind == "file" then
+                    files[#files + 1] = child
+                elseif vim.fn.isdirectory(dir .. "/" .. name) == 0 then
+                    -- A symlink to a file counts; one to a directory is not
+                    -- followed, so a link back up the tree cannot loop.
+                    files[#files + 1] = child
+                end
             end
         end
     end
@@ -774,9 +824,28 @@ local function expand_glob(root, glob)
     if type(root) ~= "string" or root == "" then
         err("glob needs the project root; pass explicit files instead")
     end
-    local paths = vim.fn.globpath(root, glob, true, true)
+    -- Matched against the project's own file list rather than with globpath,
+    -- for the same reason the searchers pass --hidden: globpath's "*" does
+    -- not match a leading dot, so a glob could not reach a vendored tree
+    -- under `.repos/` at all, and globpath knows no ignore rules, so it
+    -- handed back node_modules. project_files is what the census walks.
+    local files = project_files(root)
+    local matches = function(pattern)
+        local re = vim.regex(vim.fn.glob2regpat(pattern))
+        -- "**" spans zero directories too, which glob2regpat's ".*" needs a
+        -- hand with: "bridge/**/*.go" has to match "bridge/x.go".
+        local zero = vim.regex(vim.fn.glob2regpat((pattern:gsub("/%*%*/", "/"))))
+        local out = {}
+        for _, rel in ipairs(files) do
+            if re:match_str(rel) ~= nil or zero:match_str(rel) ~= nil then
+                out[#out + 1] = root .. "/" .. rel
+            end
+        end
+        return out
+    end
+    local paths = matches(glob)
     if #paths == 0 and not glob:find("/") then
-        paths = vim.fn.globpath(root, "**/" .. glob, true, true)
+        paths = matches("**/" .. glob)
     end
     if #paths == 0 then
         return paths, ("glob %q matched no files under %s; a glob is matched "
@@ -890,6 +959,7 @@ M.position_params = position_params
 M.line_preview = line_preview
 M.decl_line = decl_line
 M.expand_glob = expand_glob
+M.project_files = project_files
 M.has_parser = has_parser
 M.client_for = client_for
 M.dialect_note = dialect_note
