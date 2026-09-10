@@ -28,7 +28,34 @@ const (
 	maxGrepScan  = 20000
 	maxListFiles = 500
 	maxReadLines = 2000
+	// The longest a single line of a reply may be before its tail is
+	// replaced by a count of what was left off.
+	//
+	// workspace_map has clipped at 80 characters for as long as it has
+	// existed; grep and read_file did not clip at all, so one 11-character
+	// match on a minified line came back as a 30 KB hit and a 50,000-character
+	// line spent a whole reply on one file. A source line longer than this is
+	// generated, and what is past the cut is not what was asked for.
+	maxLineChars = 400
+	// And the most a read may spend in total. maxReadLines alone counts
+	// lines, which says nothing about a file whose lines are 40 KB each: a
+	// default read of a minified bundle returned 85 KB.
+	maxReadBytes = 48000
 )
+
+// clipLine cuts a line to n bytes and says how much it dropped, never
+// through a UTF-8 sequence: half a rune is invalid JSON, and losing the
+// whole reply to save the tail of one line is not a trade worth making.
+func clipLine(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := n
+	for cut > 0 && s[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return fmt.Sprintf("%s… (+%d characters on this line)", s[:cut], len(s)-cut)
+}
 
 var lspToolNames = func() map[string]bool {
 	set := map[string]bool{}
@@ -137,6 +164,13 @@ func skimHasOutline(res any) bool {
 func runReadFile(ses session, args map[string]any) (string, error) {
 	path := resolveInRoot(ses.Root, args["path"])
 	explicit := args["offset"] != nil || args["limit"] != nil
+	// Why a long file is being read as text after all. The outline rule is
+	// documented in terms of the file's length, but it can only fire when
+	// something could outline the file: a 4,001-line YAML holding one
+	// top-level key fell through it and dumped 2,000 lines of raw text
+	// without a word about the rule - which is exactly the shape (a long
+	// sequence, a playbook, generated data) the rule exists for.
+	ruleNote := ""
 	if !explicit && os.Getenv("AGENT99_NO_LSP") == "" {
 		if n := countLines(path); n > autoSkimThreshold {
 			// A skim only replaces the content when it has an outline. A
@@ -153,6 +187,12 @@ func runReadFile(ses session, args map[string]any) (string, error) {
 						path, n, pretty), nil
 				}
 			}
+			ruleNote = fmt.Sprintf(
+				"note: this file has %d lines, over the %d at which a plain read answers "+
+					"with the outline instead - but nothing could outline it (too few "+
+					"declarations, or no parser), so what follows is its text from the "+
+					"start. grep, or offset/limit, reach a specific part of it.",
+				n, autoSkimThreshold)
 		}
 	}
 	offset := argInt(args, "offset", 1)
@@ -171,7 +211,8 @@ func runReadFile(ses session, args map[string]any) (string, error) {
 	var out []string
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	total, next := 0, 0
+	total, next, spent, clipped := 0, 0, 0, 0
+	overBudget := false
 	for i := 1; scanner.Scan(); i++ {
 		total = i
 		if i < offset {
@@ -181,7 +222,20 @@ func runReadFile(ses session, args map[string]any) (string, error) {
 			next = i
 			break
 		}
-		out = append(out, fmt.Sprintf("%d: %s", i, scanner.Text()))
+		// A line budget is not a reply budget. limit=2000 over a minified
+		// bundle returned 85 KB, and every line of it was one the caller
+		// could not read anyway; both caps are enforced, and whichever is
+		// reached first says so.
+		if spent >= maxReadBytes {
+			next, overBudget = i, true
+			break
+		}
+		text := clipLine(scanner.Text(), maxLineChars)
+		if len(text) != len(scanner.Bytes()) {
+			clipped++
+		}
+		spent += len(text) + 1
+		out = append(out, fmt.Sprintf("%d: %s", i, text))
 	}
 	if next > 0 {
 		// Read on to the end without keeping the lines, so the hint can say
@@ -191,9 +245,19 @@ func runReadFile(ses session, args map[string]any) (string, error) {
 		for scanner.Scan() {
 			total++
 		}
+		why := ""
+		if overBudget {
+			why = fmt.Sprintf("; the read stopped at its %d-character budget, "+
+				"not at limit=%d", maxReadBytes, limit)
+		}
 		out = append(out, fmt.Sprintf(
-			"... (truncated: lines %d-%d of %d; continue with offset=%d)",
-			offset, next-1, total, next))
+			"... (truncated: lines %d-%d of %d; continue with offset=%d%s)",
+			offset, next-1, total, next, why))
+	}
+	if clipped > 0 {
+		out = append(out, fmt.Sprintf(
+			"... (%d of the lines above were longer than %d characters and are shown "+
+				"clipped; each says how much of it was left off)", clipped, maxLineChars))
 	}
 	if err := scanner.Err(); err != nil {
 		return "", err
@@ -205,6 +269,9 @@ func runReadFile(ses session, args map[string]any) (string, error) {
 		if crumb := readContext(ses, path, offset); crumb != "" {
 			out = append([]string{crumb}, out...)
 		}
+	}
+	if ruleNote != "" {
+		out = append([]string{ruleNote}, out...)
 	}
 	return strings.Join(out, "\n"), nil
 }
@@ -399,7 +466,10 @@ func runGrep(ses session, args map[string]any) (string, error) {
 					testsFiltered++
 				}
 			case len(lines) < maxGrepLines:
-				lines = append(lines, l)
+				// Clipped here rather than at the end, so the annotator
+				// still sees "path:line:col:" intact at the front and the
+				// reply never carries the tail of a generated line.
+				lines = append(lines, clipLine(l, maxLineChars))
 			case isHit:
 				truncated++
 			}

@@ -3707,6 +3707,11 @@ local function insert_lines(args)
     return { files = #reports, reports = reports }
 end
 
+-- How many of an undo's reverted files the reply lists by name. One bulk
+-- edit's undo is one step to the caller and hundreds of file entries to the
+-- reply; past this many the count says it better than the list does.
+local MAX_UNDONE_SHOWN = 40
+
 local function undo_edit(args)
     local edits = require("agent99.edits")
     local count = (not args.all) and (tonumber(args.count) or 1) or nil
@@ -3770,24 +3775,41 @@ local function undo_edit(args)
     end
     -- Steps left, not files left: one rename across seven files is one. Left
     -- of this client's own edits: another client's stand whatever this says.
-    local result = { undone = out, remaining = edits.operations() }
+    --
+    -- The list is budgeted, because undoing one bulk edit answered with 2,431
+    -- lines over 59 KB - one entry per file the edit had touched - and the
+    -- `remaining` a caller actually reads was buried inside it. What each
+    -- entry says is the same sentence with a different file name in it; the
+    -- count is the part that carries information once there are hundreds.
+    local shown_undone = out
+    if #out > MAX_UNDONE_SHOWN then
+        shown_undone = vim.list_slice(out, 1, MAX_UNDONE_SHOWN)
+    end
+    local result = { undone = shown_undone, remaining = edits.operations() }
+    result.undone_entries = cap.fields(#shown_undone, #out, {
+        unit = "reverted files",
+        reach = "all of them were reverted; only the listing is cut",
+    })
     if others.clients > 0 then
         result.other_clients = ("%d other client(s) share this workspace and had %d undo step(s) "
             .. "on it, which this call did not touch: the ledger is per client, so undo_edit "
             .. "only ever reaches your own edits"):format(others.clients, others.steps)
     end
     if #dropped > 0 then
-        result.dropped = dropped
+        result.dropped = cap.list(dropped, MAX_UNDONE_SHOWN, "forgotten entries",
+            "each was left as it stands in the file")
         result.dropped_note = "skip=true: these entries could not be undone and were forgotten, "
             .. "so the ones under them could be reached. What they wrote is still in the file."
     end
     if #refused > 0 and #dropped == 0 then
-        result.refused = refused
+        result.refused = cap.list(refused, MAX_UNDONE_SHOWN, "refused entries",
+            "they were all left alone")
         result.refused_note = "the entries under this one were left alone, because undoing them "
             .. "over a region that has changed would clobber it. Fix that region by hand, or "
             .. "pass skip=true to forget this entry and undo the rest."
     elseif #refused > 0 then
-        result.refused = refused
+        result.refused = cap.list(refused, MAX_UNDONE_SHOWN, "refused entries",
+            "they were all left alone")
     end
     if last_bufnr then
         local opts = post_edit_options()

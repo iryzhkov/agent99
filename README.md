@@ -661,6 +661,22 @@ the rest is unknown, rather than offering a number. Where a bounded counting
 pass ran out of its own budget, the total is reported as a floor and the
 reply says the count stopped early.
 
+A single over-long line is cut the same way. `grep` hits, `read_file` lines and
+a `find_symbol` name path stop at a few hundred characters and end with
+`… (+N characters on this line)`, so an eleven-character match on a minified
+line costs eleven characters and not 30 KB. `read_file` also has a byte budget
+as well as a line budget, and says which of the two it stopped at; a name path
+long enough to be clipped is no longer one an edit tool can resolve, and the
+reply says so rather than letting it be pasted back.
+
+A batch tool survives one bad member. `skim`, `find_symbol`, `ts_query` and
+`workspace_map` run each file under its own guard: a file that cannot be read
+or indexed is named, with the reason beside it, and the other files' results
+are in the same reply. One 3000-deep generated JSON file used to answer a
+20-file `skim` with `Error: stack overflow` and nothing else — no partial
+results, and no clue which of the twenty had done it.
+
+
 ### Extras
 
 `AGENT99_LINT_<FILETYPE>` in the server's environment (`claude mcp add -e

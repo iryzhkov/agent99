@@ -86,4 +86,30 @@ function M.list(items, limit, unit, reach, total, where)
     return out
 end
 
+-- The same contract for one over-long string: a line, a name path, a hit.
+--
+-- A truncation inside a single string cannot carry three numbers, but it can
+-- carry the two that matter - how much is shown and how much was cut - and it
+-- must, because a clipped line that ends in nothing reads as a short line. A
+-- 50,000-character minified line and an 11-character match on it were the same
+-- reply until this existed: one grep hit, 30 KB.
+--
+-- Byte-counted, because that is what the reply budget is spent in, but never
+-- cut through a UTF-8 sequence: a half rune is invalid JSON and the whole
+-- reply is lost rather than the tail of one line.
+function M.clip(s, max, what)
+    if type(s) ~= "string" or #s <= max then
+        return s
+    end
+    local cut = max
+    -- Back off any continuation bytes (10xxxxxx) so the cut lands on a
+    -- character boundary.
+    while cut > 0 and s:byte(cut + 1) and s:byte(cut + 1) >= 0x80 and s:byte(cut + 1) < 0xC0 do
+        cut = cut - 1
+    end
+    return ("%s… (+%d %s)"):format(s:sub(1, cut), #s - cut,
+        what or "characters on this line")
+end
+
+
 return M

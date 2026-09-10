@@ -90,6 +90,23 @@ local MAX_SKIM_FILES = 20
 
 local MAX_SKIM_ENTRIES = 150
 
+-- How many levels of an outline are spelled out in leading spaces before the
+-- depth is written as a number instead.
+--
+-- The indentation is what an outline is read by, and past a dozen levels it
+-- stops being readable and becomes the reply: entry 150 of a 3000-deep
+-- generated JSON carried 298 leading spaces, and one degenerate file spent
+-- about 8000 tokens printing whitespace. Past the cut the depth is still
+-- there, as "[+N]", which says more than 298 spaces did.
+local MAX_SKIM_INDENT = 12
+
+local function outline_indent(depth)
+    if depth <= MAX_SKIM_INDENT then
+        return ("  "):rep(depth)
+    end
+    return ("  "):rep(MAX_SKIM_INDENT) .. ("[+%d] "):format(depth - MAX_SKIM_INDENT)
+end
+
 -- Node types are matched on their underscore-separated segments, exactly:
 -- "function_declaration" has segment "function" (wanted), while
 -- "table_constructor" does not have segment "struct", and
@@ -461,7 +478,7 @@ local function ts_outline(bufnr)
             if i > MAX_SKIM_ENTRIES then break end
             local span = s.last > s.first and ("%d-%d"):format(s.first, s.last) or tostring(s.first)
             out[#out + 1] = ("%s%s: %s"):format(
-                string.rep("  ", s.depth), span, decl_line(bufnr, s.first))
+                outline_indent(s.depth), span, decl_line(bufnr, s.first))
         end
         if #sections > MAX_SKIM_ENTRIES then
             out[#out + 1] = cap.note(MAX_SKIM_ENTRIES, #sections, "declarations",
@@ -483,6 +500,9 @@ local function ts_outline(bufnr)
     -- explicit; a 3000-deep chain is exactly the file this now walks in full.
     local last_row = -1
     local total = 0
+    -- The line the last emitted entry started on, kept rather than parsed
+    -- back out of the rendered string: the indentation is not always spaces.
+    local last_shown_line = 0
     local stack = {}
     local function push_children(node, depth)
         local kids = {}
@@ -514,8 +534,9 @@ local function ts_outline(bufnr)
                     local span = erow > srow
                         and ("%d-%d"):format(srow + 1, erow + 1)
                         or tostring(srow + 1)
+                    last_shown_line = srow + 1
                     out[#out + 1] = ("%s%s: %s"):format(
-                        string.rep("  ", depth), span, decl_line(bufnr, srow + 1))
+                        outline_indent(depth), span, decl_line(bufnr, srow + 1))
                 end
             end
             push_children(child, depth + 1)
@@ -524,10 +545,9 @@ local function ts_outline(bufnr)
         end
     end
     if total > #out then
-        local last_line = tonumber((out[#out] or ""):match("^%s*(%d+)")) or 0
         out[#out + 1] = cap.note(#out, total, "declarations",
             "find_symbol or read_file with offset reach them",
-            (" after line %d"):format(last_line))
+            (" after line %d"):format(last_shown_line))
     end
     return out
 end
@@ -564,6 +584,48 @@ local function ts_query(args)
     local compiled, first_query_error = {}, nil
     local matches, skipped = {}, {}
     local files_searched = 0
+    -- Each file's search runs under its own pcall, so one file that the
+    -- grammar or the query cannot survive costs that file and not the batch.
+    local function search_file(f, bufnr)
+        local okp, parser = pcall(vim.treesitter.get_parser, bufnr)
+        if not (okp and parser) then
+            skipped[#skipped + 1] = f .. " (no treesitter parser)"
+            return
+        end
+        local lang = parser:lang()
+        if compiled[lang] == nil then
+            local okq, q = pcall(vim.treesitter.query.parse, lang, qstr)
+            if okq then
+                compiled[lang] = q
+            else
+                compiled[lang] = false
+                first_query_error = first_query_error
+                    or ("for language %s: %s"):format(lang, tostring(q))
+            end
+        end
+        local q = compiled[lang]
+        local tree = q and parser:parse()[1] or nil
+        if not tree then
+            return
+        end
+        for id, node in q:iter_captures(tree:root(), bufnr) do
+            if #matches >= MAX_QUERY_MATCHES then
+                break
+            end
+            local srow = node:range()
+            local text = vim.treesitter.get_node_text(node, bufnr)
+                :gsub("%s+", " ")
+            if #text > 120 then
+                text = text:sub(1, 120) .. "…"
+            end
+            matches[#matches + 1] = {
+                file = vim.api.nvim_buf_get_name(bufnr),
+                line = srow + 1,
+                capture = q.captures[id],
+                text = text,
+            }
+        end
+    end
     for _, f in ipairs(files) do
         if #matches >= MAX_QUERY_MATCHES then
             break
@@ -573,42 +635,9 @@ local function ts_query(args)
         if not okb then
             skipped[#skipped + 1] = f .. " (unreadable)"
         else
-            local okp, parser = pcall(vim.treesitter.get_parser, bufnr)
-            if not (okp and parser) then
-                skipped[#skipped + 1] = f .. " (no treesitter parser)"
-            else
-                local lang = parser:lang()
-                if compiled[lang] == nil then
-                    local okq, q = pcall(vim.treesitter.query.parse, lang, qstr)
-                    if okq then
-                        compiled[lang] = q
-                    else
-                        compiled[lang] = false
-                        first_query_error = first_query_error
-                            or ("for language %s: %s"):format(lang, tostring(q))
-                    end
-                end
-                local q = compiled[lang]
-                local tree = q and parser:parse()[1] or nil
-                if tree then
-                    for id, node in q:iter_captures(tree:root(), bufnr) do
-                        if #matches >= MAX_QUERY_MATCHES then
-                            break
-                        end
-                        local srow = node:range()
-                        local text = vim.treesitter.get_node_text(node, bufnr)
-                            :gsub("%s+", " ")
-                        if #text > 120 then
-                            text = text:sub(1, 120) .. "…"
-                        end
-                        matches[#matches + 1] = {
-                            file = vim.api.nvim_buf_get_name(bufnr),
-                            line = srow + 1,
-                            capture = q.captures[id],
-                            text = text,
-                        }
-                    end
-                end
+            local oks, why = pcall(search_file, f, bufnr)
+            if not oks then
+                skipped[#skipped + 1] = ("%s (%s)"):format(f, tostring(why))
             end
         end
     end
@@ -660,84 +689,100 @@ local function skim(args)
         err("too many files: %d (max %d)", #files, MAX_SKIM_FILES)
     end
     local out = {}
-    for _, f in ipairs(files) do
-        local okb, bufnr = pcall(load_buf, f)
-        if not okb then
-            out[#out + 1] = { file = f, error = tostring(bufnr) }
+    -- One file per pcall, and the error kept beside the file it came from.
+    --
+    -- Every outline in this batch used to be lost to the first file that
+    -- failed, and the reply named no file at all: a 20-file skim answered
+    -- "Error: stack overflow" and nothing else, so the caller learned neither
+    -- which file was pathological nor what the other nineteen contained. A
+    -- batch tool that cannot survive one bad member is not a batch tool.
+    local function outline_of(f)
+        local bufnr = load_buf(f)
+        local entry = {
+            file = vim.api.nvim_buf_get_name(bufnr),
+            total_lines = vim.api.nvim_buf_line_count(bufnr),
+        }
+        -- A file with no declarations falls back to the server's
+        -- symbols, and for a data table that is every value in it. The
+        -- keys are the outline; the values are the file.
+        local dropped_values = 0
+        local function lsp_outline(timeout_ms)
+            local okc, client = pcall(get_client, bufnr,
+                "textDocument/documentSymbol", timeout_ms)
+            if not okc then return nil end
+            local okr, syms = pcall(request, client, bufnr,
+                "textDocument/documentSymbol",
+                { textDocument = { uri = vim.uri_from_bufnr(bufnr) } })
+            if not okr then return nil end
+            local opts = { drop_values = true }
+            local flat = flatten_symbols(syms, 0, {}, bufnr, opts)
+            dropped_values = opts.dropped or 0
+            -- Some servers answer alphabetically (pyright does), which
+            -- reads as a shuffled file; and an outline is a map, so it
+            -- takes the same cap the treesitter one has.
+            table.sort(flat, function(a, b)
+                return (tonumber(a:match("^%s*(%d+)")) or 0) < (tonumber(b:match("^%s*(%d+)")) or 0)
+            end)
+            flat = cap.list(flat, MAX_SKIM_ENTRIES, "declarations",
+                "find_symbol or read_file with offset reach them")
+            return #flat > 0 and flat or nil
+        end
+        local outline
+        if PREFER_LSP_OUTLINE[vim.bo[bufnr].filetype] then
+            -- Macro-heavy C and C++ confuse the treesitter grammar
+            -- (FMT_BEGIN_NAMESPACE swallowing a file, expressions read
+            -- as declarators); the language server's symbols are exact.
+            outline = lsp_outline(3000)
+        end
+        outline = outline or ts_outline(bufnr)
+        if not (outline and #outline > 0) then
+            -- No parser (or nothing recognized): try LSP symbols, briefly.
+            outline = lsp_outline(1500)
+        end
+        if outline and #outline > 0 then
+            entry.outline = outline
+            if dropped_values > 0 then
+                entry.note = ("%d list entries are left out: they are values, named after "
+                    .. "their own text, and read_file shows them"):format(dropped_values)
+            end
         else
-            local entry = {
-                file = vim.api.nvim_buf_get_name(bufnr),
-                total_lines = vim.api.nvim_buf_line_count(bufnr),
-            }
-            -- A file with no declarations falls back to the server's
-            -- symbols, and for a data table that is every value in it. The
-            -- keys are the outline; the values are the file.
-            local dropped_values = 0
-            local function lsp_outline(timeout_ms)
-                local okc, client = pcall(get_client, bufnr,
-                    "textDocument/documentSymbol", timeout_ms)
-                if not okc then return nil end
-                local okr, syms = pcall(request, client, bufnr,
-                    "textDocument/documentSymbol",
-                    { textDocument = { uri = vim.uri_from_bufnr(bufnr) } })
-                if not okr then return nil end
-                local opts = { drop_values = true }
-                local flat = flatten_symbols(syms, 0, {}, bufnr, opts)
-                dropped_values = opts.dropped or 0
-                -- Some servers answer alphabetically (pyright does), which
-                -- reads as a shuffled file; and an outline is a map, so it
-                -- takes the same cap the treesitter one has.
-                table.sort(flat, function(a, b)
-                    return (tonumber(a:match("^%s*(%d+)")) or 0) < (tonumber(b:match("^%s*(%d+)")) or 0)
-                end)
-                flat = cap.list(flat, MAX_SKIM_ENTRIES, "declarations",
-                    "find_symbol or read_file with offset reach them")
-                return #flat > 0 and flat or nil
-            end
-            local outline
-            if PREFER_LSP_OUTLINE[vim.bo[bufnr].filetype] then
-                -- Macro-heavy C and C++ confuse the treesitter grammar
-                -- (FMT_BEGIN_NAMESPACE swallowing a file, expressions read
-                -- as declarators); the language server's symbols are exact.
-                outline = lsp_outline(3000)
-            end
-            outline = outline or ts_outline(bufnr)
-            if not (outline and #outline > 0) then
-                -- No parser (or nothing recognized): try LSP symbols, briefly.
-                outline = lsp_outline(1500)
-            end
-            if outline and #outline > 0 then
-                entry.outline = outline
-                if dropped_values > 0 then
-                    entry.note = ("%d list entries are left out: they are values, named after "
-                        .. "their own text, and read_file shows them"):format(dropped_values)
-                end
+            local ft = vim.bo[bufnr].filetype
+            if ft ~= "" and not has_parser(ft)
+                and #vim.lsp.get_clients({ bufnr = bufnr }) == 0 then
+                entry.note = ("no treesitter parser and no language server for %s: "
+                    .. "no outline; read the file instead"):format(ft)
             else
-                local ft = vim.bo[bufnr].filetype
-                if ft ~= "" and not has_parser(ft)
-                    and #vim.lsp.get_clients({ bufnr = bufnr }) == 0 then
-                    entry.note = ("no treesitter parser and no language server for %s: "
-                        .. "no outline; read the file instead"):format(ft)
-                else
-                    entry.note = "no outline available for this file; read it instead"
-                end
+                entry.note = "no outline available for this file; read it instead"
             end
-            -- An outline of a file that does not parse is a partial outline
-            -- shaped exactly like a whole one: a JSON object whose separator
-            -- was eaten skimmed as three healthy keys with two siblings
-            -- silently missing and a grandchild lifted to the top. Whatever
-            -- the grammar could still read is worth printing, but not
-            -- without saying what it could not.
-            local syntax = require("agent99.syntax")
-            local broken = syntax.first_error(bufnr)
-            if broken then
-                entry.parse_error = syntax.where(broken)
-                entry.partial = true
-                entry.parse_error_note = "this file does not parse, so the outline is "
-                    .. "whatever the grammar could still read: entries after the error may "
-                    .. "be missing, and one may be shown under the wrong parent"
-            end
+        end
+        -- An outline of a file that does not parse is a partial outline
+        -- shaped exactly like a whole one: a JSON object whose separator
+        -- was eaten skimmed as three healthy keys with two siblings
+        -- silently missing and a grandchild lifted to the top. Whatever
+        -- the grammar could still read is worth printing, but not
+        -- without saying what it could not.
+        local syntax = require("agent99.syntax")
+        local broken = syntax.first_error(bufnr)
+        if broken then
+            entry.parse_error = syntax.where(broken)
+            entry.partial = true
+            entry.parse_error_note = "this file does not parse, so the outline is "
+                .. "whatever the grammar could still read: entries after the error may "
+                .. "be missing, and one may be shown under the wrong parent"
+        end
+        return entry
+    end
+    for _, f in ipairs(files) do
+        local okf, entry = pcall(outline_of, f)
+        if okf then
             out[#out + 1] = entry
+        else
+            out[#out + 1] = {
+                file = f,
+                error = tostring(entry),
+                note = "this file was skipped; the rest of the batch is unaffected "
+                    .. "and its outlines are in this reply",
+            }
         end
     end
     return { files = out }
@@ -814,40 +859,66 @@ local function top_level_outline(path, budget, missing)
     -- to "class Flask(App):" - true, and no use to anyone. One level in, a
     -- class lists its methods and the map is worth reading again. Past the
     -- budget, keep counting so the entry can say how much was left out.
-    local function walk(node, depth)
+    --
+    -- Reached without recursion, and the counting is separated from the
+    -- listing. The walk used to stop descending where the map stops printing,
+    -- so what it counted was the declarations it was willing to show and
+    -- nothing below them: a Markdown file's `####` headings were neither
+    -- listed nor counted, and the reply carried no note at all because by its
+    -- own arithmetic nothing had been dropped. It now descends everywhere and
+    -- counts everything, while `depth` - nil once the chain has left the part
+    -- of the file the map lists - decides what is printed, exactly as before.
+    -- Descending everywhere on a 3000-deep generated JSON is what a recursive
+    -- walk could not survive.
+    local stack = {}
+    local function push_children(node, depth)
+        local kids = {}
         for child in node:iter_children() do
-            if child:named() then
-                local ctype = child:type()
-                if wanted_node(child, ft) then
-                    local srow = child:range()
-                    if srow == last_row then
-                        -- Several declarations on one line (a one-line JSON
-                        -- object) are one line of the map.
-                    elseif #out >= budget then
-                        last_row = srow
-                        total = total + 1
-                    else
-                        last_row = srow
-                        total = total + 1
-                        local text = (lines[srow + 1] or ""):gsub("^%s+", "")
-                        if #text > MAP_TEXT_MAX then
-                            text = text:sub(1, MAP_TEXT_MAX) .. "…"
-                        end
-                        out[#out + 1] = ("%s%d: %s"):format(("  "):rep(depth), srow + 1, text)
-                    end
-                    if depth < MAP_MAX_DEPTH and ts_container(ctype, ft) then
-                        walk(child, depth + 1)
-                    end
-                elseif not ts_opaque(ctype) and not data_opaque(ctype, ft) then
-                    walk(child, depth)
-                end
-            end
+            if child:named() then kids[#kids + 1] = child end
+        end
+        for i = #kids, 1, -1 do
+            stack[#stack + 1] = { node = kids[i], depth = depth }
         end
     end
-    walk(trees[1]:root(), 0)
+    push_children(trees[1]:root(), 0)
+    while #stack > 0 do
+        local item = stack[#stack]
+        stack[#stack] = nil
+        local child, depth = item.node, item.depth
+        local ctype = child:type()
+        if wanted_node(child, ft) then
+            local srow = child:range()
+            if srow == last_row then
+                -- Several declarations on one line (a one-line JSON
+                -- object) are one line of the map.
+            elseif depth == nil or #out >= budget then
+                last_row = srow
+                total = total + 1
+            else
+                last_row = srow
+                total = total + 1
+                local text = (lines[srow + 1] or ""):gsub("^%s+", "")
+                if #text > MAP_TEXT_MAX then
+                    text = text:sub(1, MAP_TEXT_MAX) .. "…"
+                end
+                out[#out + 1] = ("%s%d: %s"):format(("  "):rep(depth), srow + 1, text)
+            end
+            -- One level into a declaration that holds other declarations, and
+            -- no further: past that the subtree is still walked, but only to
+            -- be counted.
+            local inner = nil
+            if depth ~= nil and depth < MAP_MAX_DEPTH and ts_container(ctype, ft) then
+                inner = depth + 1
+            end
+            push_children(child, inner)
+        elseif not ts_opaque(ctype) and not data_opaque(ctype, ft) then
+            push_children(child, depth)
+        end
+    end
     if total > #out then
         out[#out + 1] = cap.note(#out, total, "declarations",
-            "skim the file for all of them")
+            ("the map goes %d level(s) into a file; skim reaches the rest")
+                :format(MAP_MAX_DEPTH + 1))
     end
     return out, #lines, nil, total
 end
@@ -978,8 +1049,8 @@ local function workspace_tree(args)
     if #text_files <= MAP_SMALL_PROJECT then
         decls = {}
         for _, rel in ipairs(text_files) do
-            local outline = top_level_outline(target .. "/" .. rel, 100000)
-            if outline then
+            local oko, outline = pcall(top_level_outline, target .. "/" .. rel, 100000)
+            if oko and outline then
                 decls[rel] = #outline
             end
         end
@@ -1477,9 +1548,16 @@ local function workspace_map(args)
             sleep(0) -- yield so the editor stays responsive on big repos
         end
         local entry = { file = rel }
-        local outline, nlines, skip, decl_total = top_level_outline(target .. "/" .. rel,
-            MAP_FILE_MAX, missing)
-        if skip then
+        -- Per file, so one file the parser cannot survive costs its outline
+        -- and not the map: 200 files' worth of structure used to be lost to
+        -- the first one that failed, and the reply named none of them.
+        local oko, outline, nlines, skip, decl_total = pcall(top_level_outline,
+            target .. "/" .. rel, MAP_FILE_MAX, missing)
+        if not oko then
+            entry.skipped = ("could not be read: %s"):format(tostring(outline))
+            outline, nlines, skip, decl_total = nil, nil, nil, nil
+            skipped = skipped + 1
+        elseif skip then
             entry.skipped = skip
             skipped = skipped + 1
         else
@@ -1891,51 +1969,68 @@ local function ts_index(bufnr)
         return md_sections(bufnr)
     end
     local entries = {}
-    local function walk(node, prefix)
+    -- Reached without recursion, for the same reason ts_outline is: a
+    -- generated JSON file 3000 objects deep overflowed the Lua stack here,
+    -- and the overflow escaped as `Error: stack overflow` from whatever call
+    -- was walking - find_symbol answered nothing at all for a query that
+    -- matched twelve symbols in eight healthy files, because one file in the
+    -- batch was that shape. The explicit stack pushes each node's children in
+    -- reverse so they pop in document order, which is the order the recursive
+    -- walk produced.
+    local stack = {}
+    local function push_children(node, prefix)
+        local kids = {}
         for child in node:iter_children() do
-            if child:named() then
-                if wanted_node(child, ft) then
-                    local srow, scol, erow, ecol = child:range()
-                    -- Where the declaration actually ends on its last line.
-                    -- A node ending at column 0 stopped at the previous
-                    -- line's newline (a Markdown section runs up to the
-                    -- next heading): its last line is the one before, and it
-                    -- owns that line to the end.
-                    local end_col = ecol > 0 and ecol or nil
-                    if ecol == 0 and erow > srow then
-                        erow = erow - 1
-                    end
-                    local written = last_written_line(bufnr, srow + 1, erow + 1) - 1
-                    if written ~= erow then
-                        -- Trailing blank lines were dropped from the span, so
-                        -- the recorded end column no longer describes it.
-                        end_col = nil
-                    end
-                    erow = written
-                    local name = ts_node_name(child, bufnr)
-                    local path = prefix == "" and name or (prefix .. "/" .. name)
-                    entries[#entries + 1] = {
-                        path = path,
-                        name = name,
-                        kind = child:type(),
-                        first = srow + 1,
-                        last = erow + 1,
-                        -- Byte columns of the declaration inside its first
-                        -- and last lines, so an edit can replace the node
-                        -- rather than the lines it happens to sit on. Only
-                        -- treesitter entries carry them; a language server's
-                        -- do not, and those stay line-granular.
-                        first_col = scol,
-                        last_col = end_col,
-                    }
-                    walk(child, path)
-                elseif not data_opaque(child:type(), ft) then
-                    walk(child, prefix)
-                end
-            end
+            if child:named() then kids[#kids + 1] = child end
+        end
+        for i = #kids, 1, -1 do
+            stack[#stack + 1] = { node = kids[i], prefix = prefix }
         end
     end
-    walk(trees[1]:root(), "")
+    push_children(trees[1]:root(), "")
+    while #stack > 0 do
+        local item = stack[#stack]
+        stack[#stack] = nil
+        local child, prefix = item.node, item.prefix
+        if wanted_node(child, ft) then
+            local srow, scol, erow, ecol = child:range()
+            -- Where the declaration actually ends on its last line.
+            -- A node ending at column 0 stopped at the previous
+            -- line's newline (a Markdown section runs up to the
+            -- next heading): its last line is the one before, and it
+            -- owns that line to the end.
+            local end_col = ecol > 0 and ecol or nil
+            if ecol == 0 and erow > srow then
+                erow = erow - 1
+            end
+            local written = last_written_line(bufnr, srow + 1, erow + 1) - 1
+            if written ~= erow then
+                -- Trailing blank lines were dropped from the span, so
+                -- the recorded end column no longer describes it.
+                end_col = nil
+            end
+            erow = written
+            local name = ts_node_name(child, bufnr)
+            local path = prefix == "" and name or (prefix .. "/" .. name)
+            entries[#entries + 1] = {
+                path = path,
+                name = name,
+                kind = child:type(),
+                first = srow + 1,
+                last = erow + 1,
+                -- Byte columns of the declaration inside its first
+                -- and last lines, so an edit can replace the node
+                -- rather than the lines it happens to sit on. Only
+                -- treesitter entries carry them; a language server's
+                -- do not, and those stay line-granular.
+                first_col = scol,
+                last_col = end_col,
+            }
+            push_children(child, path)
+        elseif not data_opaque(child:type(), ft) then
+            push_children(child, prefix)
+        end
+    end
     -- A Dockerfile stage is FROM up to the next FROM, but the grammar only
     -- has the one line; widen each stage to what it actually owns so a
     -- stage can be read and edited as a unit.
@@ -1984,41 +2079,51 @@ local function lsp_index(bufnr)
         return nil
     end
     local entries = {}
-    local function walk(list, prefix)
-        for _, s in ipairs(list or {}) do
-            local range = s.range or (s.location and s.location.range)
-            local kind = symbol_kind(s.kind)
-            if range and kind == "Null" then
-                -- clangd wraps a macro-opened namespace (FMT_BEGIN_NAMESPACE)
-                -- in a Null symbol: not a name anyone addresses, skip it.
-                walk(s.children, prefix)
-            elseif range then
-                local path = prefix == "" and s.name or (prefix .. "/" .. s.name)
-                local first, last = range.start.line + 1, range["end"].line + 1
-                -- Widened here rather than where the server's symbols are
-                -- merged into treesitter's, because a file that declares no
-                -- function - a module of constants, the case this is for -
-                -- has no treesitter entries at all and takes the server's
-                -- list unmerged.
-                --
-                -- Only for the kinds a server reports by the range of their
-                -- name: a value whose text spans lines. Widening whatever
-                -- else comes back one line long would take a symbol out to
-                -- the statement around it - a loop variable to its whole
-                -- loop - and an edit addressed to the symbol would then
-                -- write over that statement.
-                if first == last and WIDEN_TO_STATEMENT[kind] then
-                    last = statement_end(bufnr, first)
-                end
-                entries[#entries + 1] = {
-                    path = path, name = s.name, kind = kind,
-                    first = first, last = last,
-                }
-                walk(s.children, path)
-            end
+    -- Iterative, like ts_index and for the same reason: a server's symbol
+    -- tree for a deeply nested data file nests just as deep as the file does,
+    -- and a stack overflow here would take out the whole find_symbol batch.
+    local stack = {}
+    local function push(list, prefix)
+        for i = #(list or {}), 1, -1 do
+            stack[#stack + 1] = { sym = list[i], prefix = prefix }
         end
     end
-    walk(syms, "")
+    push(syms, "")
+    while #stack > 0 do
+        local item = stack[#stack]
+        stack[#stack] = nil
+        local s, prefix = item.sym, item.prefix
+        local range = s.range or (s.location and s.location.range)
+        local kind = symbol_kind(s.kind)
+        if range and kind == "Null" then
+            -- clangd wraps a macro-opened namespace (FMT_BEGIN_NAMESPACE)
+            -- in a Null symbol: not a name anyone addresses, skip it.
+            push(s.children, prefix)
+        elseif range then
+            local path = prefix == "" and s.name or (prefix .. "/" .. s.name)
+            local first, last = range.start.line + 1, range["end"].line + 1
+            -- Widened here rather than where the server's symbols are
+            -- merged into treesitter's, because a file that declares no
+            -- function - a module of constants, the case this is for -
+            -- has no treesitter entries at all and takes the server's
+            -- list unmerged.
+            --
+            -- Only for the kinds a server reports by the range of their
+            -- name: a value whose text spans lines. Widening whatever
+            -- else comes back one line long would take a symbol out to
+            -- the statement around it - a loop variable to its whole
+            -- loop - and an edit addressed to the symbol would then
+            -- write over that statement.
+            if first == last and WIDEN_TO_STATEMENT[kind] then
+                last = statement_end(bufnr, first)
+            end
+            entries[#entries + 1] = {
+                path = path, name = s.name, kind = kind,
+                first = first, last = last,
+            }
+            push(s.children, path)
+        end
+    end
     return entries
 end
 
@@ -2189,6 +2294,12 @@ end
 
 local MAX_FIND_RESULTS = 20
 
+-- A name path is an address, and past this length it is neither an address
+-- anyone can use nor something a reply can afford: one query against a
+-- 2500-deep generated JSON came back as 147,819 characters over 126 lines,
+-- almost all of it slash-separated ancestors.
+local MAX_NAME_PATH = 240
+
 local MAX_BODY_LINES = 200
 
 -- Body lines are numbered RELATIVE to the symbol (declaration = 1), matching
@@ -2332,15 +2443,30 @@ local function find_symbol(args)
         files = vim.list_slice(files, 1, MAX_QUERY_FILES)
     end
     local found = {}
+    -- One file per pcall, and the file named when it fails.
+    --
+    -- Indexing one file used to be able to end the whole search: a query that
+    -- matched twelve symbols in eight healthy files answered "Error: stack
+    -- overflow" and nothing else, because a generated JSON file thousands of
+    -- objects deep was among the files ripgrep had picked. The walk no longer
+    -- overflows, but the isolation is the part that keeps a search usable when
+    -- one file is unreadable for any other reason.
+    local failed, failed_seen = {}, {}
     local function collect(query)
         for _, f in ipairs(files) do
             local okb, bufnr = pcall(load_buf, f)
             if okb then
-                for _, entry in ipairs(symbol_index(bufnr)) do
-                    local rank = match_rank(entry, query)
-                    if rank then
-                        found[#found + 1] = { rank = rank, bufnr = bufnr, entry = entry }
+                local oki, entries = pcall(symbol_index, bufnr)
+                if oki then
+                    for _, entry in ipairs(entries) do
+                        local rank = match_rank(entry, query)
+                        if rank then
+                            found[#found + 1] = { rank = rank, bufnr = bufnr, entry = entry }
+                        end
                     end
+                elseif not failed_seen[f] then
+                    failed_seen[f] = true
+                    failed[#failed + 1] = ("%s: %s"):format(rel_path(f), tostring(entries))
                 end
             end
         end
@@ -2389,10 +2515,14 @@ local function find_symbol(args)
         return a.entry.first < b.entry.first
     end)
     local out = {}
+    local clipped_path = false
     for i, m in ipairs(found) do
         if i > MAX_FIND_RESULTS then break end
+        local shown_path = cap.clip(m.entry.path, MAX_NAME_PATH,
+            "characters of name path")
+        if shown_path ~= m.entry.path then clipped_path = true end
         local item = {
-            name_path = m.entry.path,
+            name_path = shown_path,
             kind = m.entry.kind,
             file = vim.api.nvim_buf_get_name(m.bufnr),
             lines = ("%d-%d"):format(m.entry.first, m.entry.last),
@@ -2421,11 +2551,23 @@ local function find_symbol(args)
             .. "if it is declared elsewhere"):format(MAX_QUERY_FILES)
             .. (note and ("; " .. note) or "")
     end
-    return {
+    local result = {
         count = #found,
         matches = out,
         note = note,
     }
+    if clipped_path then
+        result.name_paths_clipped = "some name paths were too long to print and are shown "
+            .. "clipped; a clipped path is not one an edit tool can resolve - address those "
+            .. "symbols by file and the line range beside them"
+    end
+    if #failed > 0 then
+        result.files_failed = cap.list(failed, 10, "files",
+            "the matches above come from the files that did read")
+        result.files_failed_note = ("%d of the %d files searched could not be indexed and "
+            .. "were skipped; everything above is from the rest"):format(#failed, #files)
+    end
+    return result
 end
 
 local MAX_NEAR_NAMES = 6

@@ -556,7 +556,11 @@ var fileTools = []tool{
 		Name:        "read_file",
 		Description: fmt.Sprintf("Read a file with line numbers (offset/limit). A plain read of a "+
 			"file over %d lines returns its skim (the outline) instead of its text; pass "+
-			"offset/limit to read the text of one anyway.", autoSkimThreshold),
+			"offset/limit to read the text of one anyway, and a file that long which nothing "+
+			"could outline comes back as text with a note saying so. Lines over %d characters "+
+			"are clipped and say how much was left off, and the read stops at %d characters "+
+			"whether or not limit was reached.",
+			autoSkimThreshold, maxLineChars, maxReadBytes),
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -569,7 +573,7 @@ var fileTools = []tool{
 	},
 	{
 		Name:        "grep",
-		Description: "Regex search (ripgrep syntax) with context. Hits carry a tag: path:line [Symbol kind @pos/len dN !SEV ~age · signature · doc]: kind is def/call/comment/string, dN nesting depth, !ERROR an existing diagnostic, test: a test file, ~age needs blame=true. Usually no follow-up read is needed. Narrow with kind= (code skips comments and strings) and tests=, rather than by grepping again with a cleverer pattern.",
+		Description: fmt.Sprintf("Regex search (ripgrep syntax) with context. Hits carry a tag: path:line [Symbol kind @pos/len dN !SEV ~age · signature · doc]: kind is def/call/comment/string, dN nesting depth, !ERROR an existing diagnostic, test: a test file, ~age needs blame=true. Usually no follow-up read is needed. Narrow with kind= (code skips comments and strings) and tests=, rather than by grepping again with a cleverer pattern. A hit on a line over %d characters is clipped and says how much of it was left off.", maxLineChars),
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

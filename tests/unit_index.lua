@@ -96,6 +96,27 @@ local floored = cap.fields(3, 46, { unit = "entries", floor = true })
 check("a floor says the count stopped early",
     floored.total_is_floor == true and floored.note:find("at least 46", 1, true) ~= nil, floored)
 
+-- The same contract for one over-long string. A clipped line that simply
+-- stops reads as a short line, which is how a 50,000-character minified line
+-- and an 11-character match on it came back as the same reply.
+check("cap.clip leaves a short string alone",
+    cap.clip("abcdef", 10) == "abcdef", cap.clip("abcdef", 10))
+local long = string.rep("x", 500)
+check("cap.clip says how much it dropped",
+    cap.clip(long, 100) == string.rep("x", 100) .. "… (+400 characters on this line)",
+    cap.clip(long, 100))
+check("cap.clip takes the noun it was given",
+    cap.clip(long, 100, "characters of name path")
+        :find("(+400 characters of name path)", 1, true) ~= nil,
+    cap.clip(long, 100, "characters of name path"))
+-- Cutting through a UTF-8 sequence makes the whole reply invalid JSON, which
+-- costs far more than the tail of one line.
+local runes = string.rep("é", 200)  -- two bytes each
+local cut = cap.clip(runes, 101)
+check("cap.clip never cuts through a rune",
+    vim.fn.strchars(cut:gsub("… %(.*%)$", "")) == 50 and #cut:gsub("… %(.*%)$", "") == 100,
+    cut)
+
 if vim.treesitter.language.add and pcall(vim.treesitter.language.inspect, "json") then
     -- One nesting chain, 400 keys deep and no siblings anywhere. This is the
     -- case where the old count computed to 0 and took the note with it: 150
@@ -110,6 +131,18 @@ if vim.treesitter.language.add and pcall(vim.treesitter.language.inspect, "json"
     end
     local chain_buf = buffer_with(vim.split(text, "\n"), "json")
     local chain_out = index.ts_outline(chain_buf)
+    -- Indentation is what an outline is read by, and past a dozen levels it
+    -- stops being that and becomes the reply: entry 150 of this chain used to
+    -- carry 298 leading spaces, and one 3000-deep file spent about 8000
+    -- tokens printing whitespace. The depth is still there, as a number.
+    check("a deep entry writes its depth instead of indenting to it",
+        chain_out[150]:sub(1, 24) == string.rep(" ", 24)
+        and chain_out[150]:sub(25):match("^%[%+137%] 150%-") ~= nil
+        and #chain_out[150] < 60,
+        chain_out[150]:sub(1, 60))
+    check("a shallow entry still indents",
+        chain_out[3]:match("^    %d") ~= nil and chain_out[3]:find('"d3"', 1, true) ~= nil,
+        chain_out[3])
     check("a nesting chain still gets its note",
         #chain_out == 151
         and chain_out[151] == "… +250 more declarations (150 of 400 shown) after line 150; "

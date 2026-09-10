@@ -364,7 +364,12 @@ def group_index(c):
         r = b.rpc("tools/call", {"name": "read_file", "arguments": {"path": big}})
         text = r["result"]["content"][0]["text"]
         check("read_file returns text when the outline is trivial",
-              text.startswith("1: items:") and "600: " in text, text[:120])
+              "1: items:" in text and "600: " in text, text[:120])
+        # And says why: the rule is documented in lines, so a file over the
+        # threshold that comes back as text has to account for itself.
+        check("a long file read as text says the outline rule could not fire",
+              text.startswith("note: this file has 601 lines, over the 400 at which")
+              and "nothing could outline it" in text, text[:200])
         # A truncated read says where to resume and how much is left, so
         # finding that out does not cost another call.
         r = b.rpc("tools/call", {"name": "read_file",
@@ -374,6 +379,25 @@ def group_index(c):
               "lines 1-100 of 601" in text and "offset=101" in text,
               text[-200:])
         os.remove(big)
+
+    reset(c)
+    # The map lists one level into a declaration by design, and it used to
+    # count only as far as it listed: a file whose headings go deeper was
+    # neither listed nor counted below that level, so its entry carried no
+    # note and read as complete. The listing is unchanged; the count is the
+    # whole file's.
+    deepmd = os.path.join(root, "deep.md")
+    with open(deepmd, "w") as f:
+        f.write("# Top\n\n## One\n\n### Two\n\n#### Three\n\n##### Four\n\n"
+                "## Five\n\n### Six\n")
+    res = b.call("workspace_map", {"glob": "deep.md"})
+    entry = res["files"][0]
+    check("the map counts the declarations below the level it lists",
+          len(entry.get("outline", [])) == 4
+          and entry["outline"][:3] == ["1: # Top", "  3: ## One", "  11: ## Five"]
+          and "+4 more declarations (3 of 7 shown)" in entry["outline"][3]
+          and "the map goes 2 level(s) into a file" in entry["outline"][3], entry)
+    os.remove(deepmd)
 
     reset(c)
     # A small project lists its tests in the map by default.
@@ -884,6 +908,70 @@ def group_index(c):
     check("and says the outline may be missing entries",
           "may be missing" in (entry.get("parse_error_note") or ""), res)
     os.remove(broken)
+
+    # Depth, not size and not minification. A JSON file 3,000 objects deep
+    # overflowed the Lua stack on the find_symbol path, and the overflow left
+    # the editor as a bare "Error: stack overflow": no file named, no partial
+    # result, and every other file in the same call lost with it. A 1.6 MB
+    # single-line file six deep was always fine, so the depth is the number
+    # worth asserting - and the exact depth, not "it does not crash".
+    def nest(depth, pretty):
+        sep = "\n" if pretty else ""
+        open_ = sep.join('{"d%d": ' % i for i in range(depth, 0, -1))
+        return "%s0%s%s\n" % (open_, sep, sep.join("}" for _ in range(depth)))
+
+    deep = os.path.join(root, "deep.json")
+    with open(deep, "w") as f:
+        f.write(nest(5000, False))
+    res = b.call("find_symbol", {"file": deep, "name": "d4999"})
+    check("find_symbol indexes a 5000-deep file that used to overflow the stack",
+          res.get("count", 0) >= 1
+          and res["matches"][0]["name_path"].startswith("d5000/d4999"), res)
+    # 3,000 deep is where it used to give up; the pretty-printed variant
+    # is the one that made it clear size was not the cause (38 KB).
+    pretty_deep = os.path.join(root, "deep_pretty.json")
+    with open(pretty_deep, "w") as f:
+        f.write(nest(3000, True))
+    res = b.call("find_symbol", {"file": pretty_deep, "name": "d2999"})
+    check("and a 3000-deep pretty-printed one, which is where it used to stop",
+          res.get("count", 0) >= 1, res)
+    # A name path 5,000 segments long is neither an address anyone can use
+    # nor something a reply can afford: one such query came back at 147,819
+    # characters. It is clipped, and the reply says a clipped path cannot be
+    # handed to an edit tool.
+    res = b.call("find_symbol", {"file": deep, "name": "d1"})
+    path = res["matches"][0]["name_path"]
+    check("a name path too long to print is clipped and says how much it lost",
+          len(path) < 400 and "characters of name path)" in path
+          and "not one an edit tool can resolve" in (res.get("name_paths_clipped") or ""),
+          {"len": len(path), "tail": path[-80:], "note": res.get("name_paths_clipped")})
+
+    # A batch tool survives one bad member. Nineteen good files used to be
+    # lost to one that failed, and the reply named none of them.
+    md = os.path.join(root, "NOTES.md")
+    res = b.call("skim", {"files": [md, os.path.join(root, "nosuch.json"),
+                                    pretty_deep, os.path.join(root, "deploy"), util]})
+    files = res.get("files", [])
+    named = {os.path.basename(f.get("file", "").rstrip("/")): f for f in files}
+    check("a skim batch returns the good files and names the ones that failed",
+          len(files) == 5
+          and named["NOTES.md"].get("outline")
+          and named["util.lua"].get("outline")
+          and named["deep_pretty.json"].get("outline")
+          and named["nosuch.json"].get("error")
+          and "rest of the batch is unaffected" in (named["nosuch.json"].get("note") or ""),
+          [(f.get("file"), bool(f.get("outline")), f.get("error")) for f in files])
+    # And the deep file's own outline says how much of it was left out
+    # without spending the reply on indentation: entry 150 used to carry 298
+    # leading spaces.
+    outline = named["deep_pretty.json"]["outline"]
+    check("a deep outline writes its depth instead of indenting to it",
+          len(outline) == 151 and outline[149].strip().startswith("[+137]")
+          and max(len(l) for l in outline) < 200
+          and "+2850 more declarations (150 of 3000 shown)" in outline[150],
+          outline[148:])
+    os.remove(deep)
+    os.remove(pretty_deep)
 
 
 SMALL_JSON = ('{\n'
@@ -1827,6 +1915,34 @@ def group_undo(c):
           and 'return "hello, " .. name' in open(util).read()
           and res.get("remaining") == 0, res)
 
+    reset(c)
+    # Undoing one bulk edit answered with 2,431 lines over 59 KB - one entry
+    # per file the edit had touched, each the same sentence with a different
+    # name in it - and the `remaining` a caller actually reads was buried
+    # inside it. The list is budgeted; the revert itself is not.
+    bulk = os.path.join(root, "bulk")
+    os.makedirs(bulk, exist_ok=True)
+    for i in range(50):
+        with open(os.path.join(bulk, "f%02d.lua" % i), "w") as f:
+            f.write("local NAME_HERE = %d\nreturn NAME_HERE\n" % i)
+    res = b.call("replace_pattern", {
+        "glob": "bulk/**/*.lua", "pattern": "NAME_HERE", "replacement": "RENAMED",
+        "literal": True})
+    check("the bulk edit reached every file", res.get("files_matched") == 50,
+          {k: v for k, v in res.items() if k != "files"})
+    res = b.call("undo_edit", {"count": 1})
+    cut = res.get("undone_entries") or {}
+    check("a bulk undo lists a budgeted sample and counts the rest",
+          len(res.get("undone", [])) == 40
+          and cut.get("shown") == 40 and cut.get("total") == 50 and cut.get("dropped") == 10
+          and "only the listing is cut" in (cut.get("note") or "")
+          and res.get("remaining") == 0, {"listed": len(res.get("undone", [])), "cut": cut,
+                                          "remaining": res.get("remaining")})
+    check("and every file really was reverted",
+          all("NAME_HERE" in open(os.path.join(bulk, "f%02d.lua" % i)).read()
+              for i in range(50)), res)
+    shutil.rmtree(bulk)
+
 
 def group_polish(c):
     """What the polish after an edit does to the record of that edit: an
@@ -2301,6 +2417,41 @@ def group_search(c):
     empty = r["result"]["content"][0]["text"]
     check("a glob that matches no files says so",
           "matched no files" in empty, empty)
+
+    # An eleven-character match on a 50,000-character minified line came back
+    # as the whole line: one grep hit, 30 KB, and a reply budget spent on a
+    # file nobody was reading. workspace_map has clipped at 80 characters for
+    # as long as it has existed; grep and read_file clipped nothing.
+    minified = os.path.join(root, "bundle.min.js")
+    with open(minified, "w") as f:
+        f.write("var pad=%s;var NEEDLE_HERE=1;\n" % ('"' + "x" * 50000 + '"'))
+    r = b.rpc("tools/call", {"name": "grep", "arguments": {
+        "pattern": "NEEDLE_HERE", "files": [minified], "context": 0}})
+    hit = r["result"]["content"][0]["text"]
+    check("a grep hit on a very long line is clipped and says how much it lost",
+          len(hit) < 1000 and "NEEDLE_HERE" not in hit
+          and "characters on this line)" in hit, {"len": len(hit), "head": hit[:120]})
+    # read_file has a byte budget as well as a line budget: limit=2000 over a
+    # file of 40 KB lines returned 85 KB and every line of it was one nobody
+    # could read.
+    r = b.rpc("tools/call", {"name": "read_file",
+                             "arguments": {"path": minified, "offset": 1, "limit": 10}})
+    text = r["result"]["content"][0]["text"]
+    check("read_file clips a very long line too, and counts the ones it clipped",
+          len(text) < 2000 and "1 of the lines above were longer than 400 characters"
+          in text, {"len": len(text), "tail": text[-200:]})
+    # Lines short enough that the per-line clip never fires: it is the total
+    # that has to stop this read, and say so rather than let the caller read
+    # "truncated" as "limit=2000 was reached".
+    with open(minified, "w") as f:
+        f.write("".join('var v%d="%s";\n' % (i, "y" * 300) for i in range(2000)))
+    r = b.rpc("tools/call", {"name": "read_file",
+                             "arguments": {"path": minified, "offset": 1, "limit": 2000}})
+    text = r["result"]["content"][0]["text"]
+    check("a read stops at its character budget and says that is why",
+          len(text) < 60000 and "the read stopped at its 48000-character budget, "
+          "not at limit=2000" in text, {"len": len(text), "tail": text[-260:]})
+    os.remove(minified)
 
     # A match inside a string literal that sits on a declaration's own line:
     # calling the whole declaration line "def" kept it under kind=code, which
