@@ -234,6 +234,36 @@ check("a text the pass removed a line of is left unpaired",
     edit.reindented_kept_line(dropped_before, dropped_after) == nil,
     edit.reindented_kept_line(dropped_before, dropped_after))
 
+-- move_symbols loads the files that referenced a moved symbol so the server
+-- checks them, and only a diagnostic naming one of those symbols is the move's
+-- doing. The two ways to get this wrong both shipped: charging the whole file
+-- to the move put three pre-existing warnings from an untouched Go test file
+-- into one move's verdict, and the fix for that dropped everything else in
+-- those files on the floor - an unresolved-import error in a file the move had
+-- genuinely broken vanished from the reply while the same error in an
+-- unrelated open file was reported.
+check("a message naming the moved symbol is the move's doing",
+    edit.mentions_name('"has_triple_quotes" is unknown import symbol',
+        { "has_triple_quotes" }) == true, "not matched")
+check("a longer word merely containing the name is not",
+    edit.mentions_name("address is not defined", { "add" }) == false, "matched")
+check("a name that is only a suffix of a word is not",
+    edit.mentions_name("reshout is undefined", { "shout" }) == false, "matched")
+check("an unrelated error in the same file is not the move's doing",
+    edit.mentions_name('Import "black.strings" could not be resolved',
+        { "has_triple_quotes" }) == false, "matched")
+-- The symbol index spells a Go method `(*Archiver).Do`, which begins with
+-- punctuation: a leading word-frontier there can never match, so it must not
+-- be applied on that side.
+check("a name carrying pattern magic still matches",
+    edit.mentions_name("undefined: (*Archiver).Do", { "(*Archiver).Do" }) == true, "not matched")
+check("a name in backticks matches",
+    edit.mentions_name("undefined global `shout`", { "shout" }) == true, "not matched")
+check("no names means nothing is the move's doing",
+    edit.mentions_name("anything at all", {}) == false, "matched")
+check("a nil message is not a match",
+    edit.mentions_name(nil, { "shout" }) == false, "matched")
+
 if failures > 0 then
     io.stdout:write(("unit_edit: %d failed\n"):format(failures))
     vim.cmd("cquit 1")

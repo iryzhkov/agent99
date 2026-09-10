@@ -1397,6 +1397,31 @@ local last_prior_sigs = {}
 local carried_prior_sigs = {}
 local preexisting_hinted = false
 
+-- Whether a diagnostic message names one of these symbols. Whole-word, so a
+-- moved `add` is not found inside `address` and a file's unrelated error is
+-- not charged to the move; the frontier patterns are what a plain
+-- `find(name, 1, true)` was missing. The name is escaped because a symbol
+-- path can carry pattern magic - `(*Archiver).Do` is a Go method as the
+-- symbol index spells it.
+local function mentions_name(message, names)
+    message = message or ""
+    for _, name in ipairs(names or {}) do
+        if name ~= "" then
+            local escaped = name:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0")
+            -- A frontier only means anything next to a word character. A name
+            -- that begins or ends with punctuation - `(*Archiver).Do`, as the
+            -- symbol index spells a Go method - gets none on that side, or the
+            -- pattern could never match at all.
+            local head = name:match("^[%w_]") and "%f[%w_]" or ""
+            local tail = name:match("[%w_]$") and "%f[^%w_]" or ""
+            if message:find(head .. escaped .. tail) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 -- ctx (optional): label = what the edit was, for the deferred and late
 -- reports; since/acks/names = the barrier already sent, when resolving a
 -- deferred verdict rather than judging a fresh edit.
@@ -1514,19 +1539,30 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
                     vim.diagnostic.severity[d.severity], d.lnum + 1, d.message)
             elseif ctx.also and ctx.also[d.bufnr] then
                 -- A file this call did not edit, loaded only so the server
-                -- would check it. Everything it already had is its own
-                -- business, and reporting all of it charged a move with three
-                -- pre-existing warnings in a test file it never touched. Only
-                -- a diagnostic that names one of the symbols this call moved
-                -- can be this call's doing.
-                for _, name in ipairs(ctx.also_names or {}) do
-                    if (d.message or ""):find(name, 1, true) then
-                        new_here[#new_here + 1] = ("%s %s:%d: %s"):format(
-                            vim.diagnostic.severity[d.severity],
-                            vim.fn.fnamemodify(vim.api.nvim_buf_get_name(d.bufnr), ":."),
-                            d.lnum + 1, d.message)
-                        break
-                    end
+                -- would check it. A diagnostic naming one of the moved symbols
+                -- is this call's doing and is reported with the edit's own;
+                -- anything else in that file is treated exactly as any other
+                -- unedited file's is, which means an error is still reported
+                -- under new_errors_elsewhere.
+                --
+                -- Both halves are load-bearing and each fixes the other's bug.
+                -- Filing all of it as the edit's doing charged one move with
+                -- three pre-existing warnings in a Go test file it had never
+                -- touched. Dropping the rest instead - which is what this
+                -- branch did until now - made an unresolved-import error in a
+                -- file the move had genuinely broken vanish from the reply
+                -- entirely, while the identical error in an unrelated open
+                -- file was reported. That is the silent-drop this whole line
+                -- of work exists to prevent, so it must fall through, not stop.
+                if mentions_name(d.message, ctx.also_names) then
+                    new_here[#new_here + 1] = ("%s %s:%d: %s"):format(
+                        vim.diagnostic.severity[d.severity],
+                        vim.fn.fnamemodify(vim.api.nvim_buf_get_name(d.bufnr), ":."),
+                        d.lnum + 1, d.message)
+                elseif d.severity == vim.diagnostic.severity.ERROR then
+                    new_elsewhere[#new_elsewhere + 1] = ("%s:%d: %s"):format(
+                        vim.fn.fnamemodify(vim.api.nvim_buf_get_name(d.bufnr), ":."),
+                        d.lnum + 1, d.message)
                 end
             elseif ctx.own and ctx.own[d.bufnr] then
                 -- Another file this same call edited. Only errors are worth
@@ -4557,5 +4593,8 @@ M.move_symbols = move_symbols
 M.indent_profile = indent_profile
 M.format_damage = format_damage
 M.map_region = map_region
+-- Exported for tests/unit_edit.lua: whether a diagnostic in a file a move only
+-- loaded is the move's doing. Getting this wrong drops a real error silently.
+M.mentions_name = mentions_name
 
 return M
