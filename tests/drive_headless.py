@@ -1674,8 +1674,11 @@ def group_verdict(c):
         "file": util, "name_path": "M.shout", "first_line": 2, "last_line": 2,
         "text": '    return string.upper(M.greet(name))',
     })
+    # startswith: every clean verdict now names the scope it covered, because
+    # "no new errors or warnings" on its own reads as a statement about the
+    # project and was one about a single file.
     check("post-edit separates pre-existing",
-          res.get("diagnostics_after") == "no new errors or warnings"
+          str(res.get("diagnostics_after", "")).startswith("no new errors or warnings")
           and "1 warnings" in res.get("preexisting", ""), res)
     # The error the earlier edit planted is new to the pre-existing list,
     # so it is named this once (with its file), and not on the next reply.
@@ -1766,7 +1769,8 @@ def group_verdict(c):
                                          "text": "function M.quick() return 2 end"})
     waited = time.time() - t0
     check("clean edit returns well before the ceiling",
-          waited < 2.5 and res.get("diagnostics_after") == "no new errors or warnings",
+          waited < 2.5
+          and str(res.get("diagnostics_after", "")).startswith("no new errors or warnings"),
           "%.2fs %s" % (waited, res))
     b.call("undo_edit", {})
 
@@ -1822,8 +1826,140 @@ def group_verdict(c):
     verdicts = res.get("deferred_verdicts") or []
     check("an owed verdict is settled before the next edit's snapshot",
           len(verdicts) == 1 and "fixed" in verdicts[0]
-          and res.get("diagnostics_after") == "no new errors or warnings", res)
+          and str(res.get("diagnostics_after", "")).startswith("no new errors or warnings"), res)
     b.call("undo_edit", {"all": True})
+
+    verdict_closure(c)
+
+
+def verdict_closure(c):
+    """The scope the verdict covers. An edit that changes a symbol's shape
+    breaks the files that use it, and a language server publishes only for
+    the documents something has opened: four Go packages broken by one
+    return-type change came back as "no new errors or warnings", and the
+    warmer the server the cleaner that false verdict read. Asserted on the
+    wording, because the defect arrives as a successful reply with a clean
+    exit code and every count in it is right about the files it looked at."""
+    b, work = c.b, c.work
+    if not shutil.which("gopls") or not shutil.which("go"):
+        return
+    goroot = os.path.join(work, "closureproj")
+    os.makedirs(goroot)
+    with open(os.path.join(goroot, "go.mod"), "w") as f:
+        f.write("module closureproj\n\ngo 1.22\n")
+    files = {
+        "core/core.go":
+            "package core\n\n// Compute returns an int derived from a.\n"
+            "func Compute(a int) int {\n\treturn a * 2\n}\n",
+        "usera/a.go":
+            "package usera\n\nimport \"closureproj/core\"\n\n"
+            "// Val takes its type from Compute's return type.\n"
+            "var Val = core.Compute(1)\n\nfunc Wrap() int {\n\treturn core.Compute(9)\n}\n",
+        "userb/b.go":
+            "package userb\n\nimport \"closureproj/core\"\n\nvar B int = core.Compute(2)\n",
+        "userc/c.go":
+            "package userc\n\nimport \"closureproj/core\"\n\n"
+            "func C() int {\n\tx := core.Compute(3)\n\treturn x\n}\n",
+        # Never mentions Compute: it breaks through usera.Val's inferred
+        # type, so its error names neither the edited symbol nor the edited
+        # file. A one-hop closure does not reach it, and that is the exact
+        # shape the last round's regression hid in.
+        "userd/d.go":
+            "package userd\n\nimport \"closureproj/usera\"\n\n"
+            "func D() int {\n\treturn usera.Val\n}\n",
+    }
+    for rel, text in files.items():
+        os.makedirs(os.path.join(goroot, os.path.dirname(rel)), exist_ok=True)
+        with open(os.path.join(goroot, rel), "w") as f:
+            f.write(text)
+    # A package that is broken on purpose and stays broken, so the warm-up
+    # below has something gopls must eventually publish. Without it "gopls has
+    # said nothing yet" and "gopls says this is clean" are the same reply, and
+    # the check would pass against a server that never woke up.
+    os.makedirs(os.path.join(goroot, "warm"))
+    with open(os.path.join(goroot, "warm", "warm.go"), "w") as f:
+        f.write("package warm\n\nfunc W() int {\n\treturn missingHelper()\n}\n")
+    b.call("open_workspace", {"root": goroot})
+    core_go = os.path.join(goroot, "core", "core.go")
+    # The probe found the false verdict got *cleaner* the warmer the server
+    # was, so this has to run against a gopls that has already loaded the
+    # module and answered for every one of these files.
+    warm = os.path.join(goroot, "warm", "warm.go")
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if b.call("diagnostics", {"file": warm}).get("count", 0) > 0:
+            break
+        time.sleep(0.5)
+    check("gopls is warm before the closure is judged",
+          b.call("diagnostics", {"file": warm}).get("count", 0) > 0, "gopls never published")
+    for rel in files:
+        b.call("diagnostics", {"file": os.path.join(goroot, rel)})
+    res = b.call("replace_symbol_body", {
+        "file": core_go, "name_path": "Compute",
+        "body": "func Compute(a int) string {\n\treturn \"x\"\n}",
+    })
+    blob = repr(res)
+    for name in ("usera/a.go", "userb/b.go", "userc/c.go", "userd/d.go"):
+        check("the verdict names %s" % name, name in blob, res)
+    reported = list(res.get("new_errors_elsewhere") or [])
+    if isinstance(res.get("diagnostics_after"), list):
+        reported += res["diagnostics_after"]
+    check("the indirect dependent's own error is reported",
+          any("usera.Val" in line for line in reported), res)
+    check("the verdict is not a clean line",
+          not str(res.get("diagnostics_after", "")).startswith("no new errors"), res)
+    # Put it back, and check the clean verdict states its own scope rather
+    # than reading as a statement about the project.
+    res = b.call("replace_symbol_body", {
+        "file": core_go, "name_path": "Compute",
+        "body": "func Compute(a int) int {\n\treturn a * 2\n}",
+    })
+    after = str(res.get("diagnostics_after", ""))
+    check("a clean verdict says which files it covered",
+          "listed under checked" in after and isinstance(res.get("checked"), list)
+          and "usera/a.go" in res["checked"] and "userd/d.go" in res["checked"], res)
+
+    # undo_edit(skip=True) leaves half a rename standing on purpose: the
+    # entry it could not reverse keeps the new name while the rest of the
+    # project goes back to the old one. The prose said so and
+    # diagnostics_after - the field read as the verdict - said "no new errors
+    # or warnings".
+    res = b.call("rename_symbol", {"file": core_go, "line": 4, "symbol": "Compute",
+                                   "new_name": "Calculate"})
+    check("the rename the undo check needs went through",
+          res.get("renamed_to") == "Calculate" and len(res.get("files", [])) > 1, res)
+    if res.get("renamed_to") == "Calculate":
+        # Change one of the renamed files behind the ledger's back, so its
+        # undo entry is refused and skip=true drops it.
+        usera = os.path.join(goroot, "usera", "a.go")
+        with open(usera) as f:
+            text = f.read()
+        with open(usera, "w") as f:
+            f.write(text.replace("func Wrap() int {", "func Wrap() int { // pinned"))
+        b.call("find_symbol", {"file": usera, "name": "Wrap"})
+        res = b.call("undo_edit", {"skip": True, "workspace": goroot})
+        blob = repr(res)
+        check("undo_edit reports the file it did not undo",
+              "usera/a.go" in blob and not
+              str(res.get("diagnostics_after", "")).startswith("no new errors or warnings"),
+              res)
+        b.call("undo_edit", {"all": True, "skip": True, "workspace": goroot})
+        with open(usera, "w") as f:
+            f.write(text)
+        b.call("find_symbol", {"file": usera, "name": "Wrap"})
+
+    # delete_file had no closure pass at all and phrased its verdict as
+    # covering the project.
+    res = b.call("delete_file", {"file": os.path.join(goroot, "userd", "d.go")})
+    after = str(res.get("diagnostics_after", ""))
+    check("delete_file states the scope of its verdict",
+          "checked" in res or "no other file using what this file declared" in after
+          or "importers were not checked" in after, res)
+    res = b.call("delete_file", {"file": core_go})
+    blob = repr(res)
+    check("delete_file reports the files that used the deleted one",
+          all(name in blob for name in ("usera/a.go", "userb/b.go", "userc/c.go")), res)
+    b.call("close_workspace", {"root": goroot})
 
 
 def group_search(c):

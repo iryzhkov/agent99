@@ -17,6 +17,7 @@ local position_params, fresh_buf, enabled_lsp_configs_for =
     core.position_params, core.fresh_buf, core.enabled_lsp_configs_for
 local resolve_symbol, doc_block_start, decl_block_top =
     index.resolve_symbol, index.doc_block_start, index.decl_block_top
+local closure = require("agent99.closure")
 
 -- Neovim 0.12 moved the diff to vim.text.diff and deprecated vim.diff; one
 -- name for it here keeps the rest of the file indifferent to the version.
@@ -1163,6 +1164,161 @@ local function wait_for_diagnostics(bufnr, root, wait_ms, settle_ms, since, acks
     return published, done, basis
 end
 
+-- The closure files are asked at the same moment the edited file is, so the
+-- two waits overlap instead of running end to end.
+local function closure_barriers(also)
+    local out = {}
+    for b in pairs(also or {}) do
+        if vim.api.nvim_buf_is_valid(b) and #vim.lsp.get_clients({ bufnr = b }) > 0 then
+            local uri = vim.uri_from_bufnr(b)
+            local acks, names, used = {}, {}, nil
+            for _, c in ipairs(vim.lsp.get_clients({ bufnr = b })) do
+                -- A pull-diagnostics request where the server offers one.
+                -- documentSymbol - the barrier the edited file gets - comes
+                -- off the syntax tree and is answered long before the server
+                -- has type-checked anything, which is how four broken Go
+                -- packages passed a wait that had "acknowledged" all four.
+                -- textDocument/diagnostic is answered only once the server
+                -- has worked out what this file's problems are, so its reply
+                -- is a real point to measure the quiet from. The answer
+                -- itself is not read: it lands in a namespace of its own and
+                -- would be counted twice beside the server's own publish.
+                local method, params
+                if c:supports_method("textDocument/diagnostic", b) then
+                    method = "textDocument/diagnostic"
+                    params = { textDocument = { uri = uri } }
+                elseif c:supports_method("textDocument/documentSymbol", b) then
+                    method = "textDocument/documentSymbol"
+                    params = { textDocument = { uri = uri } }
+                end
+                local name = c.name
+                -- Not recorded in last_ack: that ring is how the settle for
+                -- the edited file is learned, and a pull answered after a
+                -- whole-package type-check would teach it the wrong number.
+                if method and c:request(method, params, function()
+                        acks[name] = vim.uv.now()
+                    end, b) then
+                    acks[name] = false
+                    names[#names + 1] = name
+                    used = method:match("[^/]+$")
+                end
+            end
+            if next(acks) ~= nil then
+                out[#out + 1] = { bufnr = b, acks = acks, names = names, method = used }
+            end
+        end
+    end
+    return out
+end
+
+-- What a server does after an edit, learned per workspace. gopls answers for
+-- the file it was told about within a couple of hundred milliseconds and
+-- publishes the packages that depend on it about a second later, in a second
+-- wave; lua_ls publishes once and never comes back. Waiting out the gopls
+-- wave on every lua_ls edit would cost a second for nothing, and not waiting
+-- it costs the whole point of the closure - so how long to hold on for is
+-- learned from what the server has actually done here, the same way the
+-- settle is.
+local closure_wave = {}          -- [root][name] = { lag = worst ms seen, quiet = n }
+local CLOSURE_GRACE_MS = 1200    -- before anything is known about the server
+local CLOSURE_QUIET_AFTER = 3    -- closure waits with no second wave = it has none
+
+local function closure_grace(root, names)
+    local grace = 0
+    for _, name in ipairs(names or {}) do
+        local e = per_root(closure_wave, root)[name]
+        local ms
+        if e and e.lag then
+            ms = math.floor(e.lag * 1.5 + 100)
+        elseif e and e.quiet >= CLOSURE_QUIET_AFTER then
+            ms = 0
+        else
+            ms = CLOSURE_GRACE_MS
+        end
+        if ms > grace then grace = ms end
+    end
+    return grace
+end
+
+-- `lag` is how long after the edit this server's wave arrived, or nil when
+-- it never came. A wave that arrives resets the quiet count: a server that
+-- has one is not to be written off because three edits in a row changed
+-- nothing downstream.
+local function note_closure_wave(root, names, lag)
+    for _, name in ipairs(names or {}) do
+        local e = per_root(closure_wave, root)[name] or { quiet = 0 }
+        per_root(closure_wave, root)[name] = e
+        if lag then
+            e.lag = math.max(e.lag or 0, lag)
+            e.quiet = 0
+        else
+            e.quiet = e.quiet + 1
+        end
+    end
+end
+
+-- Loading a file is not asking it. The four Go packages a return-type change
+-- broke were already open in the editor, every one of them had been asked for
+-- its diagnostics moments earlier, and the reply still read "no new errors or
+-- warnings": gopls had not republished for them by the time the wait on the
+-- edited file ended. So the quiet these files are waited out for is counted
+-- from the edited file's own publish where there was one - a server that
+-- re-checks a package publishes the file it was told about first and the
+-- files that depend on it after.
+
+local function wait_for_closure(entries, root, bufnr, since, opts)
+    if #entries == 0 then return {} end
+    local deadline = since + opts.wait_ms
+    for _, e in ipairs(entries) do
+        e.settle = settle_for(root, e.names, opts.settle_ms, opts.wait_ms)
+        e.grace = closure_grace(root, e.names)
+    end
+    local function settled(e, from)
+        local now = vim.uv.now()
+        local lp = last_publish[e.bufnr]
+        if lp and lp.at >= from then
+            -- The wave arrived. Quiet after it is the ordinary signal.
+            e.how = "published"
+            return now - lp.at >= e.settle
+        end
+        local acked = all_acked(e.acks)
+        if acked then
+            e.how = "quiet"
+            return now - from >= e.grace and now - acked >= e.settle
+        end
+        return false
+    end
+    local all_done = false
+    while not all_done and vim.uv.now() < deadline do
+        -- Re-read every round: the edited file's publish may arrive while
+        -- this loop is running, and it moves the point the dependents' wave
+        -- is measured from.
+        local from = since
+        local lp = bufnr and last_publish[bufnr]
+        if lp and lp.at >= since then from = lp.at end
+        all_done = true
+        for _, e in ipairs(entries) do
+            -- No wanted version: nothing changed these buffers, so the
+            -- version the server has already answered for is the current
+            -- one, and asking for it would end the wait before the
+            -- re-publish this whole pass exists to wait for.
+            if not e.done then e.done = settled(e, from) end
+            if not e.done then all_done = false end
+        end
+        if not all_done then sleep(50) end
+    end
+    local how = {}
+    for _, e in ipairs(entries) do
+        local lp = last_publish[e.bufnr]
+        note_closure_wave(root, e.names, lp and lp.at >= since and (lp.at - since) or nil)
+        how[#how + 1] = ("%s %s/%s %s grace=%d settle=%d pub=%s"):format(
+            vim.fn.fnamemodify(vim.api.nvim_buf_get_name(e.bufnr), ":t"),
+            e.method or "?", table.concat(e.names, ","), e.done and (e.how or "?") or "timeout",
+            e.grace, e.settle, lp and tostring(lp.at - since) or "none")
+    end
+    return how
+end
+
 -- Reports not yet delivered: verdicts deferred by wait=false, and
 -- diagnostics that arrived after a report went out. Both ride on the next
 -- reply, whatever tool produces it.
@@ -1301,7 +1457,8 @@ function flush_deferred(wait)
                 -- be the one running must not consume or widen it.
                 local report = require("agent99.client").as_client(d.client, function()
                     return post_edit_report(bufnr, d.before, d.root, d.headless, opts, d.full,
-                        { since = d.since, acks = d.acks, names = d.names, label = d.label })
+                        { since = d.since, acks = d.acks, names = d.names, label = d.label,
+                          closure = d.closure, also = d.also, also_names = d.also_names })
                 end)
                 report.edit = d.label
                 report.file = vim.api.nvim_buf_get_name(bufnr)
@@ -1465,6 +1622,28 @@ end
 function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     opts = opts or post_edit_options()
     ctx = ctx or {}
+    -- The closure the caller computed before its edit: the files that use
+    -- what this edit changed, already loaded and settled. They are `also`
+    -- files like a move's referrers - this call did not edit them - and the
+    -- names it asked about are what tells one of their diagnostics apart as
+    -- this edit's doing.
+    local cl = ctx.closure
+    -- Whether the caller named the extra files itself, before the closure is
+    -- folded in. It is what makes a change "structural" below, and a closure
+    -- must not: every symbol edit has one now, and hanging the provisional
+    -- wording on all of them would teach the reader to skip the field.
+    local caller_also = (ctx.also and next(ctx.also) ~= nil) or false
+    if cl then
+        local also = ctx.also or {}
+        for b in pairs(cl.also) do
+            -- A buffer this call edited itself is `own`, and `own` is the
+            -- stronger claim: `also` reports errors from a file and drops its
+            -- warnings, which is right for a file the call only read.
+            if not (ctx.own and ctx.own[b]) then also[b] = true end
+        end
+        ctx.also = also
+        ctx.also_names = ctx.also_names or cl.names
+    end
     local label = ctx.label or (bufnr and edit_label("edit", bufnr)) or "edit"
     local ft = bufnr and vim.bo[bufnr].filetype or ""
     -- Kick nvim-lint before waiting so its diagnostics join the same report.
@@ -1490,6 +1669,10 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
             -- The version the servers were told about, so the deferred check
             -- can use the same exact signal the waiting path does.
             version = vim.lsp.util.buf_versions and vim.lsp.util.buf_versions[bufnr] or nil,
+            -- The closure was computed before the edit; a deferred verdict
+            -- covers the same files a waited one would, or it would answer a
+            -- narrower question than the caller asked.
+            closure = cl, also = ctx.also, also_names = ctx.also_names,
         }
         return {
             diagnostics_after = "deferred: the server's verdict on this edit comes with the next reply "
@@ -1499,12 +1682,16 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     -- Whether the wait actually obtained a verdict. `settled` false means the
     -- budget expired first, and every "no new errors" below is then a guess
     -- about a server that had not finished answering.
+    -- Sent before the wait below, not after it: the closure's servers get
+    -- the same barrier at the same moment, so the two waits overlap.
+    local closure_wait = closure_barriers(ctx.also)
     local basis = "published"
     if attached then
         local _, _, how = wait_for_diagnostics(bufnr, root, opts.wait_ms, opts.settle_ms,
             since, acks, names)
         basis = how
     end
+    local closure_how = wait_for_closure(closure_wait, root, bufnr, since, opts)
     local report = {}
     -- AGENT99_DEBUG_VERDICT surfaces which signal the wait actually got, which
     -- is otherwise only visible through the wording it produces. Worth keeping:
@@ -1656,7 +1843,7 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     local scope = also_touched > 0 and "the files this call edited" or "this file"
     -- A move, a rename or a glob pattern: more than one file, and the kind of
     -- change whose breakage lands in a file the reply is not looking at.
-    local structural = also_touched > 0 or (ctx.also and next(ctx.also) ~= nil) or false
+    local structural = also_touched > 0 or caller_also
     local silent = attached and silent_server(bufnr, names) or nil
     -- Everything above counts errors and warnings only. In a JavaScript file
     -- with no tsconfig the server has nothing stronger than a hint to say
@@ -1683,7 +1870,13 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     if debug_verdict then
         report.verdict_basis = basis
         report.verdict_stamps = (vim.inspect(stamps_version):gsub("%s+", " "))
+        if #closure_how > 0 then report.verdict_closure = closure_how end
     end
+    -- What the verdict actually covered, as a clause. Not decoration: "no new
+    -- errors or warnings" with nothing after it reads as a statement about
+    -- the project, and it was one about a single file. Every clean verdict
+    -- below names its own scope, whether or not a closure was computed.
+    local covers = closure.clause(cl, scope)
     local not_analyzed = bufnr and not_analyzed_reason(bufnr) or nil
     if not_analyzed then
         -- Reporting "no new errors" here would be a straight lie: the server
@@ -1700,15 +1893,22 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     elseif not attached and bufnr then
         report.diagnostics_after = "no language server attached to this file; nothing checked"
     elseif not bufnr then
-        report.diagnostics_after = #new_elsewhere == 0
-            and "no new errors elsewhere in the project" or nil
+        -- delete_file: nothing is left to report against, and the old line
+        -- claimed the project on the strength of whatever happened to be
+        -- open. What it can honestly say is which files were asked - the
+        -- ones that used what the deleted file declared.
+        if #new_here > 0 then
+            report.diagnostics_after = new_here
+        elseif #new_elsewhere == 0 then
+            report.diagnostics_after = "no new errors" .. closure.clause_gone(cl)
+        end
     elseif #new_here == 0 and basis == "timeout" then
         -- The budget ran out before the servers had finished. Saying "no new
         -- errors" here asserts a verdict that was never given; whatever the
         -- server says next arrives under late_diagnostics on a later reply.
-        report.diagnostics_after = ("nothing new so far, but the server had not finished "
+        report.diagnostics_after = ("nothing new so far%s, but the server had not finished "
             .. "answering within %d ms, so this verdict is provisional: anything that arrives "
-            .. "later comes with a later reply under late_diagnostics"):format(opts.wait_ms)
+            .. "later comes with a later reply under late_diagnostics"):format(covers, opts.wait_ms)
     elseif #new_here == 0 and basis == "unmeasured" and structural then
         -- The servers answered the barrier and then stayed quiet for as long
         -- as the settle guess allowed. For a server whose publish lag has
@@ -1722,20 +1922,20 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         -- reader to skip the field, which is the failure this whole line of
         -- work exists to prevent. A move, a rename or a glob pattern is where
         -- the late answer actually lands, and where it costs the most.
-        report.diagnostics_after = "nothing new so far, but no server had published for this "
-            .. "file when the wait ended and none of them has been timed in this workspace "
-            .. "yet, so this verdict is provisional: what arrives later comes with a later "
-            .. "reply under late_diagnostics. A structural change is worth confirming with "
-            .. "check_project or diagnostics before it is treated as finished"
+        report.diagnostics_after = ("nothing new so far%s, but no server had published for "
+            .. "this file when the wait ended and none of them has been timed in this "
+            .. "workspace yet, so this verdict is provisional: what arrives later comes with "
+            .. "a later reply under late_diagnostics. A structural change is worth confirming "
+            .. "with check_project or diagnostics before it is treated as finished"):format(covers)
     elseif #new_here == 0 and silent then
         -- The servers on this file answered the barrier and then said nothing,
         -- and none of them has published a single diagnostic anywhere in this
         -- session. That is what bash-language-server does for a file holding a
         -- deliberate syntax error, so the silence is not a verdict.
-        report.diagnostics_after = ("no new errors or warnings, but %s has published no "
+        report.diagnostics_after = ("no new errors or warnings%s, but %s has published no "
             .. "diagnostics at all in this session, so its silence is not yet evidence that "
             .. "this file is clean; check_project runs the project's own build or check")
-            :format(silent)
+            :format(covers, silent)
     elseif #new_here == 0 and #hints > 0 and not strong_here then
         -- The server has hints for these files and has never had anything
         -- stronger to say about them, so "errors or warnings" is an empty
@@ -1751,11 +1951,11 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         -- Worth one clause on a structural change, because the alternative
         -- wording on this branch is "provisional": here the servers stamped a
         -- publish for the exact text that was written, so nothing is inferred.
-        report.diagnostics_after = "no new errors or warnings, and every server on this file "
-            .. "published for the version this edit wrote, so that is their answer rather "
-            .. "than a guess from how long they stayed quiet"
+        report.diagnostics_after = ("no new errors or warnings%s, and every server on this "
+            .. "file published for the version this edit wrote, so that is their answer "
+            .. "rather than a guess from how long they stayed quiet"):format(covers)
     elseif #new_here == 0 then
-        report.diagnostics_after = "no new errors or warnings"
+        report.diagnostics_after = "no new errors or warnings" .. covers
     else
         report.diagnostics_after = new_here
         -- A server analyzes one build configuration and can lag a change it
@@ -1764,6 +1964,10 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         report.if_unexpected = "these come from the language server; check_project "
             .. "runs the project's own build or check for ground truth"
     end
+    -- The closure, listed whatever the verdict says: a reply that does report
+    -- new errors still has to say what it looked at, or the reader cannot
+    -- tell a short list from a narrow one.
+    closure.attach(report, cl)
     -- A multi-file edit takes its verdict from the buffer it was addressed to,
     -- and the rest only ever reached the reply through `preexisting`: three Go
     -- files behind a build tag, which the server had declined to analyze,
@@ -2089,7 +2293,7 @@ end
 -- Shared tail of every edit tool: the lines are already in the buffer;
 -- polish (format, imports), record the final region in the ledger, and
 -- build the reply with the post-edit report.
-local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_old, old_lines, count, fields, regions)
+local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_old, old_lines, count, fields, regions, cl)
     local opts = post_edit_options(args)
     -- The whole file as the edit left it, before any polish. Organizing
     -- imports rewrites the import block, which is above the edited region
@@ -2203,7 +2407,7 @@ local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_o
     end
     return vim.tbl_extend("error", fields,
         post_edit_report(bufnr, before, args.root, args.headless, opts, args.full_diagnostics,
-            { label = edit_label(kind, bufnr) }))
+            { label = edit_label(kind, bufnr), closure = cl }))
 end
 
 -- A unified diff of what an edit would do, for the dry_run of the tools that
@@ -2291,10 +2495,16 @@ local function replace_symbol_body(args)
     local conflict = primary_region_conflict(bufnr, entry.first, entry.last)
     if conflict then err(conflict) end
     settle_before_edit(bufnr)
+    -- Asked while the declaration is still where the server expects it, and
+    -- before the snapshot, so the problems these files already had are in the
+    -- baseline and only what this edit breaks in them is new.
+    local cl = closure.plan({
+        bufnr = bufnr, root = args.root, seeds = { entry }, settle = settle_before_edit,
+    })
     local before = diag_snapshot()
     vim.api.nvim_buf_set_lines(bufnr, entry.first - 1, entry.last, false, new_lines)
     return finish_edit(bufnr, args, before, entry.path, "replace", entry.first, entry.last,
-        old, #new_lines, { replaced = entry.path, reindented = reindented })
+        old, #new_lines, { replaced = entry.path, reindented = reindented }, nil, cl)
 end
 
 -- Join lines with each one's indentation dropped. Text that a format pass
@@ -2927,6 +3137,18 @@ local function replace_symbol_lines(args)
     end
 
     settle_before_edit(bufnr)
+    -- The declarations these chunks are inside, and the files that use them:
+    -- a chunk that changes a signature breaks its callers, and this is what
+    -- gets those files loaded and asked before the verdict is taken.
+    local seeds = {}
+    for _, c in ipairs(chunks) do
+        if c.entry then seeds[#seeds + 1] = c.entry end
+    end
+    local cl = closure.plan({
+        bufnr = bufnr, root = args.root, settle = settle_before_edit,
+        seeds = #seeds > 0 and seeds or nil,
+        region = { first = chunks[1].abs_first, last = chunks[#chunks].abs_last },
+    })
     local before = diag_snapshot()
     -- Bottom-up, so a chunk's replacement never shifts the ones above it.
     local span_first, span_last = chunks[1].abs_first, chunks[#chunks].abs_last
@@ -2964,7 +3186,7 @@ local function replace_symbol_lines(args)
         or ("%d symbols:%d-%d"):format(symbols, span_first, span_last)
     local result = finish_edit(bufnr, args, before, ledger_path,
         "replace_lines", span_first, span_last, span_old, #span_old + delta,
-        { replaced = label }, symbols > 1 and regions or nil)
+        { replaced = label }, symbols > 1 and regions or nil, cl)
     if #anchored > 0 then
         result.expect_was_a_prefix = anchored
     end
@@ -3184,6 +3406,28 @@ local function undo_edit(args)
         return out
     end
     local last_bufnr
+    -- The closure of what is about to be put back, worked out before the
+    -- snapshot: an undo puts an older shape of a symbol back and breaks the
+    -- files that had been updated to the new one, and skip=true leaves half a
+    -- rename standing on purpose. The reply said "no new errors or warnings"
+    -- with an import in another file naming a symbol the undo had just
+    -- removed.
+    local target_files = edits.pending_files(count)
+    local cl
+    for _, path in ipairs(target_files) do
+        local okb, b = pcall(load_buf, path)
+        if okb then
+            settle_before_edit(b)
+            -- extra_paths: the other files this undo step touches belong in
+            -- the closure whatever the reference graph says, because half of
+            -- a rename left standing is exactly what skip=true produces.
+            local part = closure.plan({
+                bufnr = b, root = args.root, settle = settle_before_edit,
+                extra_paths = target_files,
+            })
+            cl = cl and closure.merge(cl, part) or part
+        end
+    end
     local before = diag_snapshot()
     local undone, refused, dropped = edits.undo_last(count, args.skip == true)
     local out = {}
@@ -3233,8 +3477,16 @@ local function undo_edit(args)
                 end
             end
         end
+        -- Every buffer this undo wrote to, not only the last one: the rest
+        -- reached the reply as "elsewhere in the project" - errors only, and
+        -- unattributed - though the undo is exactly what put them there.
+        local own = {}
+        for _, e in ipairs(undone) do
+            if e.bufnr and vim.api.nvim_buf_is_valid(e.bufnr) then own[e.bufnr] = true end
+        end
         result = vim.tbl_extend("error", result,
-            post_edit_report(last_bufnr, before, args.root, args.headless, opts, args.full_diagnostics))
+            post_edit_report(last_bufnr, before, args.root, args.headless, opts,
+                args.full_diagnostics, { own = own, closure = cl }))
         result.note = edit_note(args)
     end
     return result
@@ -4046,6 +4298,13 @@ local function move_file(args)
     -- name, and the move is not what put them there.
     local from_buf = load_buf(from)
     settle_before_edit(from_buf)
+    -- The files that name this module. A server that rewrites imports on a
+    -- rename rewrites theirs; one that addresses modules by a string it does
+    -- not rename leaves them broken, and those are the files whose diagnostic
+    -- says so.
+    local cl = closure.plan({
+        bufnr = from_buf, root = args.root, settle = settle_before_edit,
+    })
     local before = diag_snapshot()
     local prefix = from .. "|"
     for sig, n in pairs(vim.deepcopy(before)) do
@@ -4106,7 +4365,8 @@ local function move_file(args)
             .. "grep for the old module path - because no diagnostic covers it."
     end
     return vim.tbl_extend("force", result,
-        post_edit_report(bufnr, before, args.root, args.headless, nil, args.full_diagnostics))
+        post_edit_report(bufnr, before, args.root, args.headless, nil, args.full_diagnostics,
+            { closure = cl }))
 end
 
 local function delete_file(args)
@@ -4123,6 +4383,16 @@ local function delete_file(args)
     end
 
     local files = { { uri = file_uri(path) } }
+    -- Asked while the file is still here: once it is gone there is no buffer
+    -- to ask from, which is why this tool had no closure pass at all and
+    -- still phrased its verdict as covering the project. A delete breaks
+    -- exactly the files that used what it declared.
+    local okd, doomed = pcall(load_buf, path)
+    local cl
+    if okd then
+        settle_before_edit(doomed)
+        cl = closure.plan({ bufnr = doomed, root = args.root, settle = settle_before_edit })
+    end
     local before = diag_snapshot()
     local touched = apply_will_file_operation("workspace/willDeleteFiles", files)
     flush_before_file_op(path, args.headless, "delete")
@@ -4168,8 +4438,10 @@ local function delete_file(args)
     if #touched > 0 then
         result.updated_by_server = touched
     end
-    -- No buffer left to report against, so report the project-wide picture.
-    local report = post_edit_report(nil, before, args.root, args.headless, nil, args.full_diagnostics)
+    -- No buffer left to report against: the verdict is what the files that
+    -- used this one say now.
+    local report = post_edit_report(nil, before, args.root, args.headless, nil,
+        args.full_diagnostics, { closure = cl })
     report.file = nil
     return vim.tbl_extend("force", result, report)
 end
@@ -4197,8 +4469,6 @@ local function trailing_return_row(bufnr)
     return srow
 end
 
-local MOVE_REFERRERS_MAX = 20
-
 
 -- Collapse the run of blank lines that meets at `row` (1-based, the first line
 -- after a removal) down to `keep`, and to nothing at the top or the bottom of
@@ -4221,47 +4491,9 @@ local function collapse_blanks(bufnr, row, keep)
     vim.api.nvim_buf_set_lines(bufnr, first - 1 + want, last, false, {})
 end
 
--- The files, other than the two this move edits, that reference the symbols
--- about to move. move_symbols reorganizes the imports of the source and the
--- destination and of nothing else, so a third file importing a moved name
--- from its old module keeps a stale import and an ImportError at run time,
--- and no diagnostic in either edited file says so. Asked before the move,
--- while the declarations are still where the server expects them.
-local function referring_files(bufnr, moving, exclude)
-    local client = core.client_for(bufnr, "textDocument/references")
-    if not client then return nil end
-    local out, seen = {}, {}
-    for _, m in ipairs(moving) do
-        local name = m.path:match("[^%.:/]+$") or m.path
-        local line, col
-        for i = m.first, m.last do
-            local text = vim.api.nvim_buf_get_lines(bufnr, i - 1, i, false)[1] or ""
-            local s = text:find(name, 1, true)
-            if s then
-                line, col = i, s
-                break
-            end
-        end
-        if line then
-            local ok, refs = pcall(request, client, bufnr, "textDocument/references", {
-                textDocument = { uri = vim.uri_from_bufnr(bufnr) },
-                position = { line = line - 1, character = col - 1 },
-                context = { includeDeclaration = false },
-            })
-            for _, r in ipairs(ok and type(refs) == "table" and refs or {}) do
-                local file = r.uri and vim.uri_to_fname(r.uri)
-                if file and not exclude[file] and not seen[file]
-                    and #out < MOVE_REFERRERS_MAX then
-                    seen[file] = true
-                    out[#out + 1] = file
-                end
-            end
-        end
-    end
-    table.sort(out)
-    return out
-end
-
+-- The files other than the two this move edits, and what breaks in them, are
+-- worked out by the shared closure pass in agent99.closure - move_symbols had
+-- the first version of it, one hop deep and its own.
 -- Move whole symbols from one file to another.
 --
 -- Splitting an oversized file is a symbol operation that no symbol tool could
@@ -4432,22 +4664,20 @@ local function move_symbols(args)
     settle_before_edit(to_buf)
     -- Load the files that reference the moved symbols before the snapshot is
     -- taken, so the problems they already have are in the baseline and only
-    -- what this move breaks in them is reported.
-    local referrers = referring_files(from_buf, moving,
-        { [vim.fn.fnamemodify(args.from, ":p")] = true, [to_path] = true })
-    local own, also, also_checked = { [from_buf] = true }, {}, {}
-    for _, file in ipairs(referrers or {}) do
-        local okb, b = pcall(load_buf, file)
-        if okb then
-            settle_before_edit(b)
-            -- `also`, not `own`: this call did not edit these files, so only a
-            -- diagnostic naming one of the moved symbols is its doing. Filing
-            -- them under `own` charged one move with three pre-existing
-            -- warnings in a test file it had never touched.
-            also[b] = true
-            also_checked[#also_checked + 1] = rel_path(file)
-        end
-    end
+    -- what this move breaks in them is reported. This is the pass every edit
+    -- tool now shares; move_symbols had a one-hop version of it first, and
+    -- the shared one reaches a file that breaks through one of these rather
+    -- than through the moved symbol itself.
+    --
+    -- The closure's files are `also`, not `own`: this call did not edit them,
+    -- so only a diagnostic naming one of the moved symbols is its doing.
+    -- Filing them under `own` charged one move with three pre-existing
+    -- warnings in a test file it had never touched.
+    local cl = closure.plan({
+        bufnr = from_buf, root = args.root, seeds = moving, settle = settle_before_edit,
+        exclude = { [vim.fn.fnamemodify(args.from, ":p")] = true, [to_path] = true },
+    })
+    local own, also = { [from_buf] = true }, cl.also
     local before = diag_snapshot()
 
     -- Append to the destination, then delete from the source bottom upwards so
@@ -4593,23 +4823,24 @@ local function move_symbols(args)
             .. "old call sites now resolve to nothing. Export them there and import them "
             .. "where they are called, or move them back"):format(rel_path(to_path))
     end
-    if #also_checked > 0 then
-        result.also_checked = also_checked
-        -- Not "anything this move broke in them is reported below": that is a
-        -- promise the verdict cannot keep when the server answers after the
-        -- reply has gone out, and a move that did break one of these files
-        -- came back clean. Say what was done, not what was guaranteed.
-        result.also_checked_note = "these files reference the moved symbols. They were loaded "
-            .. "so the server would look at them, and a diagnostic naming one of the moved "
-            .. "symbols in them is listed with this edit's own; their imports were not "
-            .. "rewritten, so check them before treating the move as finished"
-    elseif referrers then
+    -- The list itself comes back under `checked`, with the rest of the
+    -- closure; what is move-specific is the warning, because move_symbols
+    -- reorganizes the imports of the two files it edits and of nothing else.
+    -- Not "anything this move broke in them is reported below": that is a
+    -- promise the verdict cannot keep when the server answers after the
+    -- reply has gone out, and a move that did break one of these files came
+    -- back clean. Say what was done, not what was guaranteed.
+    if #cl.checked > 0 then
+        result.also_checked_note = "the files under checked use what moved. Their imports were "
+            .. "not rewritten - this tool reorganizes the two files it edits and no others - "
+            .. "so check them before treating the move as finished"
+    elseif cl.computable then
         result.also_checked_note = "the server reports no other file referencing the moved "
             .. "symbols, so only the two files above needed changing"
     else
-        result.also_checked_note = "the language server here answers no reference requests, so "
-            .. "nothing could be checked about other files that use the moved symbols; grep "
-            .. "for their names before treating this move as finished"
+        result.also_checked_note = ("%s, so nothing could be checked about other files that "
+            .. "use the moved symbols; grep for their names before treating this move as "
+            .. "finished"):format(cl.reason)
     end
     local moved_names = {}
     for _, m in ipairs(moving) do
@@ -4617,7 +4848,7 @@ local function move_symbols(args)
     end
     return vim.tbl_extend("force", result,
         post_edit_report(to_buf, before, args.root, args.headless, opts, args.full_diagnostics,
-            { own = own, also = also, also_names = moved_names }))
+            { own = own, also = also, also_names = moved_names, closure = cl }))
 end
 M.post_edit_options = post_edit_options
 M.organize_imports = organize_imports

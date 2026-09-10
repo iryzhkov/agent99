@@ -127,6 +127,33 @@ function M.others()
     return { clients = clients, steps = steps }
 end
 
+--- The files the newest `n` steps of this client's ledger touch, absolute
+--- paths, newest first. Asked before an undo, so the files that use what is
+--- about to be put back can be loaded while the diagnostics baseline is still
+--- the pre-undo one. Same step grouping as undo_last, so the two agree about
+--- what one step is.
+function M.pending_files(n)
+    local current = ledger()
+    local todo = n or M.operations()
+    local step_group, out, seen = nil, {}, {}
+    for i = #current, 1, -1 do
+        if todo <= 0 then break end
+        local e = current[i]
+        if step_group == nil then
+            step_group = e.group
+        elseif e.group ~= step_group then
+            todo = todo - 1
+            step_group = e.group
+            if todo == 0 then break end
+        end
+        if e.file and not seen[e.file] then
+            seen[e.file] = true
+            out[#out + 1] = e.file
+        end
+    end
+    return out
+end
+
 --- Undo the newest `n` edits this client recorded (all of them when n is
 --- nil), newest first, and drop them from its ledger. Another client's
 --- entries are not in this ledger and are never reached. Each edit is checked
