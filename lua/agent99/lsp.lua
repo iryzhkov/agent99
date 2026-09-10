@@ -692,7 +692,61 @@ end
 -- of the name the index gives it. A Go method is indexed `(*Archiver).Do`
 -- and called `a.Do(...)`; a Lua one is `M.greet` and called `util.greet(...)`.
 local function bare_name(name)
+    -- A server may spell the signature into the name: jdtls calls a Java
+    -- method "main(String[])" and "accumulate(List<Integer>) : int". None of
+    -- that is written at a call site, and a reference request made against
+    -- the whole string finds nothing. Only when something precedes the
+    -- parenthesis, so a Go method indexed `(*Archiver).Do` keeps its
+    -- receiver for the component split below.
+    local head = name:match("^([^%(%)]+)%(")
+    if head then
+        name = vim.trim(head)
+    end
     return name:match("[^%.:/]+$") or name
+end
+
+-- What a declaration's kind says about the two things this tool has to tell
+-- apart. A container holds other declarations - a class, a struct, an impl
+-- block, a Ruby module - and what is declared inside one is a member, named
+-- and reachable from outside it. Something callable holds statements, and
+-- what is declared inside one is a local, which nothing outside can name.
+--
+-- Deliberately separate from index.lua's TS_CONTAINER, which decides how far
+-- workspace_map descends: this has to read the language server's SymbolKind
+-- names ("Class", "Method") as well as treesitter node types, and widening
+-- the map's table would change what every map descends into.
+local DECL_CONTAINER = {
+    class = true, struct = true, interface = true, impl = true, trait = true,
+    enum = true, module = true, mod = true, namespace = true, object = true,
+    record = true, union = true, protocol = true, section = true,
+}
+
+local DECL_CALLABLE = {
+    ["function"] = true, method = true, constructor = true, subroutine = true,
+    lambda = true, closure = true,
+}
+
+-- Segment by segment, lower-cased, so both `class_declaration` and `Class`
+-- answer the same. Callable wins: a `method_declaration` is not a container
+-- because "declaration" is not one either, and a Rust `function_item` must
+-- not be read as a container just because some other segment matches.
+local function kind_segments(kind)
+    local container, callable = false, false
+    for segment in tostring(kind or ""):lower():gmatch("%a+") do
+        if DECL_CALLABLE[segment] then callable = true end
+        if DECL_CONTAINER[segment] then container = true end
+    end
+    return container and not callable, callable
+end
+
+local function holds_declarations(kind)
+    local container = kind_segments(kind)
+    return container
+end
+
+local function is_callable(kind)
+    local _, callable = kind_segments(kind)
+    return callable
 end
 
 -- The line inside the symbol that carries its name, which is where a
@@ -704,7 +758,7 @@ local function name_line(lines, entry)
     -- "M.noop" would put it on the M, and the answer would then be about M:
     -- its other uses are real references and the symbol looks alive. The
     -- last component is the one being declared here.
-    local name = entry.name:match("[^%.:/]+$") or entry.name
+    local name = bare_name(entry.name)
     -- Whole word only: "get" inside "widget" or "getter" is not the name,
     -- and a request made there would be about the other identifier.
     local pattern = "%f[%w_]" .. name:gsub("%W", "%%%0") .. "%f[^%w_]"
@@ -772,15 +826,45 @@ local function references_outside(bufnr, path, entry, lines, client, root, cache
         -- the tree, or inside a string literal, counted as referenced -
         -- which is most functions worth deleting. The classifier grep uses
         -- settles it; a hit it cannot classify counts, as before.
+        --
+        -- The classifier needs the column and the search reports none, so
+        -- every hit used to be classified at column 1. On
+        -- `const note = "zdeadInString is named here"` that is the `const`,
+        -- which is code, so the string mention counted as a reference and
+        -- the dead function was dropped from the reply without a word.
+        -- Every whole-word occurrence of the name on the line is classified
+        -- instead, and the hit counts when any one of them is code.
+        local pattern = "%f[%w_]" .. key:gsub("%W", "%%%0") .. "%f[^%w_]"
         local code_hits = {}
         for _, hit in ipairs(hits) do
             local okb, hbuf = pcall(load_buf, hit.file)
-            local kind = nil
+            local is_code = not okb
             if okb then
-                local oke, k = pcall(index.classify_hit, hbuf, hit.line, hit.col or 1, nil)
-                kind = oke and k or nil
+                local text = vim.api.nvim_buf_get_lines(hbuf, hit.line - 1, hit.line, false)[1]
+                local from, found_any = 1, false
+                while text do
+                    local s = text:find(pattern, from)
+                    if not s then
+                        break
+                    end
+                    found_any = true
+                    local oke, k = pcall(index.classify_hit, hbuf, hit.line, s, nil)
+                    local kind = oke and k or nil
+                    if kind ~= "comment" and kind ~= "string" then
+                        is_code = true
+                        break
+                    end
+                    from = s + 1
+                end
+                -- The line no longer holds the name at all - the buffer has
+                -- moved on since the search ran. There is nothing to
+                -- classify, so it counts, the way an unclassifiable hit
+                -- always has.
+                if not found_any then
+                    is_code = true
+                end
             end
-            if kind ~= "comment" and kind ~= "string" then
+            if is_code then
                 code_hits[#code_hits + 1] = hit
             end
         end
@@ -827,6 +911,14 @@ local function references_outside(bufnr, path, entry, lines, client, root, cache
         -- against the text search, which knows nothing about modules; when
         -- that cannot run either, the server's answer stands.
         local text = text_count()
+        if text and text > 0 then
+            -- Which of the two answers won is the reply's to explain.
+            -- Returning the text search's number alone dropped the symbol
+            -- from the list with nothing to say that the server had called
+            -- it dead, so the reader could not tell a stale call site from
+            -- a live one.
+            return text, text
+        end
         return text or 0
     end
     return text_count()
@@ -841,16 +933,34 @@ end
 -- those and nothing can delete them, so they are noise in this list.
 local function anonymous(entry)
     local name = entry.name or ""
+    -- A server that spells the signature into the name writes a
+    -- zero-argument method as `deadPerimeter()`, and the placeholder test
+    -- below read the empty parentheses as an anonymous declaration and
+    -- dropped a real method unchecked. Strip the signature first: what is
+    -- left of `()` on its own is still `()`.
+    local bare = bare_name(name)
     -- Anchored: a server's placeholder for an anonymous function is called
     -- `callback`, but `handle_callback` is a function somebody wrote and can
     -- delete, and the unanchored match dropped it from the list unchecked.
-    return name == "" or name:find("^<") ~= nil or name:find("%(%)") ~= nil
-        or name:match("^callback%d*$") ~= nil or name:find("^line%d+$") ~= nil
+    return bare == "" or bare:find("^<") ~= nil or bare:find("%(%)") ~= nil
+        or bare:match("^callback%d*$") ~= nil or bare:find("^line%d+$") ~= nil
 end
 
-local function entry_point(entry, path)
+-- A name the language's own runtime calls rather than a call site: Python's
+-- special methods, Ruby's constructor. Nothing in the source names one, so a
+-- zero-reference answer says nothing about it - the same reason a program's
+-- entry point is skipped. Only for a member of a container: a plain function
+-- somebody called `initialize` is called by name like any other.
+local function runtime_invoked(name)
+    return name:match("^__.+__$") ~= nil or name == "initialize"
+end
+
+local function entry_point(entry, path, is_member)
     local name = bare_name(entry.name)
     if name == "main" or name == "init" or name == "setup" or name == "teardown" then
+        return true
+    end
+    if is_member and runtime_invoked(name) then
         return true
     end
     if not core.is_test_path(rel_path(path)) then
@@ -875,11 +985,92 @@ end
 -- file does declare (`M.greet` after `local M = {}`) is a real declaration
 -- and stays.
 local function foreign_field(entry, declared_here)
+    -- A declaration of something callable, or of something that holds
+    -- declarations, is not a setting whoever the head names: a Go method
+    -- indexed `(*Archiver).Do` has a head this file never declares and is
+    -- still a method somebody wrote and can delete.
+    if is_callable(entry.kind) or holds_declarations(entry.kind) then
+        return false
+    end
     local head = (entry.name or ""):match("^[^%.:]+")
     if not head or head == entry.name then
         return false
     end
     return not declared_here[head]
+end
+
+-- Whether every declaration this one sits inside holds declarations rather
+-- than statements. A method of a class does: it has a name of its own, it is
+-- called through its receiver from anywhere, and a reference request answers
+-- about it. A helper inside a function does not, and neither does a method
+-- of a class that is itself declared inside a function.
+--
+-- The old test was the presence of a "/" in the name path, which made every
+-- method of every class a local: in Java that left 3 of 24 declarations
+-- examined, with both of the fixture's planted dead methods among the ones
+-- "declared inside another symbol (locals, parameters, nested functions)".
+local function local_of_a_body(entry, by_path)
+    local path = entry.path or entry.name or ""
+    local prefix
+    for part in path:gmatch("[^/]+") do
+        if prefix then
+            local parent = by_path[prefix]
+            -- An enclosing declaration the index does not carry cannot be
+            -- classified, and the old behaviour is what to fall back to.
+            if not parent or not holds_declarations(parent.kind) then
+                return true
+            end
+        end
+        prefix = prefix and (prefix .. "/" .. part) or part
+    end
+    return false
+end
+
+-- How long to wait for a language server before answering a file from a
+-- text search instead. A cold first call fell straight through to the text
+-- search because nothing had attached yet, and reported that no server had
+-- answered; the identical second call was answered by the server. The two
+-- calls disagreed about which symbols were dead, because the text search
+-- counts mentions the server does not.
+local REFERENCE_ATTACH_TIMEOUT_MS = core.ATTACH_TIMEOUT_MS
+
+-- The client that will answer reference requests for this buffer, or nil
+-- and which of the three things actually happened. "The server declined" was
+-- the only one the reply could say, and it was the wrong one in every case
+-- the probe met: a filetype with no server configured at all, and a server
+-- that had not finished starting.
+local function reference_client(bufnr, waited)
+    local client = core.client_for(bufnr, "textDocument/references")
+    if client then
+        return client
+    end
+    local ft = vim.bo[bufnr].filetype
+    local configs = core.enabled_lsp_configs_for(ft)
+    if #configs == 0 then
+        return nil, "none_configured", ft ~= "" and ft or "these files"
+    end
+    -- One wait per filetype, not one per file: forty files of a language
+    -- whose server is not coming would otherwise cost forty timeouts.
+    if not waited[ft] then
+        waited[ft] = true
+        local ok, c = pcall(core.get_client, bufnr, "textDocument/references",
+            REFERENCE_ATTACH_TIMEOUT_MS)
+        if ok and c then
+            return c
+        end
+    end
+    -- Attached without the capability is the one case in which a server
+    -- declined anything. Nothing attached at all is not.
+    local attached = vim.lsp.get_clients({ bufnr = bufnr })
+    if #attached > 0 then
+        local names = {}
+        for _, c in ipairs(attached) do
+            names[#names + 1] = c.name
+        end
+        table.sort(names)
+        return nil, "declined", table.concat(names, ", ")
+    end
+    return nil, "no_attach", table.concat(configs, ", ")
 end
 
 local function unreferenced_symbols(args)
@@ -909,55 +1100,89 @@ local function unreferenced_symbols(args)
         root = vim.fn.getcwd()
     end
     local dead, unknown, methods, cache = {}, {}, {}, {}
+    -- Symbols the server called dead and the text search did not. They are
+    -- not findings, and the reply says so rather than dropping them.
+    local disagrees = {}
     local checked = 0
     -- What was left out and why. Without this the reply asserted that every
     -- top-level symbol in a file was referenced when the file held nothing
     -- but methods and not one symbol had been examined.
     local skipped = {}
-    -- First pass: load every file and pick its top-level symbols, so the
-    -- names that need a text search are known before any search runs.
-    -- Top-level names only. A method is reached through its receiver, and a
-    -- zero-reference answer for one says more about the server than about
-    -- the code.
+    -- Why a file was answered by a text search, keyed by which of the three
+    -- reasons it was and by the detail that names it (the filetype, the
+    -- configured servers, the attached ones).
+    local no_server, waited = {}, {}
+    -- First pass: load every file and pick the symbols worth examining, so
+    -- the names that need a text search are known before any search runs.
     local work, text_names, text_seen = {}, {}, {}
     for _, f in ipairs(files) do
         local okb, bufnr = pcall(load_buf, f)
         if okb then
             local path = vim.api.nvim_buf_get_name(bufnr)
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-            local client = core.client_for(bufnr, "textDocument/references")
+            local client, no_client_why, detail = reference_client(bufnr, waited)
             methods[client and "language server" or "text search"] = true
+            if no_client_why then
+                no_server[no_client_why] = no_server[no_client_why] or {}
+                no_server[no_client_why][detail or ""] = true
+            end
             local entries = {}
+            local indexed = symbol_index(bufnr)
             -- Only undotted names count as declared here: seeding this from
             -- every entry would let `vim.opt.number` declare `vim`, and so
             -- vouch for itself.
-            local declared_here = {}
-            for _, e in ipairs(symbol_index(bufnr)) do
+            local declared_here, by_path = {}, {}
+            for _, e in ipairs(indexed) do
                 local name = e.name or ""
                 if name ~= "" and not name:find("[%.:]") then
                     declared_here[name] = true
                 end
+                if e.path then
+                    by_path[e.path] = e
+                end
             end
-            for _, e in ipairs(symbol_index(bufnr)) do
+            -- A class whose reason to exist is the entry point it declares
+            -- is an entry point too. Nothing in a Java program names `Main`,
+            -- and it was this tool's one finding on a fixture where both of
+            -- the planted dead methods had been skipped unexamined.
+            local holds_entry_point = {}
+            for _, e in ipairs(indexed) do
+                local parent = (e.path or ""):match("^(.*)/[^/]+$")
+                if parent and entry_point(e, path, true) then
+                    holds_entry_point[parent] = true
+                end
+            end
+            -- One entry per declaration. A server that spells the signature
+            -- into a name declares `Shape/deadPerimeter()` where the grammar
+            -- declares `Shape/deadPerimeter`, and the index carries both:
+            -- unexamined they cost nothing, examined they are one finding
+            -- reported twice.
+            local seen_decl = {}
+            for _, e in ipairs(indexed) do
+                local key = tostring(e.first) .. "\0" .. bare_name(e.name or "")
+                local is_member = (e.path or ""):find("/", 1, true) ~= nil
                 local why
-                if not e.name or e.name == "" or anonymous(e) then
+                if seen_decl[key] then
+                    why = "duplicate"
+                elseif not e.name or e.name == "" or anonymous(e) then
                     why = "anonymous"
-                elseif e.path:find("/", 1, true) then
+                elseif local_of_a_body(e, by_path) then
                     why = "nested"
-                elseif entry_point(e, path) then
+                elseif entry_point(e, path, is_member) or holds_entry_point[e.path or ""] then
                     why = "entry_point"
                 elseif foreign_field(e, declared_here) then
-                    why = "method_or_field"
+                    why = "foreign_field"
                 end
+                seen_decl[key] = true
                 if why then
                     skipped[why] = (skipped[why] or 0) + 1
                 elseif checked < MAX_UNREFERENCED_SYMBOLS then
                     checked = checked + 1
                     entries[#entries + 1] = e
-                    local key = bare_name(e.name)
-                    if not client and not text_seen[key] then
-                        text_seen[key] = true
-                        text_names[#text_names + 1] = key
+                    local name = bare_name(e.name)
+                    if not client and not text_seen[name] then
+                        text_seen[name] = true
+                        text_names[#text_names + 1] = name
                     end
                 end
             end
@@ -984,13 +1209,16 @@ local function unreferenced_symbols(args)
     end
     for _, w in ipairs(work) do
         for _, e in ipairs(w.entries) do
-            local n = references_outside(w.bufnr, w.path, e, w.lines, w.client, root,
+            local n, overridden = references_outside(w.bufnr, w.path, e, w.lines, w.client, root,
                 cache, args.include_tests)
             local entry = { file = w.path, line = e.first, name = e.path, kind = e.kind }
             if n == nil then
                 unknown[#unknown + 1] = entry
             elseif n == 0 then
                 dead[#dead + 1] = entry
+            elseif overridden then
+                entry.text_hits = overridden
+                disagrees[#disagrees + 1] = entry
             end
         end
     end
@@ -1003,21 +1231,29 @@ local function unreferenced_symbols(args)
     -- module of plain functions whose 85 "skipped declarations" were locals
     -- inside those functions.
     local SKIP_LABEL = {
-        method_or_field = "methods, and fields on an object this file does not declare",
-        nested = "names declared inside another symbol (locals, parameters, nested functions)",
+        foreign_field = "fields set on an object this file does not declare",
+        nested = "names declared inside a function (locals, parameters, nested functions)",
         entry_point = "entry points and tests, which have no caller by construction",
         anonymous = "anonymous declarations",
+        duplicate = "declarations the index carries twice",
     }
+    -- No reason here names an oracle the reply cannot vouch for. The one for
+    -- locals used to end "and its own server already warns when it is
+    -- unused", in replies whose adjacent field said no language server had
+    -- answered at all - and in Java, where jdtls warns about neither of the
+    -- two methods that were skipped by it.
     local SKIP_WHY = {
-        method_or_field = "a method is reached through its receiver, and a zero-reference "
-            .. "answer for one says more about the server than about the code",
-        nested = "this tool reports top-level symbols only; a local is scoped to the symbol "
-            .. "around it and its own server already warns when it is unused",
+        foreign_field = "a setting on an object declared somewhere else is not a declaration "
+            .. "anything could reference",
+        nested = "this tool reports what is addressable from outside; a local is scoped to "
+            .. "the function around it, so nothing out there can name it or delete it",
         entry_point = "nothing calls them by name, so a zero-reference answer means nothing",
         anonymous = "nothing can reference them and nothing can delete them by name",
+        duplicate = "the index carries the same line twice, once from the grammar and once "
+            .. "from the document outline, and one declaration is not two",
     }
     local skipped_total, skipped_parts, skipped_why = 0, {}, {}
-    for _, k in ipairs({ "method_or_field", "nested", "entry_point", "anonymous" }) do
+    for _, k in ipairs({ "foreign_field", "nested", "entry_point", "anonymous", "duplicate" }) do
         if skipped[k] then
             skipped_total = skipped_total + skipped[k]
             skipped_parts[#skipped_parts + 1] = ("%d %s"):format(skipped[k], SKIP_LABEL[k])
@@ -1040,13 +1276,43 @@ local function unreferenced_symbols(args)
     -- somewhere else" from a whole-word text search is a much weaker claim
     -- than the same sentence backed by the language server. The method was
     -- reported as a bare field and the summary read identically either way.
-    if res.method == "text search" then
-        res.method_note = "no language server answered reference requests for these files, so "
-            .. "this rests on a whole-word text search: a name that appears in a comment, a "
-            .. "string or a stale call site counts as a reference"
-    elseif res.method == "language server and text search" then
-        res.method_note = "some of these files were answered by the language server and some "
-            .. "by a whole-word text search, which is the weaker of the two"
+    local function named(reason)
+        local set = no_server[reason]
+        if not set then
+            return nil
+        end
+        local names = {}
+        for name in pairs(set) do
+            if name ~= "" then
+                names[#names + 1] = name
+            end
+        end
+        table.sort(names)
+        return #names > 0 and table.concat(names, ", ") or nil
+    end
+    local why_text = {}
+    if no_server.none_configured then
+        why_text[#why_text + 1] = ("no language server is configured for %s")
+            :format(named("none_configured") or "these files")
+    end
+    if no_server.no_attach then
+        why_text[#why_text + 1] = ("the language server for these files (%s) had not attached "
+            .. "within %d s and was not asked; a later call may be answered by it")
+            :format(named("no_attach") or "configured but not named",
+                REFERENCE_ATTACH_TIMEOUT_MS / 1000)
+    end
+    if no_server.declined then
+        why_text[#why_text + 1] = ("the language server attached to these files (%s) does not "
+            .. "answer reference requests"):format(named("declined") or "unnamed")
+    end
+    if #why_text > 0 then
+        res.method_note = table.concat(why_text, "; ") .. ", so "
+            .. (res.method == "language server and text search"
+                and "some of these files rest on a whole-word text search"
+                or "this rests on a whole-word text search")
+            .. ": a mention inside a comment or a string is dropped by the grammar, a stale "
+            .. "call site still counts as a reference, and a name reached by reflection or "
+            .. "built out of string pieces does not"
     end
     -- A server that cannot resolve the project's imports answers about one
     -- package and calls it the project. references says so where it answers;
@@ -1060,6 +1326,13 @@ local function unreferenced_symbols(args)
     if #unknown > 0 then
         res.not_answered = unknown
         res.not_answered_note = "no reference answer for these; they are not a finding either way"
+    end
+    if #disagrees > 0 then
+        res.text_search_disagrees = disagrees
+        res.text_search_disagrees_note = "the language server found no reference to these and "
+            .. "a whole-word text search found one outside a comment or a string, so they are "
+            .. "not listed as unreferenced: a stale call site the server no longer resolves "
+            .. "reads exactly like a live one, and the weaker answer is the safe one to keep"
     end
     if search_note then
         res.search_note = search_note
@@ -1086,9 +1359,10 @@ local function unreferenced_symbols(args)
             or "nothing was checked: no declaration in these files was eligible"
     elseif #dead > 0 then
         res.summary = "nothing outside its own body mentions these names. A symbol that is "
-            .. "this file's public API, reached by reflection or a string, or used from a "
-            .. "file the search cannot see (another build configuration, another language) "
-            .. "lands here too, so read each one before deleting it."
+            .. "this file's public API, reached by reflection or a string, an override or an "
+            .. "interface implementation called through the declaration it satisfies, or used "
+            .. "from a file the search cannot see (another build configuration, another "
+            .. "language) lands here too, so read each one before deleting it."
     else
         res.summary = ("every one of the %d symbols checked in these files is referenced "
             .. "somewhere else"):format(checked)

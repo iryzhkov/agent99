@@ -2873,6 +2873,15 @@ local function classify_hit(bufnr, line, col, entry)
         if t:find("comment", 1, true) then
             return "comment"
         end
+        -- `#{...}` in Ruby, `${...}` in a JavaScript template, the braces of
+        -- a Python f-string: what is written in there is code that runs, and
+        -- the string node above it made a live call site read as a mention in
+        -- prose. `puts "area #{s.area}"` is the only call to `area` in the
+        -- Ruby fixture, and reading it as a string reported the method it
+        -- calls as dead code.
+        if t:find("interpolation", 1, true) or t:find("substitution", 1, true) then
+            break
+        end
         if t:find("string", 1, true) and not (shell and t == "string") then
             return "string"
         end

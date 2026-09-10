@@ -798,8 +798,15 @@ def group_index(c):
     # a module of plain functions.
     check("what was skipped is counted and named",
           res.get("symbols_skipped", 0) >= 3
-          and "fields on an object this file does not declare"
+          and "fields set on an object this file does not declare"
           in res.get("symbols_skipped_note", ""), res)
+    # No skip reason names an oracle the reply cannot vouch for. The one for
+    # locals ended "and its own server already warns when it is unused", in
+    # replies whose adjacent field said no language server had answered
+    # anything at all - and in Java, where jdtls warns about neither of the
+    # two methods that reason was used to skip.
+    check("no skip reason claims a server warns about what it skipped",
+          "server" not in res.get("symbols_skipped_note", ""), res)
     os.remove(settings)
     # A file holding nothing this tool checks used to come back with
     # "every top-level symbol in these files is referenced somewhere else"
@@ -815,6 +822,101 @@ def group_index(c):
           and res.get("summary", "").startswith("nothing was checked")
           and "referenced somewhere else" not in res.get("summary", ""), res)
     os.remove(only_fields)
+    # A name inside a string literal is not a reference, and it used to veto
+    # the symbol in silence: symbols_checked 5, count 3, no symbols_skipped
+    # and no note, while the reply's own summary promised that a symbol
+    # "reached by reflection or a string" lands in the list. The classifier
+    # was asked about column 1 of the hit line instead of the column of the
+    # match, so the `M` of `M.doc = "M.dead_in_string ..."` answered for the
+    # string and the hit counted as code.
+    stringref = os.path.join(root, "lua", "testproj", "stringref.lua")
+    with open(stringref, "w") as f:
+        f.write("local M = {}\n"
+                "\n"
+                "-- M.dead_in_comment is named here, in a comment.\n"
+                'M.doc = "M.dead_in_string is named here, in a string literal."\n'
+                "\n"
+                "function M.dead_in_string()\n"
+                "    return 1\n"
+                "end\n"
+                "\n"
+                "function M.dead_in_comment()\n"
+                "    return 2\n"
+                "end\n"
+                "\n"
+                "return M\n")
+    res = b.call("unreferenced_symbols", {"file": stringref})
+    names = [s["name"] for s in res.get("unreferenced", [])]
+    check("a name inside a string literal does not veto the symbol",
+          "M.dead_in_string" in names and "M.dead_in_comment" in names, res)
+    os.remove(stringref)
+    # Every method of a class was skipped as "declared inside another symbol
+    # (locals, parameters, nested functions)". A public method is not a
+    # local: in Java that left 3 of 24 declarations examined, with both of
+    # the fixture's planted dead methods among the ones never looked at.
+    #
+    # `Shape/area` is called from `describe`, inside an f-string. The text
+    # search classified everything under the string node as a string, so the
+    # one call site of a live method read as a mention in prose.
+    shapes = os.path.join(root, "shapes.py")
+    with open(shapes, "w") as f:
+        f.write("class Shape:\n"
+                "    def __init__(self, w):\n"
+                "        self.w = w\n"
+                "\n"
+                "    def area(self):\n"
+                "        return self.w * self.w\n"
+                "\n"
+                "    def dead_perimeter(self):\n"
+                "        return 4 * self.w\n"
+                "\n"
+                "\n"
+                "def describe(s):\n"
+                '    return f"area {s.area()}"\n')
+    res = b.call("unreferenced_symbols", {"file": shapes})
+    names = [s["name"] for s in res.get("unreferenced", [])]
+    check("a method of a class is examined, not skipped as a local",
+          "Shape/dead_perimeter" in names, res)
+    check("a method called from inside an f-string is not a finding",
+          "Shape/area" not in names
+          and "Shape/area" not in [s["name"] for s in res.get("not_answered", [])], res)
+    # A constructor the language calls rather than the source is skipped for
+    # the same reason an entry point is: nothing names it.
+    check("a name the runtime calls is not reported as unreferenced",
+          "Shape/__init__" not in names, res)
+    os.remove(shapes)
+    # A symbol the server called dead and the text search kept alive was
+    # dropped from the reply with nothing to say which answer had won:
+    # symbols_checked minus count was the only trace of it.
+    zombie = os.path.join(root, "lua", "testproj", "zombie.lua")
+    with open(zombie, "w") as f:
+        f.write("local Z = {}\n"
+                "\n"
+                "function Z.zombie(x)\n"
+                "    return x\n"
+                "end\n"
+                "\n"
+                "return Z\n")
+    moved = os.path.join(root, "MOVED.md")
+    with open(moved, "w") as f:
+        f.write("# Moved\n"
+                "\n"
+                "The call site the move left behind:\n"
+                "\n"
+                "```lua\n"
+                "local n = Z.zombie(3)\n"
+                "```\n")
+    res = b.call("unreferenced_symbols", {"file": zombie})
+    if res.get("method") != "language server":
+        print("SKIP text_search_disagrees check: no server answered for zombie.lua")
+    else:
+        disagrees = [s["name"] for s in res.get("text_search_disagrees", [])]
+        check("a symbol the text search kept alive is named, not dropped in silence",
+              "Z.zombie" in disagrees
+              and "not listed as unreferenced"
+              in res.get("text_search_disagrees_note", ""), res)
+    os.remove(zombie)
+    os.remove(moved)
 
     reset(c)
     seed_dot_directory(root)

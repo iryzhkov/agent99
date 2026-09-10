@@ -327,13 +327,17 @@ var lspTools = []tool{
 	},
 	{
 		Name: "unreferenced_symbols",
-		Description: "Top-level symbols in these files that nothing outside their own body mentions. " +
+		Description: "Declarations in these files that nothing outside their own body mentions: " +
+			"the top-level ones, and the members of a class, a struct, an impl block or a " +
+			"module, which are addressable from outside too. A local inside a function is not " +
+			"checked, and the reply says how many it left out and why. " +
 			"Run it after extracting code into a module or deleting a caller: a definition left " +
 			"behind is not an error to any language server and not a warning to any linter, so " +
 			"every edit reports clean and the dead copy ships. Uses the language server's " +
 			"references where there is one, a whole-word project search where there is not. " +
-			"A public API, a name reached by reflection or from a build configuration the search " +
-			"cannot see lands here too: read each one before deleting it.",
+			"A public API, an override called through the declaration it satisfies, a name " +
+			"reached by reflection or from a build configuration the search cannot see lands " +
+			"here too: read each one before deleting it.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
