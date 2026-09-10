@@ -6,10 +6,13 @@ package main
 // The standalone server can hold several headless workspaces open at once
 // (see headless.go). They never overlap, so a path belongs to at most one of
 // them and most calls route themselves: the workspace that owns the file
-// named in the arguments is the one that gets the call. Calls that name no
-// path - check_project, undo_edit, the debugger tools - fall back to an
-// explicit "workspace" argument, then to the workspace last used for that
-// kind of work, then to the active one.
+// named in the arguments is the one that gets the call - owns it as the
+// caller wrote it, not as it resolves, so a symlink cannot carry the call
+// into a workspace nobody named. Calls that name no path - check_project,
+// undo_edit, the debugger tools - fall back to an explicit "workspace"
+// argument, then to the workspace last used for that kind of work, then to
+// the active one. With several open, a path no workspace holds is refused
+// rather than guessed at.
 
 import (
 	"fmt"
@@ -180,6 +183,49 @@ func realPath(path string) string {
 	}
 }
 
+// namedOwner returns the workspace the caller named: the one holding the
+// path as it was written. Resolution is a fallback, not the first move,
+// because a symlink inside one workspace can point at a file in another: a
+// path resolved first routes the call to the workspace at the far end of
+// the link, which then answers with its own relative path and takes the
+// edit into its own undo ledger. Resolving second still lets a root reached
+// through a symlinked ancestor route, since roots are stored resolved.
+func namedOwner(p string) *headlessWorkspace {
+	if ws := workspaceFor(filepath.Clean(absPath(p))); ws != nil {
+		return ws
+	}
+	return workspaceFor(realPath(p))
+}
+
+// assertNamedRoot refuses a call whose path lies inside the workspace it
+// named but resolves, through a symlink, to a file outside it. Confinement
+// used to be tested against the set of open roots rather than against the
+// root the request named, so a link from one open workspace into another
+// passed it: the write landed in the other workspace and the reply read
+// like success in the one the caller had named.
+func assertNamedRoot(name, root string, paths []string) error {
+	for _, p := range paths {
+		if !underRoot(root, p) {
+			continue
+		}
+		target := realPath(p)
+		if underRoot(root, target) {
+			continue
+		}
+		where := "outside it"
+		if other := workspaceFor(target); other != nil {
+			where = "inside the open workspace " + other.Root
+		}
+		return fmt.Errorf("%s is inside the workspace %s, but it resolves through a symlink "+
+			"to %s, which is %s. A call works in the workspace the path it names belongs to, "+
+			"so %s is refused rather than served from the far end of the link: the reply would "+
+			"carry the other workspace's relative path, and an edit would land there and enter "+
+			"its undo ledger. Name %s to work on it where it lives",
+			p, root, target, where, name, target)
+	}
+	return nil
+}
+
 // resolveSession picks the instance a call goes to. The returned error is
 // meant for the model: it says what is open and how to disambiguate.
 func resolveSession(name string, args map[string]any) (session, error) {
@@ -211,26 +257,52 @@ func resolveSession(name string, args map[string]any) (session, error) {
 			return session{}, fmt.Errorf("no open workspace at %s (open: %s)",
 				want, strings.Join(roots, ", "))
 		}
+		// Naming the workspace does not exempt the paths from it: a link
+		// out of the named root leads somewhere this call did not ask for
+		// just the same.
+		if err := assertNamedRoot(name, ws.Root, argPaths(args)); err != nil {
+			return session{}, err
+		}
 		return ws.session(), nil
 	}
 
+	named := argPaths(args)
 	owners := map[string]*headlessWorkspace{}
-	for _, p := range argPaths(args) {
-		if ws := workspaceFor(realPath(p)); ws != nil {
+	for _, p := range named {
+		if ws := namedOwner(p); ws != nil {
 			owners[ws.Root] = ws
 		}
 	}
 	if len(owners) > 1 {
-		var named []string
+		var owned []string
 		for root := range owners {
-			named = append(named, root)
+			owned = append(owned, root)
 		}
 		return session{}, fmt.Errorf("this call names paths in %d workspaces (%s); "+
 			"one call works in one workspace at a time",
-			len(owners), strings.Join(named, ", "))
+			len(owners), strings.Join(owned, ", "))
 	}
 	for _, ws := range owners {
+		if err := assertNamedRoot(name, ws.Root, named); err != nil {
+			return session{}, err
+		}
 		return ws.session(), nil
+	}
+	// A write to a path no open workspace holds is refused here rather than
+	// in the editor, because this is where the open roots are known. The
+	// editor sees only the one workspace the call landed in, so its refusal
+	// named that workspace as though the caller had asked for it - "X is
+	// outside the workspace Y" about a Y nobody had mentioned.
+	if editTools[name] {
+		for _, p := range named {
+			if namedOwner(p) != nil {
+				continue
+			}
+			return session{}, fmt.Errorf("no open workspace holds %s, and %s writes only "+
+				"inside a workspace. The root that holds it is not open (open: %s): "+
+				"open_workspace there and call again - one call works in one workspace",
+				p, name, strings.Join(roots, ", "))
+		}
 	}
 	// Every path was relative, outside every workspace (a dependency under
 	// ~/go/pkg/mod, a header in /usr/include), or there was none at all.
@@ -251,21 +323,37 @@ func resolveSession(name string, args map[string]any) (session, error) {
 			return ws.session(), nil
 		}
 	}
-	// An absolute path in no workspace at all - a dependency under
-	// ~/go/pkg/mod, a system header - is a read of something outside the
-	// project, and it goes to the active instance as it always has (writing
-	// there is refused on the Lua side). What is refused is a call with
-	// nothing absolute to go on: no path, or only relative ones, which mean
-	// "in the workspace this call is routed to" and so answer nothing.
-	if len(roots) > 1 && len(argPaths(args)) == 0 {
-		return session{}, fmt.Errorf("%s named no absolute path and no workspace=, and %d "+
-			"workspaces are open (%s), so there is nothing to route it by - a relative path "+
-			"means \"in whichever workspace this lands in\". Pass workspace=<root>, or an "+
-			"absolute path. The server will not guess with several open, because the guess "+
-			"can be another agent's repository. This count is not yours to cache: one server "+
-			"is shared by every agent on this machine, so a workspace can open between two "+
-			"of your calls",
-			name, len(roots), strings.Join(roots, ", "))
+	// Nothing open owns what this call named. With one workspace open there
+	// is no guess to make: an absolute path in no workspace at all - a
+	// dependency under ~/go/pkg/mod, a system header - is read in that one
+	// instance as it always has been, and only read, since the edit tools
+	// were already turned away above. With several open one guard covers
+	// both shapes of unroutable path, because the reason is the same for
+	// both: the sticky pointers live in this process, one server is shared
+	// by every agent talking to it, and the workspace that would answer is
+	// whichever one the call happened to land in. /etc/passwd was read
+	// through one agent's workspace and /etc/hostname through another's,
+	// minutes apart.
+	if len(roots) > 1 {
+		if len(named) == 0 {
+			return session{}, fmt.Errorf("%s named no absolute path and no workspace=, and %d "+
+				"workspaces are open (%s), so there is nothing to route it by - a relative path "+
+				"means \"in whichever workspace this lands in\". Pass workspace=<root>, or an "+
+				"absolute path. The server will not guess with several open, because the guess "+
+				"can be another agent's repository. This count is not yours to cache: one server "+
+				"is shared by every agent on this machine, so a workspace can open between two "+
+				"of your calls",
+				name, len(roots), strings.Join(roots, ", "))
+		}
+		return session{}, fmt.Errorf("no open workspace holds %s (open: %s), and %d are open, so "+
+			"%s has nothing to route it by. Whichever workspace answered would be an arbitrary "+
+			"one, and the server will not guess with several open, because the guess can be "+
+			"another agent's repository - it would load that path into their Neovim and their "+
+			"language servers. open_workspace at the root that holds it, or pass "+
+			"workspace=<root> to read it against one of the open ones. This count is not yours "+
+			"to cache: one server is shared by every agent on this machine, so a workspace can "+
+			"open or close between two of your calls",
+			named[0], strings.Join(roots, ", "), len(roots), name)
 	}
 	for _, root := range []string{stickyRoot(stickyFor(name)), stickyRoot(stickyActive), roots[0]} {
 		if ws := workspaceAt(root); ws != nil {

@@ -84,6 +84,36 @@ def main():
                 check("overlapping root refused (%s)" % bad,
                       "shares a file tree" in str(e) and alpha in str(e), e)
 
+        # One Neovim per tree held inside a process and not across them:
+        # openWorkspace consulted only its own map, so a second bridge - the
+        # ordinary shape here, one per agent on the machine - started its
+        # own instance over the same files. Two instances each hold their
+        # own buffers, and an edit made in one is lost when the other
+        # writes, which is the whole reason for the rule.
+        other = Bridge(env=env)
+        try:
+            other.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                     "clientInfo": {"name": "drive_multi_2", "version": "0"}})
+            try:
+                other.call("open_workspace", {"root": alpha})
+                check("another bridge cannot open the same root", False, "call succeeded")
+            except RuntimeError as e:
+                check("another bridge cannot open the same root",
+                      "already open in another agent99 bridge" in str(e)
+                      and alpha in str(e), e)
+            # A root nobody holds still opens in the second bridge, so the
+            # check is about the tree and not about being second.
+            res = other.call("open_workspace", {"root": gamma})
+            check("a free root still opens in the second bridge",
+                  res.get("root") == gamma and res["pid"] != alpha_pid, res)
+            other.call("close_workspace", {"root": gamma})
+        finally:
+            other.proc.kill()
+            try:
+                other.proc.wait(timeout=10)
+            except Exception:
+                pass
+
         res = b.call("open_workspace", {"root": beta})
         beta_pid = res["pid"]
         check("second workspace opens beside the first",
@@ -154,10 +184,89 @@ def main():
         except RuntimeError as e:
             check("a call across workspaces is refused", "2 workspaces" in str(e), e)
 
-        # A path in no workspace at all (a dependency, a system header) is
-        # not a routing error: it goes to the active instance.
-        res = b.call("find_symbol", {"file": outsider, "name": "M.outside"})
-        check("a path outside every workspace still resolves", res.get("count") == 1, res)
+        # A path in no workspace at all used to be read in whichever
+        # instance the call landed in. That instance is arbitrary - one
+        # probe read /etc/passwd through one agent's workspace and
+        # /etc/hostname through another's, minutes apart - and answering
+        # loads the file into that agent's Neovim and language servers.
+        # Refused while several are open, for the reason the relative-path
+        # guard already gave.
+        for path, label in ((outsider, "a file beside the workspaces"),
+                            ("/etc/passwd", "a system file in no project")):
+            try:
+                b.call("find_symbol", {"file": path, "name": "M.outside"})
+                check("%s is refused, not guessed at" % label, False, "call succeeded")
+            except RuntimeError as e:
+                check("%s is refused, not guessed at" % label,
+                      "no open workspace holds" in str(e) and path in str(e)
+                      and alpha in str(e) and beta in str(e), e)
+        # workspace= is the deliberate way to read one anyway: a dependency
+        # under ~/go/pkg/mod, a system header.
+        res = b.call("find_symbol", {"file": outsider, "name": "M.outside",
+                                     "workspace": alpha})
+        check("a path outside every workspace resolves with workspace=",
+              res.get("count") == 1, res)
+
+        # A write to a path no workspace holds is refused by the router,
+        # which knows what is open. The editor's own refusal named the
+        # workspace the call had landed in - "X is outside the workspace Y"
+        # about a Y the caller had never mentioned.
+        before = open(outsider).read()
+        try:
+            b.call("replace_symbol_body", {"file": outsider, "name_path": "M.outside",
+                                           "body": "function M.outside() return 2 end"})
+            check("a write outside every workspace is refused", False, "call succeeded")
+        except RuntimeError as e:
+            check("a write outside every workspace is refused",
+                  "no open workspace holds" in str(e)
+                  and "writes only inside a workspace" in str(e)
+                  and "The root that holds it is not open" in str(e), e)
+        check("the file outside every workspace is untouched",
+              open(outsider).read() == before, outsider)
+
+        # A symlink inside one workspace pointing at a file in another used
+        # to route the call to the far end of the link: the write landed in
+        # the other workspace, the reply carried that workspace's relative
+        # path so it read like success here, and the edit entered that
+        # workspace's undo ledger. Confinement is against the root the call
+        # named now.
+        link = os.path.join(beta, "lua", "testproj", "link_to_alpha.lua")
+        os.symlink(util_of(alpha), link)
+        alpha_before = open(util_of(alpha)).read()
+        try:
+            b.call("replace_symbol_body", {"file": link, "name_path": "M.greet",
+                                           "body": 'function M.greet(name) return "x" end'})
+            check("a symlink into another workspace is refused", False, "call succeeded")
+        except RuntimeError as e:
+            check("a symlink into another workspace is refused",
+                  "resolves through a symlink" in str(e) and link in str(e)
+                  and util_of(alpha) in str(e)
+                  and ("inside the open workspace " + alpha) in str(e), e)
+        check("the file at the far end of the symlink is untouched",
+              open(util_of(alpha)).read() == alpha_before, util_of(alpha))
+        # A read through the same link is refused for the same reason: it
+        # would be answered by alpha's Neovim under beta's name.
+        try:
+            b.call("find_symbol", {"file": link, "name": "M.greet"})
+            check("a read through such a symlink is refused too", False, "call succeeded")
+        except RuntimeError as e:
+            check("a read through such a symlink is refused too",
+                  "resolves through a symlink" in str(e), e)
+        # Naming the workspace does not exempt the path from it.
+        try:
+            b.call("find_symbol", {"file": link, "name": "M.greet", "workspace": beta})
+            check("workspace= does not exempt the symlink", False, "call succeeded")
+        except RuntimeError as e:
+            check("workspace= does not exempt the symlink",
+                  "resolves through a symlink" in str(e), e)
+        # A link that stays inside its own workspace is ordinary work.
+        inner = os.path.join(beta, "lua", "testproj", "link_to_own.lua")
+        os.symlink(util_of(beta), inner)
+        res = b.call("find_symbol", {"file": inner, "name": "M.greet"})
+        check("a symlink inside its own workspace still resolves",
+              res.get("count") == 1, res)
+        os.unlink(link)
+        os.unlink(inner)
 
         # An undo belongs to the workspace that was edited, even when a read
         # of the other one came in between.
@@ -199,6 +308,19 @@ def main():
         res = b.call("open_workspace", {"root": gamma})
         gamma_pid = res["pid"]
         check("a workspace opens again once one is closed", res.get("root") == gamma, res)
+
+        # A path under a root that was closed - by this client or, in the
+        # field, by another one sharing it - is not served by whatever else
+        # happens to be open. One agent's find_symbol on a closed root was
+        # answered by an uninvolved agent's workspace, which then loaded the
+        # whole module and reported the errors as its own.
+        try:
+            b.call("find_symbol", {"file": util_of(alpha), "name": "M.greet"})
+            check("a path under a closed root is refused", False, "call succeeded")
+        except RuntimeError as e:
+            check("a path under a closed root is refused",
+                  "no open workspace holds" in str(e) and util_of(alpha) in str(e)
+                  and beta in str(e) and gamma in str(e), e)
         res = b.call("close_workspace", {"all": True})
         check("all=true closes every workspace",
               res.get("closed") == sorted([beta, gamma]) and "workspaces" not in res, res)

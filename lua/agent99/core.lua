@@ -531,8 +531,10 @@ local function assert_writable(path, root, what)
     if target == real_root or target:sub(1, #real_root + 1) == real_root .. "/" then
         return
     end
-    err("%s is outside the workspace %s, and %s writes only inside it. Open a workspace at "
-        .. "that root to edit there (one call works in one workspace).",
+    err("%s is not inside %s, the workspace this call was routed to, and %s writes only inside "
+        .. "the workspace it is routed to. Routing follows the path a call names, so name a "
+        .. "path in the root you mean, or open_workspace there and pass workspace=<that root> "
+        .. "(one call works in one workspace).",
         target, real_root, what or "this tool")
 end
 

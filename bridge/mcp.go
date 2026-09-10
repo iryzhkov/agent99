@@ -56,9 +56,12 @@ var workspaceTools = []tool{
 			"servers are shared with the other clients using it, while your undo ledger, " +
 			"your check_project and run_tests baselines and the diagnostics you have been " +
 			"shown are your own. Several projects can be open at " +
-			"once, as long as no root contains another; each call is routed to the workspace " +
-			"owning the path it names, so pass absolute paths (or workspace=<root>) once more " +
-			"than one is open. Symbol edits made through this server are saved to disk at once.",
+			"once, as long as no root contains another and no other bridge process already " +
+			"holds it; each call is routed to the workspace owning the path it names, as it " +
+			"names it, so pass absolute paths (or workspace=<root>) once more than one is " +
+			"open. With several open, a path no workspace holds is refused rather than served " +
+			"from an arbitrary one. Symbol edits made through this server are saved to disk " +
+			"at once.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -142,8 +145,10 @@ func openWorkspaceResult(ws *headlessWorkspace, client string, wasOpen bool) map
 	// to address them; with one it would be noise.
 	if roots := openRoots(); len(roots) > 1 {
 		result["workspaces"] = roots
-		result["routing"] = "calls are routed by the path they name; pass an absolute path, " +
-			"or workspace=<root>, when a call names none"
+		result["routing"] = "calls are routed by the path they name, as they name it: pass an " +
+			"absolute path, or workspace=<root>, when a call names none. With several open, a " +
+			"path no workspace holds is refused rather than guessed at, and so is one that " +
+			"leaves the root it was named under through a symlink"
 	}
 	return result
 }

@@ -399,15 +399,17 @@ sessions and every one of them recovered identically, by calling
 nothing to infer from still returns that error, because guessing a root
 wrongly is worse than asking for one.
 
-A call that names no absolute path and no `workspace=` is refused while several are open, rather than routed by a guess: the sticky "where the last call went" pointers live in the server, and one server is shared by every agent talking to it, so the guess can be another agent's repository. An edit is refused outright when its path lies outside the workspace it was routed to (reading outside stays allowed — a dependency, a system header). Several projects can be open at once (ten by default,
+A call that no open workspace can be said to own is refused while several are open, rather than routed by a guess: the sticky "where the last call went" pointers live in the server, and one server is shared by every agent talking to it, so the guess can be another agent's repository. That covers a call whose paths are all relative or which names no path at all, and equally one whose absolute path lies in no open workspace — `/etc/passwd` was read through one agent's workspace and `/etc/hostname` through another's, minutes apart, and answering loads the file into that agent's Neovim and its language servers. `workspace=<root>` is the way to read such a path deliberately, and with a single workspace open there is no guess to make, so a dependency or a system header is read in it as before. An edit whose path lies in no open workspace is refused whatever is open. Several projects can be open at once (ten by default,
 `AGENT99_MAX_WORKSPACES` to change it — each workspace is a Neovim with its
 own language servers, so the ceiling is the machine's memory). The refusal
 at the limit names the open roots and says to close one of your own or wait:
 when several agents share one server, the roots it lists may be theirs. A root that contains, or is contained by, an open
 workspace is refused: two instances over one file tree would each hold
 their own buffers for the same files, and an edit made in one would be lost
-the moment the other wrote. Sibling projects and separate worktrees of the
-same repository are fine.
+the moment the other wrote. So is a root another bridge process already has
+open — one agent per bridge is the ordinary shape here, and the rule is
+about the tree, not about one process's bookkeeping. Sibling projects and
+separate worktrees of the same repository are fine.
 
 The home directory and a filesystem root are refused as well. They are not
 projects: everything that walks a workspace walks all of it — the file
@@ -419,17 +421,21 @@ repository or the config directory the work is actually in, or set
 `AGENT99_ALLOW_WIDE_ROOT=1` to mean it.
 
 Each call is routed to the workspace that owns the path it names, so an
-absolute path is enough to address a project. A call whose paths are all
-relative, or which names no path at all (`check_project`, `undo_edit`,
+absolute path is enough to address a project. It owns the path as the call
+wrote it, not as it resolves: a symlink inside one workspace pointing at a
+file in another used to carry the call to the far end of the link, so the
+write landed in the other workspace, the reply carried that workspace's
+relative path and read like success in the one the caller had named, and
+the edit entered that workspace's undo ledger. A path that leaves the root
+it was named under is refused now, naming both ends. A call whose paths are
+all relative, or which names no path at all (`check_project`, `undo_edit`,
 `workspace_symbols`, the debugger), goes to the *active* workspace — the
 one the last call was routed to — unless it passes `workspace=<root>`,
 which those tools take for exactly this reason. Two sticky exceptions keep
 the common sequences right: `undo_edit` follows the workspace that was last
 edited even if a read of another one came in between, and
 `apply_code_action` follows the one that issued the token. A single call
-cannot span two workspaces (`move_file` from one to another is refused),
-and a path in no workspace at all — a dependency under `~/go/pkg/mod`, a
-header in `/usr/include` — is read in the active one rather than rejected.
+cannot span two workspaces (`move_file` from one to another is refused).
 
 While more than one workspace is open, every reply starts with a
 `workspace: <root>` line, so a misrouted call is visible instead of silent.

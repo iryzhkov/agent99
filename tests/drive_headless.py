@@ -1036,7 +1036,11 @@ def group_edit(c):
         check("insert_lines refuses a line past the end", "outside the file" in str(e), e)
     # A write outside the workspace is refused before anything is opened.
     # Reaching /etc/hosts through a project's workspace applied the text to a
-    # buffer, and only file permissions kept it off the disk.
+    # buffer, and only file permissions kept it off the disk. An absolute
+    # path is turned away by the router, which is where the open roots are
+    # known: the editor sees only the workspace the call landed in, and its
+    # refusal used to name that workspace as though the caller had asked for
+    # it - "X is outside the workspace Y" about a Y nobody had mentioned.
     outside = os.path.join(work, "outside.txt")
     with open(outside, "w") as f:
         f.write("untouched\n")
@@ -1050,7 +1054,19 @@ def group_edit(c):
             check("%s refuses a path outside the workspace" % tool, False, "call succeeded")
         except RuntimeError as e:
             check("%s refuses a path outside the workspace" % tool,
-                  "outside the workspace" in str(e), e)
+                  "no open workspace holds" in str(e)
+                  and "writes only inside a workspace" in str(e)
+                  and "The root that holds it is not open" in str(e), e)
+    # A relative path names no workspace, so it is the editor that catches
+    # this one, against the root the call was routed to.
+    try:
+        b.call("insert_lines", {"file": "../outside.txt", "at": "end", "text": "x"})
+        check("a relative path out of the workspace is refused", False, "call succeeded")
+    except RuntimeError as e:
+        check("a relative path out of the workspace is refused",
+              "is not inside" in str(e)
+              and "the workspace this call was routed to" in str(e)
+              and "writes only inside the workspace it is routed to" in str(e), e)
     with open(outside) as f:
         check("the file outside the workspace is untouched", f.read() == "untouched\n", None)
     os.remove(outside)

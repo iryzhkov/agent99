@@ -194,6 +194,60 @@ func nvimAlive(sock string) bool {
 	return err == nil && strings.TrimSpace(out) == "function"
 }
 
+// socketPrefix is the leading field of the socket name openWorkspace gives an
+// instance: a hash of the root, so the sockets belonging to one tree can be
+// found without asking anyone.
+func socketPrefix(root string) string {
+	sum := sha1.Sum([]byte(root))
+	return hex.EncodeToString(sum[:6])
+}
+
+// foreignInstanceAt reports a live Neovim another bridge process has open at
+// this root, as its socket path and that bridge's pid. The "one Neovim per
+// tree" rule was enforced against this process's own map only, so two bridges
+// - one per agent on the machine - each opened the same root and each held
+// its own buffers for the same files, which is the loss the rule exists to
+// prevent. The socket directory is the only thing the two processes share, so
+// it is where the question is asked, and a socket name carries a hash of its
+// root, so this answers for the same root exactly. A foreign workspace that
+// merely overlaps this one - a root inside it, or around it - is not visible
+// here, since only the hash of the root it was opened at is in the name; that
+// half of the rule is still enforced within a process only.
+func foreignInstanceAt(root string) (string, int) {
+	dir, err := socketDir()
+	if err != nil {
+		return "", 0
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", 0
+	}
+	prefix := socketPrefix(root) + "-"
+	self := os.Getpid()
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".sock") {
+			continue
+		}
+		base := strings.TrimSuffix(name, ".sock")
+		dash := strings.LastIndexByte(base, '-')
+		if dash < 0 {
+			continue
+		}
+		pid, err := strconv.Atoi(base[dash+1:])
+		if err != nil || pid == self || !processAlive(pid) {
+			continue
+		}
+		// A live owner can still have left the file behind: only an
+		// answering socket means an instance is really there.
+		sock := filepath.Join(dir, name)
+		if nvimAlive(sock) {
+			return sock, pid
+		}
+	}
+	return "", 0
+}
+
 // usableRoot refuses the two directories that are not a project tree: the
 // home directory, which holds every project on the machine plus its caches
 // and dotfiles, and a filesystem root, which holds the machine. The refusal
@@ -284,6 +338,14 @@ func openWorkspace(root string) (*headlessWorkspace, error) {
 				abs, other, other)
 		}
 	}
+	if other, pid := foreignInstanceAt(abs); other != "" {
+		return nil, fmt.Errorf("%s is already open in another agent99 bridge (process %d, "+
+			"socket %s). One Neovim per tree: two instances would hold their own buffers for "+
+			"the same files, and an edit made in one is lost when the other writes. This "+
+			"bridge will not start a second one - work through the bridge that has it, or "+
+			"wait for that process to finish with the root",
+			abs, pid, other)
+	}
 	if max := maxWorkspaces(); len(workspaces) >= max {
 		return nil, fmt.Errorf("%d workspaces are already open (%s) and the limit is %d; "+
 			"close one of your own with close_workspace, or wait and retry - a workspace "+
@@ -304,9 +366,8 @@ func openWorkspace(root string) (*headlessWorkspace, error) {
 	// window auto-opens a new instance whose socket must not be the one the
 	// old instance is about to unlink. The pid stays last, which is where
 	// sweepStaleSockets reads it.
-	sum := sha1.Sum([]byte(abs))
 	sock := filepath.Join(dir, fmt.Sprintf("%s-%d-%d.sock",
-		hex.EncodeToString(sum[:6]), instanceSeq.Add(1), os.Getpid()))
+		socketPrefix(abs), instanceSeq.Add(1), os.Getpid()))
 	os.Remove(sock)
 
 	args := []string{"--headless", "--listen", sock,
