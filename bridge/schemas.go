@@ -401,7 +401,7 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "undo_edit",
-		Description: "Undo the newest symbol edit(s) you made through this connection (count, or all), restoring the previous source, and removing a file it created. The ledger is per client: edits another agent made in the same workspace are in its own ledger and are never reached from here, and a reply says how many steps they have. Agents that share one MCP connection - the subagents of one session - count as one client and share this ledger. Refuses if the region changed since. A language server's own code action is not covered; an action offered by a refused edit is, since it re-runs that edit tool.",
+		Description: "Undo the newest symbol edit(s) you made through this connection (count, or all), restoring the previous source, and removing a file it created. The ledger is per client: edits another agent made in the same workspace are in its own ledger and are never reached from here, and a reply says how many steps they have. Agents that share one MCP connection - the subagents of one session - count as one client and share this ledger. Refuses if the region changed since, and refuses to remove a created file that has been written to since. The restore replays lines, so an entry whose file is not byte-identical to what it was before the edit says so under bytes_differ, and a polish pass that ran on the restore is reported under polished. A call that fails after the files are back says what it did not manage under incomplete. A language server's own code action is not covered; an action offered by a refused edit is, since it re-runs that edit tool.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -493,7 +493,9 @@ var lspTools = []tool{
 	{
 		Name: "create_file",
 		Description: "Create a new file with its contents, with imports organized (and formatted when format= asks for it), " +
-			"and tell the language servers about it. Missing parent directories are created. Undoable with undo_edit.",
+			"and tell the language servers about it. The text is written byte for byte: text that does not end in a " +
+			"newline makes a file that does not end in one. Missing parent directories are created. Undoable with " +
+			"undo_edit, which removes the file and the directories it made, and refuses when the file has changed since.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -834,6 +836,10 @@ var writingTools = map[string]bool{
 	"insert_after_symbol":  true,
 	"insert_before_symbol": true,
 	"insert_lines":         true,
+	// create_file was not here, so verify= was not in its schema, was
+	// accepted anyway, and produced no field at all - on the one tool whose
+	// bytes on disk differed from the bytes sent.
+	"create_file": true,
 }
 
 // The edit tools that run the server's formatter over what they wrote when
@@ -869,8 +875,12 @@ func init() {
 		if writingTools[lspTools[i].Name] {
 			props["verify"] = map[string]any{
 				"type": "boolean",
-				"description": "Echo the bytes that landed, as the file now holds them. Use when the text " +
-					"carries escapes or whitespace that must survive the JSON round trip exactly.",
+				"description": "Echo the text that landed, and describe the file's bytes: verified " +
+					"carries the byte count, a sha256, the line endings, whether there is a final " +
+					"newline and whether there is a BOM. Use when the text carries escapes or " +
+					"whitespace that must survive the JSON round trip exactly. The echo is an array " +
+					"of lines and so cannot show a line terminator; verified is the part that answers " +
+					"questions about line endings, a missing final newline or a BOM.",
 			}
 		}
 		if formattingTools[lspTools[i].Name] {

@@ -191,6 +191,65 @@ local function mark_synced(bufnr, path)
     vim.b[bufnr].agent99_disk = disk_fingerprint(path)
 end
 
+-- What the file's last byte is, recorded when the buffer is read so that a
+-- later write can put it back. Neovim loads a file with no final newline as
+-- 'noeol' and, with 'fixendofline' on, writes the newline back anyway: an
+-- edit to line 4 of a 7-line file changed a byte at the end of the file
+-- that no field of the reply accounted for, and no undo could take it back,
+-- because the ledger replays lines and the difference is not in any line.
+--
+-- A 0-byte file is the third case and needs its own name: it loads as one
+-- empty line, which is the same buffer a file holding a single "\n" loads
+-- as, so 'endofline' alone cannot tell them apart.
+local function mark_eol(bufnr, path)
+    local st = vim.uv.fs_stat(path or vim.api.nvim_buf_get_name(bufnr))
+    local state = "eol"
+    if st and st.size == 0 then
+        state = "empty"
+    elseif not vim.bo[bufnr].endofline then
+        state = "noeol"
+    end
+    vim.b[bufnr].agent99_eol = state
+    -- Without this the write puts the newline back whatever 'endofline' says.
+    vim.bo[bufnr].fixendofline = false
+end
+
+-- Whether a write of `bufnr` should end in a newline: what the file had when
+-- it was read, except for a file that was 0 bytes, which keeps its emptiness
+-- only while the buffer is still empty. Filling a 0-byte file makes an
+-- ordinary text file, ending in a newline like any other.
+-- `lines` overrides the buffer's own content, for asking the question about
+-- a shape the buffer no longer holds.
+local function want_eol(bufnr, lines)
+    local state = vim.b[bufnr].agent99_eol
+    if state == nil then return nil end
+    if state == "noeol" then return false end
+    if state == "empty" then
+        if lines then
+            return not (#lines <= 1 and (lines[1] or "") == "")
+        end
+        return not (vim.api.nvim_buf_line_count(bufnr) == 1
+            and (vim.api.nvim_buf_get_lines(bufnr, 0, 1, false)[1] or "") == "")
+    end
+    return true
+end
+
+-- "\n" or "", for reconstructing the bytes a list of lines stands for.
+local function eol_suffix(bufnr, lines)
+    local eol = want_eol(bufnr, lines)
+    if eol == nil then eol = vim.bo[bufnr].endofline end
+    return eol and "\n" or ""
+end
+
+-- The bytes `bufnr` stands for: its lines joined with newlines, plus the
+-- final newline when the file has one. This is exactly what a write puts on
+-- disk, so a digest of it can be compared across an edit and its undo
+-- without waiting for the save.
+local function buf_bytes(bufnr)
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    return table.concat(lines, "\n") .. eol_suffix(bufnr, lines)
+end
+
 -- Has the file changed behind the buffer's back since we last agreed with
 -- it? Unknown fingerprints (buffer loaded before this ran) count as clean:
 -- Neovim's own timestamp check still backs us up on the write.
@@ -219,6 +278,7 @@ local function sync_buf(bufnr, path)
         err("could not reload %s after it changed on disk: %s", rel_path(path), tostring(e))
     end
     mark_synced(bufnr, path)
+    mark_eol(bufnr, path)
     loaded_at[bufnr] = vim.uv.now()
     return true
 end
@@ -233,6 +293,10 @@ local function write_buf(bufnr)
         return false, ("%s changed on disk since this session read it; "
             .. "the edit was left unsaved in the editor"):format(rel_path(path))
     end
+    -- Put the file's own final byte back before writing: 'fixendofline' was
+    -- turned off when the buffer was read, so this is what decides it.
+    local eol = want_eol(bufnr)
+    if eol ~= nil then vim.bo[bufnr].endofline = eol end
     local ok, e = pcall(vim.api.nvim_buf_call, bufnr, function()
         vim.cmd("silent write!")
     end)
@@ -544,6 +608,7 @@ local function load_buf(file)
         vim.fn.bufload(bufnr)
         loaded_at[bufnr] = vim.uv.now()
         mark_synced(bufnr, path)
+        mark_eol(bufnr, path)
     else
         sync_buf(bufnr, path)
     end
@@ -937,6 +1002,9 @@ M.mark_synced = mark_synced
 M.disk_moved_on = disk_moved_on
 M.sync_buf = sync_buf
 M.write_buf = write_buf
+M.mark_eol = mark_eol
+M.eol_suffix = eol_suffix
+M.buf_bytes = buf_bytes
 
 -- Re-read a buffer from disk when the file changed underneath it. undo_edit
 -- checks the region it is about to restore against this, so a change made

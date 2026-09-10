@@ -329,6 +329,64 @@ local gone = edit.stopped_servers()
 check("a server that published and is not running is reported as stopped",
     vim.tbl_contains(gone, "fakels") and vim.tbl_contains(gone, "otherls"), gone)
 
+-- byte_report: what verify= answers about the bytes, which its echo of the
+-- changed lines structurally cannot. Two files whose bytes differ produce
+-- the identical array of lines, so these questions have to be answered
+-- somewhere else, and this is where.
+local lf = edit.byte_report("a\nb\n")
+check("LF endings are named, and the final newline is reported",
+    lf.line_endings == "LF" and lf.final_newline == true and lf.bytes == 4, lf)
+
+local crlf = edit.byte_report("a\r\nb\r\n")
+check("a CRLF file is not reported as an LF one",
+    crlf.line_endings == "CRLF" and crlf.bytes == 6, crlf)
+
+local nonl = edit.byte_report("a\nb")
+check("a missing final newline is reported as missing",
+    nonl.final_newline == false and nonl.line_endings == "LF", nonl)
+
+local oneline = edit.byte_report("a")
+check("one line with no terminator says so rather than naming an ending",
+    oneline.line_endings == "none: the file is one line with no terminator", oneline)
+
+local mixed = edit.byte_report("a\r\nb\nc\n")
+check("mixed endings are counted, not picked between",
+    mixed.line_endings == "mixed: 2 LF, 1 CRLF", mixed)
+
+local bom = edit.byte_report("\239\187\191a\n")
+check("a BOM is named", bom.bom == "UTF-8" and bom.bytes == 5, bom)
+check("and a file without one says so", edit.byte_report("a\n").bom == "none", lf)
+
+local empty = edit.byte_report("")
+check("a 0-byte file has no final newline and no endings",
+    empty.bytes == 0 and empty.final_newline == false, empty)
+check("and its digest is the digest of nothing",
+    empty.sha256 == vim.fn.sha256(""), empty)
+
+-- The account an undo gives of itself when it fails after the files are
+-- back. Nothing else exercises this wording: the one thing known to throw
+-- there was an invalid buffer id, which is now guarded, and a reply nothing
+-- exercises is a reply whose first defect ships.
+local undodir = "/tmp/agent99-unit-undo"
+vim.fn.delete(undodir, "rf")
+vim.fn.mkdir(undodir, "p")
+local undofile = undodir .. "/note.txt"
+vim.fn.writefile({ "one", "two" }, undofile)
+edit.insert_lines({ file = undofile, at = "end", text = "three", headless = true })
+vim.env.AGENT99_FAULT_UNDO_TAIL = "the editor went away"
+local hurt = edit.undo_edit({ headless = true })
+vim.env.AGENT99_FAULT_UNDO_TAIL = nil
+check("an undo that fails after the restore still lists what it undid",
+    #hurt.undone == 1 and hurt.remaining == 0, hurt)
+check("and says what it did not manage, rather than throwing",
+    type(hurt.incomplete) == "string"
+    and hurt.incomplete:find("restored and written", 1, true) ~= nil
+    and hurt.incomplete:find("the editor went away", 1, true) ~= nil, hurt)
+check("and the restore itself really happened",
+    table.concat(vim.fn.readfile(undofile), "\n") == "one\ntwo",
+    vim.fn.readfile(undofile))
+vim.fn.delete(undodir, "rf")
+
 if failures > 0 then
     io.stdout:write(("unit_edit: %d failed\n"):format(failures))
     vim.cmd("cquit 1")

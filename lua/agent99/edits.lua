@@ -200,9 +200,15 @@ function M.undo_last(n, skip)
             pcall(function()
                 require("agent99.core").resync_buf(e.bufnr)
             end)
-            local now = vim.api.nvim_buf_get_lines(e.bufnr,
+            -- Anything the editor throws here is this one entry's problem,
+            -- not the call's: undo_edit(all=true) died on a single bad entry
+            -- with a raw Lua error and no account of the thirty it had
+            -- already undone. A refusal is an account.
+            local okr, now = pcall(vim.api.nvim_buf_get_lines, e.bufnr,
                 e.first - 1, e.first - 1 + e.new_count, false)
-            if not vim.deep_equal(now, e.new_lines or {}) then
+            if not okr then
+                why = ("the editor refused to read the region back: %s"):format(tostring(now))
+            elseif not vim.deep_equal(now, e.new_lines or {}) then
                 why = "the region changed since the edit; fix it by hand"
             end
         end
@@ -221,8 +227,13 @@ function M.undo_last(n, skip)
             goto continue
         end
         if not e.file_op then
-            vim.api.nvim_buf_set_lines(e.bufnr, e.first - 1, e.first - 1 + e.new_count,
-                false, e.old_lines)
+            local oks, serr = pcall(vim.api.nvim_buf_set_lines, e.bufnr,
+                e.first - 1, e.first - 1 + e.new_count, false, e.old_lines)
+            if not oks then
+                refused[#refused + 1] = { file = e.file, name_path = e.name_path,
+                    why = ("could not restore the lines: %s"):format(tostring(serr)) }
+                break
+            end
         end
         -- Written first, dropped from the ledger only once it is safely on
         -- disk: a failed save used to consume the entry, so the edit stayed

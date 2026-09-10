@@ -19,6 +19,7 @@ at a time. AGENT99_TEST_JOBS caps how many; 1 runs them in order in this
 process, which reads better when something fails.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -1944,6 +1945,169 @@ def group_undo(c):
     shutil.rmtree(bulk)
 
 
+def group_bytes(c):
+    """The bytes on disk, against what the reply says about them. Every
+    defect this group covers arrived as a successful reply - "applied and
+    saved to disk" over a file whose bytes were not the ones sent, and
+    `remaining: 0` over five files still off their baseline - so every check
+    here reads the file in binary and compares bytes, never text."""
+    b, root = c.b, c.root
+
+    restart(c)
+    # create_file accepted verify= and answered with nothing at all, while
+    # appending a final newline that was in no field of the reply: there was
+    # no way for a caller to learn the bytes on disk differed from the bytes
+    # sent, which is exactly what verify= exists to close.
+    made = os.path.join(root, "made.md")
+    text = "# No Final Newline\n\n## Section\n\nlast line without newline"
+    res = b.call("create_file", {"file": made, "text": text, "verify": True})
+    on_disk = open(made, "rb").read()
+    check("create_file writes the text byte for byte, final newline and all",
+          on_disk == text.encode(), on_disk)
+    ver = res.get("verified") or {}
+    check("and verify= answers, with the bytes rather than only the lines",
+          ver.get("bytes") == len(text)
+          and ver.get("sha256") == hashlib.sha256(on_disk).hexdigest()
+          and ver.get("final_newline") is False
+          and ver.get("line_endings") == "LF"
+          and ver.get("bom") == "none", res)
+    check("and it echoes what it wrote",
+          res.get("new_text") == text.split("\n"), res.get("new_text"))
+    check("and counts the lines, not the terminators", res.get("lines") == 5, res)
+
+    # The same call with a trailing newline: the file has one, and the
+    # report says so. The line echo is identical either way, which is the
+    # whole reason the byte report has to exist.
+    made2 = os.path.join(root, "made2.md")
+    res2 = b.call("create_file", {"file": made2, "text": "# T\n\nbody\n", "verify": True})
+    check("a text that ends in a newline makes a file that does",
+          open(made2, "rb").read() == b"# T\n\nbody\n"
+          and (res2.get("verified") or {}).get("final_newline") is True, res2)
+    check("and the line echo cannot tell the two apart, as the report can",
+          res.get("new_text")[-1] == "last line without newline"
+          and res2.get("new_text") == ["# T", "", "body"], [res.get("new_text"), res2.get("new_text")])
+    os.remove(made2)
+
+    restart(c)
+    # An edit to a file with no final newline added one, outside the region
+    # the reply reported and outside new_text: one byte changed that no
+    # field accounted for, and no undo could take it back, because the
+    # ledger replays lines and the difference is not in any line.
+    nonl = os.path.join(root, "lua", "testproj", "nonl.lua")
+    original = b"local M = {}\nfunction M.tail() return 1 end\nreturn M"
+    with open(nonl, "wb") as f:
+        f.write(original)
+    res = b.call("replace_symbol_lines", {
+        "file": nonl, "name_path": "M.tail",
+        "match": "function M.tail() return 1 end",
+        "text": "function M.tail() return 2 end", "verify": True})
+    after = open(nonl, "rb").read()
+    check("an edit to a file with no final newline does not give it one",
+          after == original.replace(b"return 1", b"return 2"), after)
+    check("and verify= says the file still has none",
+          (res.get("verified") or {}).get("final_newline") is False
+          and (res.get("verified") or {}).get("sha256") == hashlib.sha256(after).hexdigest(), res)
+    res = b.call("undo_edit", {"count": 1})
+    back = open(nonl, "rb").read()
+    check("and the undo puts the bytes back, not just the lines",
+          back == original, back)
+    check("and says nothing about a byte difference, because there is none",
+          all("bytes_differ" not in e for e in res.get("undone", [])), res)
+    os.remove(nonl)
+
+    restart(c)
+    # A 0-byte file loads as one empty line, the same buffer a file holding
+    # a single "\n" loads as. Three of them came back from "everything
+    # undone" one byte long.
+    empty = os.path.join(root, "empty.txt")
+    open(empty, "wb").close()
+    res = b.call("insert_lines", {"file": empty, "at": "end", "text": "hello"})
+    check("writing into a 0-byte file writes the line and no blank one",
+          open(empty, "rb").read() == b"hello\n", open(empty, "rb").read())
+    b.call("undo_edit", {"count": 1})
+    check("and undoing it leaves the file 0 bytes long again",
+          open(empty, "rb").read() == b"", open(empty, "rb").read())
+    os.remove(empty)
+
+    restart(c)
+    # Undoing a create_file deleted whatever the file held by then. Five
+    # lines another tool had appended went with it: unrecoverable, with
+    # nothing in the reply about it and no counterpart to delete_file's
+    # "restorable" note.
+    kept = os.path.join(root, "kept.md")
+    b.call("create_file", {"file": kept, "text": "# Kept\n"})
+    with open(kept, "ab") as f:
+        f.write(b"\nwritten by somebody else\n")
+    res = b.call("undo_edit", {"count": 1})
+    check("undoing a create refuses when the file has been written to since",
+          len(res.get("refused", [])) == 1
+          and "would destroy those changes" in (res["refused"][0].get("why") or ""), res)
+    check("and the file, with what was added to it, is still there",
+          b"written by somebody else" in open(kept, "rb").read(), res)
+    res = b.call("undo_edit", {"count": 1, "skip": True})
+    check("skip=true leaves it standing rather than deleting it",
+          os.path.exists(kept) and len(res.get("dropped", [])) == 1, res)
+    os.remove(kept)
+
+    restart(c)
+    # create_file makes missing parent directories; its undo used to leave
+    # them behind empty.
+    deep = os.path.join(root, "newdir", "sub", "deep.md")
+    b.call("create_file", {"file": deep, "text": "# Deep\n"})
+    check("create_file makes the parents it needs", os.path.exists(deep), deep)
+    b.call("undo_edit", {"count": 1})
+    check("and undoing it takes back the directories it made too",
+          not os.path.exists(os.path.join(root, "newdir")), os.listdir(root))
+
+    restart(c)
+    # undo_edit(all=True) died with a raw "Invalid buffer id" here: the undo
+    # of the create wipes the buffer the edit above it had used, and the
+    # report was built from that buffer afterwards. It left two files
+    # permanently wrong and said nothing at all about its own completeness.
+    pair = os.path.join(root, "lua", "testproj", "pair.lua")
+    b.call("create_file", {"file": pair, "text": "local M = {}\nfunction M.one() return 1 end\nreturn M\n"})
+    b.call("replace_symbol_lines", {
+        "file": pair, "name_path": "M.one",
+        "match": "function M.one() return 1 end",
+        "text": "function M.one() return 11 end"})
+    res = b.call("undo_edit", {"all": True})
+    check("undoing an edit and the create under it does not throw",
+          len(res.get("undone", [])) == 2 and res.get("remaining") == 0
+          and not res.get("incomplete"), res)
+    check("and the created file is gone", not os.path.exists(pair), os.listdir(root))
+
+    restart(c)
+    # The import polish runs during the undo and rewrote a one-line Go file
+    # into three, unreported: `restored_lines: "1-1"` over a range it had
+    # actually rewritten 1-3, no polish_diff, and the file left off its
+    # baseline while the reply said everything was undone. Whether gopls
+    # reformats here or not, the invariant under test is that the reply and
+    # the disk agree.
+    oneline = os.path.join(root, "oneline.go")
+    with open(oneline, "wb") as f:
+        f.write(b"package main; func OneLiner() int { return 7 }\n")
+    before_bytes = open(oneline, "rb").read()
+    res = b.call("replace_symbol_lines", {
+        "file": oneline, "name_path": "OneLiner",
+        "match": "package main; func OneLiner() int { return 7 }",
+        "text": "package main; func OneLiner() int { return 8 }"})
+    if "no such file" in str(res) or res.get("error"):
+        print("SKIP undo byte account on Go: the edit did not apply")
+    else:
+        res = b.call("undo_edit", {"count": 1})
+        now = open(oneline, "rb").read()
+        differs = [e for e in res.get("undone", []) if e.get("bytes_differ")]
+        check("an undo that did not restore the bytes says so, and one that did does not",
+              (now != before_bytes) == bool(differs),
+              {"same": now == before_bytes, "reply": res})
+        if now != before_bytes:
+            check("and the polish pass that rewrote it is named on the undo reply",
+                  "organized imports" in (res.get("polished") or ""), res)
+            check("and the byte account gives both sizes",
+                  "before the edit" in differs[0]["bytes_differ"], differs[0])
+    os.remove(oneline)
+
+
 def group_polish(c):
     """What the polish after an edit does to the record of that edit: an
     import organizer rewrites lines above it, and undo has to take those
@@ -3110,6 +3274,7 @@ GROUPS = [
     ("ambiguity", group_ambiguity),
     ("undo", group_undo),
     ("multifile", group_multifile),
+    ("bytes", group_bytes),
     ("polish", group_polish),
     ("verdict", group_verdict),
     ("search", group_search),

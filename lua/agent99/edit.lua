@@ -1750,6 +1750,11 @@ end
 function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     opts = opts or post_edit_options()
     ctx = ctx or {}
+    -- A buffer wiped between the edit and the report (undoing a create_file
+    -- deletes the file and its buffer) is no buffer at all here. Reading an
+    -- option off it threw "Invalid buffer id" and the caller got that raw
+    -- Lua error in place of its reply.
+    if bufnr and not vim.api.nvim_buf_is_valid(bufnr) then bufnr = nil end
     -- The closure the caller computed before its edit: the files that use
     -- what this edit changed, already loaded and settled. They are `also`
     -- files like a move's referrers - this call did not edit them - and the
@@ -2444,7 +2449,22 @@ local function edit_note(args)
     return "applied to the editor buffer (unsaved)"
 end
 
+-- What the file held before this edit, as bytes, and what it holds now.
+-- The ledger replays lines, and a list of lines cannot express the last byte
+-- of a file: an edit to a file with no final newline added one, outside the
+-- region the reply reported, and the undo put every line back and still left
+-- the file different while answering `remaining: 0`. The digest is what lets
+-- the undo say so.
+local function whole_before(bufnr, first, old_lines, new_count)
+    local whole = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local was = vim.list_slice(whole, 1, first - 1)
+    vim.list_extend(was, old_lines or {})
+    vim.list_extend(was, vim.list_slice(whole, first + new_count))
+    return table.concat(was, "\n") .. core.eol_suffix(bufnr, was)
+end
+
 local function record_edit(bufnr, entry_path, kind, first, last, old_lines, new_lines)
+    local before_text = whole_before(bufnr, first, old_lines, #new_lines)
     require("agent99.edits").record({
         file = vim.api.nvim_buf_get_name(bufnr),
         bufnr = bufnr,
@@ -2455,7 +2475,83 @@ local function record_edit(bufnr, entry_path, kind, first, last, old_lines, new_
         old_lines = old_lines,
         new_lines = new_lines,
         new_count = #new_lines,
+        before_sha = vim.fn.sha256(before_text),
+        before_bytes = #before_text,
     })
+end
+
+-- A BOM is invisible in a line echo and changes every byte offset in the
+-- file, so `verify=` has to name it.
+local BOMS = {
+    ["\239\187\191"] = "UTF-8",
+    ["\255\254\0\0"] = "UTF-32LE",
+    ["\0\0\254\255"] = "UTF-32BE",
+    ["\255\254"] = "UTF-16LE",
+    ["\254\255"] = "UTF-16BE",
+}
+
+-- What `verify=` exists to answer and its line echo structurally cannot.
+-- Two files whose bytes differ produce the identical array of lines: a CRLF
+-- file and an LF one, a file with a final newline and one without, a file
+-- carrying a BOM and one that is not. This describes the bytes themselves,
+-- so the caller can settle those questions without a re-read.
+local function byte_report(text)
+    local crlf = select(2, text:gsub("\r\n", ""))
+    local lf = select(2, text:gsub("\n", "")) - crlf
+    local cr = select(2, text:gsub("\r", "")) - crlf
+    local kinds = {}
+    if lf > 0 then kinds[#kinds + 1] = { "LF", lf } end
+    if crlf > 0 then kinds[#kinds + 1] = { "CRLF", crlf } end
+    if cr > 0 then kinds[#kinds + 1] = { "CR", cr } end
+    local endings
+    if #kinds == 0 then
+        endings = "none: the file is one line with no terminator"
+    elseif #kinds == 1 then
+        endings = kinds[1][1]
+    else
+        local parts = {}
+        for _, k in ipairs(kinds) do parts[#parts + 1] = ("%d %s"):format(k[2], k[1]) end
+        endings = "mixed: " .. table.concat(parts, ", ")
+    end
+    -- The longest match wins: a UTF-32LE BOM starts with a UTF-16LE one.
+    local bom, bom_len = "none", 0
+    for prefix, name in pairs(BOMS) do
+        if #prefix > bom_len and text:sub(1, #prefix) == prefix then
+            bom, bom_len = name, #prefix
+        end
+    end
+    local last = text:sub(-1)
+    return {
+        bytes = #text,
+        sha256 = vim.fn.sha256(text),
+        line_endings = endings,
+        final_newline = text ~= "" and (last == "\n" or last == "\r"),
+        bom = bom,
+    }
+end
+
+-- The byte report for a buffer, describing what a save of it puts on disk.
+-- In a headless workspace the bridge saves immediately after the call, so
+-- this is the file; in a live editor it is the buffer, which is what the
+-- reply's `note` says was written to anyway.
+local function verified_bytes(bufnr)
+    return byte_report(core.buf_bytes(bufnr))
+end
+
+-- What `path` holds now, as bytes: the buffer when one is loaded for it (a
+-- headless workspace saves that a moment later either way), the file
+-- otherwise. nil when neither can be read.
+local function current_bytes(path)
+    local bufnr = vim.fn.bufnr(path)
+    if bufnr ~= -1 and vim.api.nvim_buf_is_loaded(bufnr) then
+        pcall(core.resync_buf, bufnr)
+        return core.buf_bytes(bufnr)
+    end
+    local fh = io.open(path, "rb")
+    if not fh then return nil end
+    local data = fh:read("a")
+    fh:close()
+    return data or ""
 end
 
 -- Text reaches an edit tool through a JSON round trip, and an escape can
@@ -2592,6 +2688,9 @@ local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_o
     local odd = odd_bytes(new_lines)
     if args.verify or #odd > 0 then
         fields.new_text = new_lines
+    end
+    if args.verify then
+        fields.verified = verified_bytes(bufnr)
     end
     if #odd > 0 then
         fields.control_characters = ("the written text holds %s; if that came from an escape "
@@ -3676,7 +3775,14 @@ local function insert_lines(args)
         end
         local conflict = primary_region_conflict(bufnr, row + 1, row + 1)
         if conflict then err("%s: %s", rel_path(path), conflict) end
-        targets[#targets + 1] = { bufnr = bufnr, row = row, path = path }
+        -- A 0-byte file loads as one empty line, and that line is not in the
+        -- file: inserting beside it wrote a blank line nobody asked for and
+        -- the reply's "1 line above line 1" did not account for it. Write
+        -- over it instead, so what lands is what was sent.
+        local phantom = vim.b[bufnr].agent99_eol == "empty" and total == 1
+            and (vim.api.nvim_buf_get_lines(bufnr, 0, 1, false)[1] or "") == ""
+        targets[#targets + 1] = { bufnr = bufnr, row = phantom and 0 or row,
+            path = path, phantom = phantom }
     end
     if args.dry_run then
         local previews = {}
@@ -3697,10 +3803,14 @@ local function insert_lines(args)
         for _, t in ipairs(targets) do
             settle_before_edit(t.bufnr)
             local before = diag_snapshot()
-            vim.api.nvim_buf_set_lines(t.bufnr, t.row, t.row, false, lines)
+            local over = t.phantom and 1 or 0
+            vim.api.nvim_buf_set_lines(t.bufnr, t.row, t.row + over, false, lines)
             reports[#reports + 1] = finish_edit(t.bufnr, args, before,
-                ("%s:%d"):format(rel_path(t.path), t.row + 1), "insert_lines", t.row + 1, t.row,
-                {}, #lines, { inserted = ("%d line(s) above line %d"):format(#lines, t.row + 1) })
+                ("%s:%d"):format(rel_path(t.path), t.row + 1), "insert_lines", t.row + 1,
+                t.row + over, t.phantom and { "" } or {}, #lines,
+                { inserted = t.phantom
+                    and ("%d line(s) into the empty file"):format(#lines)
+                    or ("%d line(s) above line %d"):format(#lines, t.row + 1) })
         end
     end)
     if #reports == 1 then return reports[1] end
@@ -3760,7 +3870,7 @@ local function undo_edit(args)
     end
     local before = diag_snapshot()
     local undone, refused, dropped = edits.undo_last(count, args.skip == true)
-    local out = {}
+    local out, items = {}, {}
     for _, e in ipairs(undone) do
         local item = { file = rel_path(e.file), symbol = e.name_path, kind = e.kind }
         if e.file_op then
@@ -3771,7 +3881,13 @@ local function undo_edit(args)
             item.restored_lines = ("%d-%d"):format(e.first, e.first + #e.old_lines - 1)
         end
         out[#out + 1] = item
-        last_bufnr = e.bufnr or last_bufnr
+        items[#items + 1] = { item = item, entry = e }
+        -- Only a buffer that is still there: a later step in the same call
+        -- can be the undo of a create_file, which wipes the buffer, and the
+        -- report built from it then threw "Invalid buffer id" - a raw Lua
+        -- error, in place of the account of an undo that had in fact
+        -- succeeded.
+        if e.bufnr and vim.api.nvim_buf_is_valid(e.bufnr) then last_bufnr = e.bufnr end
     end
     -- Steps left, not files left: one rename across seven files is one. Left
     -- of this client's own edits: another client's stand whatever this says.
@@ -3811,16 +3927,75 @@ local function undo_edit(args)
         result.refused = cap.list(refused, MAX_UNDONE_SHOWN, "refused entries",
             "they were all left alone")
     end
-    if last_bufnr then
+    -- Everything from here on is about a restore that has already happened
+    -- and is already on disk. An error in it used to leave the caller with a
+    -- raw Lua error and no account at all of what had been undone, while the
+    -- files were in fact reverted; whatever goes wrong now, the account
+    -- survives and says what was not managed.
+    local ok_tail, tail_err = pcall(function()
+        -- The `incomplete` wording below is reachable only when something in
+        -- here throws, and the one thing known to throw it has just been
+        -- fixed. A wording nothing exercises is a wording whose first defect
+        -- ships, so this seam lets the tests drive it.
+        local fault = os.getenv("AGENT99_FAULT_UNDO_TAIL")
+        if fault and fault ~= "" then error(fault, 0) end
+        if last_bufnr and not vim.api.nvim_buf_is_valid(last_bufnr) then
+            last_bufnr = nil
+        end
+        if not last_bufnr then return end
         local opts = post_edit_options()
         if opts.organize_imports then
             -- Imports added for the undone code would now be unused (an
             -- error in Go); let the server drop them again.
-            local seen = {}
+            --
+            -- This pass rewrites the file, and used to do it silently: a
+            -- one-line Go file came back from its undo as three, with no
+            -- polish_diff and no `polished` - the forward edit admits what
+            -- the same pass does to it, and the undo did not.
+            local seen, polished, diff = {}, {}, {}
             for _, e in ipairs(undone) do
                 if e.bufnr and not seen[e.bufnr] and vim.api.nvim_buf_is_valid(e.bufnr) then
                     seen[e.bufnr] = true
-                    organize_imports(e.bufnr)
+                    local was = vim.api.nvim_buf_get_lines(e.bufnr, 0, -1, false)
+                    if organize_imports(e.bufnr) then
+                        local now = vim.api.nvim_buf_get_lines(e.bufnr, 0, -1, false)
+                        if not vim.deep_equal(was, now) then
+                            polished[#polished + 1] = rel_path(e.file)
+                            local d = text_diff(
+                                table.concat(was, "\n") .. "\n",
+                                table.concat(now, "\n") .. "\n",
+                                { result_type = "unified", ctxlen = 1 })
+                            if type(d) == "string" and d ~= "" then
+                                for _, l in ipairs(vim.split(d:gsub("\n$", ""), "\n", { plain = true })) do
+                                    diff[#diff + 1] = l
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            if #polished > 0 then
+                result.polished = ("organized imports, after the restore, in %s")
+                    :format(table.concat(polished, ", "))
+                if #diff > 0 then
+                    result.polish_diff = cap.list(diff, POLISH_DIFF_LINES, "diff lines",
+                        "the whole of the pass is in the files")
+                end
+            end
+        end
+        -- Are the files byte-identical to what they were before the edits
+        -- this call took back? The ledger replays lines, and a line cannot
+        -- carry the file's last byte or what the polish above did, so
+        -- `remaining: 0` was answered over five files still off their
+        -- baseline.
+        for _, pair in ipairs(items) do
+            local e = pair.entry
+            if e.before_sha and e.bufnr and vim.api.nvim_buf_is_valid(e.bufnr) then
+                local now = core.buf_bytes(e.bufnr)
+                if vim.fn.sha256(now) ~= e.before_sha then
+                    pair.item.bytes_differ = ("the lines were put back, but the file is %d bytes "
+                        .. "where it was %d before the edit; it is not byte-identical to what it was")
+                        :format(#now, e.before_bytes)
                 end
             end
         end
@@ -3835,6 +4010,11 @@ local function undo_edit(args)
             post_edit_report(last_bufnr, before, args.root, args.headless, opts,
                 args.full_diagnostics, { own = own, closure = cl }))
         result.note = edit_note(args)
+    end)
+    if not ok_tail then
+        result.incomplete = ("the files listed under `undone` were restored and written; "
+            .. "what comes after that did not finish, so this reply carries no verdict on the "
+            .. "result and no account of any polish pass: %s"):format(tostring(tail_err))
     end
     return result
 end
@@ -4570,25 +4750,53 @@ local function create_file(args)
         err("text must be a string")
     end
     local dir = vim.fn.fnamemodify(path, ":h")
-    if vim.fn.isdirectory(dir) == 0 and vim.fn.mkdir(dir, "p") == 0 then
-        err("could not create the directory %s", rel_path(dir))
+    -- The directories this call has to make, deepest last, so undoing the
+    -- create can take them back: a create_file three levels down left two
+    -- empty directories behind after its undo, and nothing said so.
+    local made_dirs = {}
+    if vim.fn.isdirectory(dir) == 0 then
+        local probe = dir
+        while probe ~= "" and probe ~= "/" and vim.fn.isdirectory(probe) == 0 do
+            table.insert(made_dirs, 1, probe)
+            local up = vim.fn.fnamemodify(probe, ":h")
+            if up == probe then break end
+            probe = up
+        end
+        if vim.fn.mkdir(dir, "p") == 0 then
+            err("could not create the directory %s", rel_path(dir))
+        end
     end
     local files = { { uri = file_uri(path) } }
     apply_will_file_operation("workspace/willCreateFiles", files)
-    local lines = vim.split((text or ""):gsub("\n$", ""), "\n", { plain = true })
-    if vim.fn.writefile(lines, path) ~= 0 then
+    -- Byte for byte, in binary mode: writefile's ordinary mode puts a
+    -- newline after the last line, so a `text` that did not end in one got
+    -- a byte the caller never sent, in no field of the reply, and with
+    -- verify= producing no echo there was nothing to read it off.
+    local text_lines = vim.split(text or "", "\n", { plain = true })
+    if vim.fn.writefile(text_lines, path, "b") ~= 0 then
         err("could not write %s", rel_path(path))
     end
+    -- A trailing newline makes an empty last element; it is a terminator,
+    -- not a line.
+    local line_count = #text_lines
+    if line_count > 0 and text_lines[line_count] == "" then line_count = line_count - 1 end
     notify_file_operation("workspace/didCreateFiles", files)
 
     local before = diag_snapshot()
     local bufnr = load_buf(path)
     settle_before_edit(bufnr)
     local opts = post_edit_options(args)
-    local _, _, done, _, info = polish_after_edit(bufnr, 1, #lines, opts)
+    local _, _, done, _, info = polish_after_edit(bufnr, 1, line_count, opts)
     if args.headless then
         write_buf(bufnr)
     end
+    -- What this call put in the file, so its undo can tell a file it wrote
+    -- from one that has been written to since. Undoing a create used to
+    -- delete whatever the file held by then: five lines another tool had
+    -- appended went with it, unrecoverably, with nothing in the reply about
+    -- it and no counterpart to delete_file's "restorable" note.
+    local created = core.buf_bytes(bufnr)
+    local created_sha, created_bytes = vim.fn.sha256(created), #created
     require("agent99.edits").record_file_op({
         file = path,
         kind = "create_file",
@@ -4597,16 +4805,28 @@ local function create_file(args)
             if not now then
                 return "the file is already gone"
             end
+            local held = current_bytes(path)
+            if held and vim.fn.sha256(held) ~= created_sha then
+                return ("the file has changed since create_file wrote it (%d bytes now, %d then), "
+                    .. "so deleting it would destroy those changes; delete it by hand if that is "
+                    .. "what you want, or pass skip=true to leave it and undo the rest")
+                    :format(#held, created_bytes)
+            end
             forget_buf(path)
             if vim.fn.delete(path) ~= 0 then
                 return "could not delete it"
             end
             notify_file_operation("workspace/didDeleteFiles", files)
+            -- Only the directories this create made, and only while they are
+            -- empty: anything else in them is somebody's.
+            for i = #made_dirs, 1, -1 do
+                if vim.fn.delete(made_dirs[i], "d") ~= 0 then break end
+            end
             return nil
         end,
     })
 
-    local result = { created = rel_path(path), lines = #lines, note = edit_note(args) }
+    local result = { created = rel_path(path), lines = line_count, note = edit_note(args) }
     if #done > 0 then
         result.polished = table.concat(done, ", ")
         if info.diff then
@@ -4618,6 +4838,22 @@ local function create_file(args)
     end
     if info.imports_note then
         result.imports_note = info.imports_note
+    end
+    -- verify= was accepted here and answered with nothing at all, which is
+    -- precisely the failure it exists to close: the argument that promises
+    -- the caller need not re-read the file was the one call in which the
+    -- file's bytes were not what was sent.
+    local written = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local odd = odd_bytes(written)
+    if args.verify or #odd > 0 then
+        result.new_text = written
+    end
+    if #odd > 0 then
+        result.control_characters = ("the written text holds %s; if that came from an escape "
+            .. "in the request, the escape did not survive the round trip"):format(table.concat(odd, ", "))
+    end
+    if args.verify then
+        result.verified = byte_report(created)
     end
     return vim.tbl_extend("force", result,
         post_edit_report(bufnr, before, args.root, args.headless, opts, args.full_diagnostics))
@@ -5234,6 +5470,10 @@ M.move_symbols = move_symbols
 M.indent_profile = indent_profile
 M.format_damage = format_damage
 M.map_region = map_region
+-- Also for the unit checks: what verify= answers about a file's bytes. A
+-- BOM, a CR-only file and a mixed-ending file are all hard to arrange
+-- through the tools and easy to hand to this directly.
+M.byte_report = byte_report
 -- Exported for tests/unit_edit.lua: whether a diagnostic in a file a move only
 -- loaded is the move's doing. Getting this wrong drops a real error silently.
 M.mentions_name = mentions_name
