@@ -1655,6 +1655,18 @@ def group_verdict(c):
         "file": util, "name_path": "M.greet", "first_line": 2, "last_line": 2,
         "text": '    return "hello, " .. nme',
     })
+    # The exact signal: publishDiagnostics carries the version of the text it
+    # describes, and this edit made the server publish, so the verdict came
+    # from lua_ls stating which version it had analyzed rather than from
+    # waiting out a settle guess. AGENT99_DEBUG_VERDICT surfaces which of the
+    # two it was; without it the wording is the only tell. The first edit of
+    # the group cannot reach this state - a clean file makes a push-only
+    # server publish nothing at all, which is the gap pull diagnostics would
+    # close (see the design note in edit.lua).
+    if os.environ.get("AGENT99_DEBUG_VERDICT"):
+        check("the verdict came from the server's own document version",
+              res.get("verdict_basis") == "version"
+              and "lua_ls" in (res.get("verdict_stamps") or ""), res)
     check("post-edit reports the new error",
           isinstance(res.get("diagnostics_after"), list)
           and any("nme" in d for d in res["diagnostics_after"]), res)

@@ -17,6 +17,10 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$PATH:$HOME/.local/share/nvim/mason/bin"
+# Surfaces which signal the edit verdict actually rested on (the server's own
+# document version, or the settle guess). One check asserts on it, and it is
+# the first thing to look at when a verdict turns out to have been early.
+export AGENT99_DEBUG_VERDICT=1
 
 ALL_SUITES="unit mcp headless multi debug"
 HEADLESS_GROUPS="workspace index edit indent ambiguity undo multifile polish verdict search files tests lifecycle"

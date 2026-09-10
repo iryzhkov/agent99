@@ -772,6 +772,42 @@ end
 --    the next reply, so a wrong estimate delays attribution rather than
 --    losing the diagnostic. With post_edit.wait off the whole report is
 --    deferred that way and the edit tool returns as soon as the text is in.
+--
+-- The barrier alone turned out not to be enough, and the reason is worth
+-- keeping: `textDocument/documentSymbol` is answered off the syntax tree,
+-- which pyright and tsserver have ready in single-digit milliseconds, while
+-- type checking runs on a separate queue and publishes later. So the ack
+-- proves the server read the edit, not that it finished thinking about it,
+-- and the settle that follows is silence measured before the analysis
+-- started. Two things now sit above it:
+--
+--  * Version stamping (exact): publishDiagnostics carries the version of the
+--    text it describes, and Neovim sends the buffer's changedtick as that
+--    version. A publish stamped with the version we wrote is the server's own
+--    statement that it analyzed this edit. Nothing is inferred from silence,
+--    so no settle is waited out at all. Servers that omit the version fall
+--    through to the heuristic, and the reply says which basis it had.
+--  * Progress (a veto): a workDoneProgress token opened after the change is
+--    the server saying outright that it is still working, whatever the clock
+--    says. Tokens already open before the edit are somebody else's work.
+--
+-- Two more ideas, not implemented, in the order they are worth trying if the
+-- two above prove insufficient:
+--
+--  * A semantic barrier for servers that do not stamp versions: pull
+--    diagnostics (`textDocument/diagnostic`, LSP 3.17) cannot be answered
+--    without analyzing, which is exactly the property documentSymbol lacks.
+--    It was tried once and dropped because pyright answers the pull and
+--    pushes as well and every diagnostic appeared twice - but that is a
+--    deduplication problem, and the fix is to discard the pull's payload and
+--    use it purely as the barrier, the way the documentSymbol reply is
+--    discarded today. `semanticTokens/full` needs binding information too.
+--  * Cross-file: version stamping speaks for the edited buffer only. A move
+--    that leaves a stale import in a third file needs that file re-analyzed,
+--    which servers do lazily and may not do at all until asked. move_symbols
+--    loads those files (ctx.also); a pull diagnostic per file would be the
+--    semantic barrier for them, and would have caught the black probe's
+--    trans.py breakage at reply time instead of 230 ms later.
 
 -- When each buffer last had diagnostics published, and by which server,
 -- from one listener that outlives any single wait.
@@ -791,6 +827,93 @@ local ever_published = {}  -- [client.name] = true
 -- first edit being the one that breaks a file and reads as clean.
 local edits_acked = {}     -- [client.name] = count
 local SILENT_AFTER = 1
+
+-- The document version each server last published diagnostics for, and which
+-- servers stamp a version at all. This is the exact signal the settle
+-- heuristic was standing in for: `textDocument/publishDiagnostics` carries the
+-- version of the text the diagnostics describe, so a publish stamped with the
+-- version we just sent is proof the server analyzed THIS edit rather than the
+-- one before it. Neovim sends the buffer's changedtick as the version
+-- (vim/lsp.lua sets util.buf_versions[bufnr] = changedtick) and then discards
+-- params.version in its own handler, so the wrapper below is what recovers it.
+-- Neovim's codelens, inlay_hint, semantic_tokens and linked_editing_range all
+-- compare against util.buf_versions the same way.
+local publish_version = {}  -- [bufnr] = { [client.name] = version }
+local stamps_version = {}   -- [client.name] = true once a version is seen
+
+-- Work a server has open that began after our change. gopls, pyright and
+-- rust-analyzer all open a workDoneProgress while they analyze, so a token
+-- still open is the server saying outright that it has not finished. Only
+-- tokens that began after the edit count: a workspace load that was already
+-- running is not this edit's business and would otherwise block every wait
+-- until its full budget expired.
+local progress_open = {}    -- [client.name] = { [token] = began_ms }
+
+local function wrap_publish_handler(client)
+    -- Per client, not on the global vim.lsp.handlers table. Client:_resolve_handler
+    -- reads `self.handlers[method] or lsp.handlers[method]`, so a per-client entry
+    -- is consulted first and needs no load-order luck: wrapping the global table
+    -- when agent99 loads did nothing at all, because that ran before vim.lsp had
+    -- populated it and the wrap silently no-opped (publish_seen stayed 0 over a
+    -- whole smoke run, which is how this was caught).
+    if not client or client._agent99_publish_wrapped then return end
+    client._agent99_publish_wrapped = true
+    client.handlers = client.handlers or {}
+    local inner = client.handlers["textDocument/publishDiagnostics"]
+        or vim.lsp.handlers["textDocument/publishDiagnostics"]
+    if not inner then return end
+    client.handlers["textDocument/publishDiagnostics"] = function(lsp_err, params, ctx, cfg)
+        local version = params and params.version
+        if version then
+            stamps_version[client.name] = true
+            local bufnr = params.uri and vim.uri_to_bufnr(params.uri)
+            if bufnr then
+                local per = publish_version[bufnr] or {}
+                publish_version[bufnr] = per
+                -- A server may still be working through older changes; the
+                -- newest version it has spoken for is the one that counts.
+                if (per[client.name] or -1) < version then per[client.name] = version end
+            end
+        end
+        return inner(lsp_err, params, ctx, cfg)
+    end
+end
+
+vim.api.nvim_create_autocmd("LspAttach", {
+    group = vim.api.nvim_create_augroup("agent99_publish_version", { clear = true }),
+    callback = function(ev)
+        wrap_publish_handler(ev.data and ev.data.client_id
+            and vim.lsp.get_client_by_id(ev.data.client_id))
+    end,
+})
+
+vim.api.nvim_create_autocmd("LspProgress", {
+    group = vim.api.nvim_create_augroup("agent99_progress", { clear = true }),
+    callback = function(ev)
+        local data = ev.data or {}
+        local client = data.client_id and vim.lsp.get_client_by_id(data.client_id)
+        local token = data.params and data.params.token
+        if not (client and token ~= nil) then return end
+        local kind = data.params.value and data.params.value.kind
+        local open = progress_open[client.name] or {}
+        progress_open[client.name] = open
+        if kind == "begin" then
+            open[token] = vim.uv.now()
+        elseif kind == "end" then
+            open[token] = nil
+        end
+    end,
+})
+
+-- Whether any of these servers has work open that started after `since`.
+local function progress_since(names, since)
+    for _, name in ipairs(names or {}) do
+        for _, began in pairs(progress_open[name] or {}) do
+            if began >= since then return true end
+        end
+    end
+    return false
+end
 
 local function client_names_of(diags)
     local names = {}
@@ -925,17 +1048,39 @@ end
 -- Whether the servers have said all they will about the change made at
 -- `since`: a publish followed by `settle` of quiet, or every barrier
 -- answered and `settle` of quiet after the last answer.
-local function verdict_in(bufnr, since, acks, settle)
+local function verdict_in(bufnr, since, acks, settle, names, want_version)
     local now = vim.uv.now()
+    -- A server that is telling us it is still working has not finished,
+    -- whatever the clock says. This outranks every signal below it.
+    if progress_since(names, since) then
+        return false, false, "working"
+    end
+    -- The exact answer, where the servers give it: every server attached to
+    -- this buffer that stamps its publishes has now spoken for a version at
+    -- least as new as the text we wrote. Nothing is inferred from silence
+    -- here, so there is no settle to wait out either.
+    if want_version then
+        local per = publish_version[bufnr] or {}
+        local stamped, all_current = 0, true
+        for _, name in ipairs(names or {}) do
+            if stamps_version[name] then
+                stamped = stamped + 1
+                if (per[name] or -1) < want_version then all_current = false end
+            end
+        end
+        if stamped > 0 and stamped == #(names or {}) and all_current then
+            return true, true, "version"
+        end
+    end
     local lp = last_publish[bufnr]
     if lp and lp.at >= since then
-        return now - lp.at >= settle, true
+        return now - lp.at >= settle, true, "published"
     end
     local acked = all_acked(acks)
     if acked and next(acks) ~= nil then
-        return now - acked >= settle, false
+        return now - acked >= settle, false, "acked"
     end
-    return false, false
+    return false, false, "waiting"
 end
 
 -- Record what a publish on bufnr since `since` says about each server's
@@ -964,6 +1109,10 @@ end
 local function wait_for_diagnostics(bufnr, root, wait_ms, settle_ms, since, acks, names)
     since = since or vim.uv.now()
     if not acks then acks, names = send_barriers(bufnr, root) end
+    -- Read after the barriers: client:request flushes any pending didChange
+    -- before it sends, so by now the server has been told about this edit and
+    -- buf_versions holds the version it was told about.
+    local want_version = vim.lsp.util.buf_versions and vim.lsp.util.buf_versions[bufnr] or nil
     -- Counted here rather than at the end of an edit, so that settling a
     -- buffer before an edit counts too. Gating the "this server has reported
     -- nothing" caveat on three finished edits meant the first edit of a
@@ -974,33 +1123,38 @@ local function wait_for_diagnostics(bufnr, root, wait_ms, settle_ms, since, acks
     end
     local settle = settle_for(root, names, settle_ms, wait_ms)
     local deadline = since + wait_ms
-    local done, published = verdict_in(bufnr, since, acks, settle)
+    local done, published, how = verdict_in(bufnr, since, acks, settle, names, want_version)
     while not done and vim.uv.now() < deadline do
         sleep(50)
-        done, published = verdict_in(bufnr, since, acks, settle)
+        done, published, how = verdict_in(bufnr, since, acks, settle, names, want_version)
     end
     learn_from(bufnr, root, since, nil)
-    -- How much the wait actually established, which is not the same question
-    -- as whether it finished:
-    --   "published" - the server published for this buffer after the change
-    --                 and then went quiet. This is a verdict.
-    --   "acked"     - every server answered the barrier and then said nothing.
-    --                 For a push-only server with a known lag that means
-    --                 clean; for one whose lag has never been measured it
-    --                 means only that the settle guess expired. pyright on a
-    --                 repository the size of black published 230 ms after a
-    --                 reply that had already called the edit clean.
-    --   "timeout"   - the budget ran out with the servers still talking.
+    -- What the wait actually established, which is not the same question as
+    -- whether it finished:
+    --   "version"    - every server stamped a publish for the text we wrote.
+    --                  This is the server's own statement, not an inference.
+    --   "published"  - a publish arrived for this buffer and was followed by
+    --                  quiet. Good, but the publish may have been for an
+    --                  earlier version.
+    --   "unmeasured" - the servers answered the barrier and said nothing, and
+    --                  none of them has been timed here yet, so the settle was
+    --                  a guess and its expiry proves nothing. pyright
+    --                  published two errors 230 ms after a reply that had
+    --                  already called a move clean, and tsserver 66 ms after
+    --                  another; both had answered the barrier at once, because
+    --                  documentSymbol comes off the syntax tree while type
+    --                  checking runs on another queue.
+    --   "timeout"    - the budget ran out with the servers still talking.
     local basis = "timeout"
-    if published then
+    if how == "version" then
+        basis = "version"
+    elseif published then
         basis = "published"
     elseif done then
         basis = "acked"
         for _, name in ipairs(names or {}) do
             local e = per_root(publish_lag, root)[name]
             if not (e and e.n >= LEARN_AFTER) then
-                -- Nothing measured for this server yet, so the settle was a
-                -- guess and its expiry proves nothing.
                 basis = "unmeasured"
                 break
             end
@@ -1120,7 +1274,7 @@ function flush_deferred(wait)
             deferred[bufnr] = nil
         else
             local settle = settle_for(d.root, d.names, d.opts.settle_ms, d.opts.wait_ms)
-            local ripe = verdict_in(bufnr, d.since, d.acks, settle)
+            local ripe = verdict_in(bufnr, d.since, d.acks, settle, d.names, d.version)
                 or vim.uv.now() >= d.since + d.opts.wait_ms
             if ripe or wait then
                 deferred[bufnr] = nil
@@ -1268,6 +1422,9 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         deferred[bufnr] = {
             since = since, acks = acks, names = names, before = before, root = root,
             headless = headless, opts = opts, full = full, label = label,
+            -- The version the servers were told about, so the deferred check
+            -- can use the same exact signal the waiting path does.
+            version = vim.lsp.util.buf_versions and vim.lsp.util.buf_versions[bufnr] or nil,
         }
         return {
             diagnostics_after = "deferred: the server's verdict on this edit comes with the next reply "
@@ -1284,6 +1441,11 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         basis = how
     end
     local report = {}
+    -- AGENT99_DEBUG_VERDICT surfaces which signal the wait actually got, which
+    -- is otherwise only visible through the wording it produces. Worth keeping:
+    -- "does this server stamp versions" is the question to ask first when an
+    -- edit verdict turns out to have been early.
+    local debug_verdict = os.getenv("AGENT99_DEBUG_VERDICT") ~= nil
     -- AGENT99_LINT_<FILETYPE> in the environment (handy for `claude mcp add
     -- -e`) overrides the configured command for that filetype.
     local template = os.getenv("AGENT99_LINT_" .. ft:upper():gsub("[^%w]", "_"))
@@ -1442,6 +1604,10 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
             end
         end
     end
+    if debug_verdict then
+        report.verdict_basis = basis
+        report.verdict_stamps = (vim.inspect(stamps_version):gsub("%s+", " "))
+    end
     local not_analyzed = bufnr and not_analyzed_reason(bufnr) or nil
     if not_analyzed then
         -- Reporting "no new errors" here would be a straight lie: the server
@@ -1505,6 +1671,13 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
             .. "this line checks nothing. The hints below are the whole of what it has to "
             .. "say about these files; check_project runs the project's own build or check")
             :format(scope)
+    elseif #new_here == 0 and basis == "version" and structural then
+        -- Worth one clause on a structural change, because the alternative
+        -- wording on this branch is "provisional": here the servers stamped a
+        -- publish for the exact text that was written, so nothing is inferred.
+        report.diagnostics_after = "no new errors or warnings, and every server on this file "
+            .. "published for the version this edit wrote, so that is their answer rather "
+            .. "than a guess from how long they stayed quiet"
     elseif #new_here == 0 then
         report.diagnostics_after = "no new errors or warnings"
     else
