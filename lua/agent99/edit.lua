@@ -1891,7 +1891,27 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         -- edit is real, and nothing checked it.
         report.diagnostics_after = "not checked: " .. dialect_note(bufnr)
     elseif not attached and bufnr then
-        report.diagnostics_after = "no language server attached to this file; nothing checked"
+        -- For JSON, YAML, TOML and Markdown no server is ever coming, and
+        -- "nothing checked" was the whole of what an edit to one said - while
+        -- the edit had, in the JSON case, left the file unparseable. The
+        -- grammar that located the symbol can answer for the file's syntax.
+        -- That is not a type check and does not pretend to be one, but it is
+        -- the difference between a file that still loads and one that does
+        -- not. When the grammar says the file is broken, finish_edit leads
+        -- the verdict with that instead.
+        local broken = core.has_parser(ft)
+            and require("agent99.syntax").first_error(bufnr) or nil
+        if not core.has_parser(ft) then
+            report.diagnostics_after = "no language server attached to this file; nothing checked"
+        elseif broken then
+            -- Said without a cause: only the caller of finish_edit knows
+            -- whether this edit is what broke it, and it says so there.
+            report.diagnostics_after = ("no language server attached to this file, and the %s "
+                .. "grammar does not parse it as it now stands"):format(ft)
+        else
+            report.diagnostics_after = ("no language server attached to this file; the %s "
+                .. "grammar still parses it, which is all that was checked"):format(ft)
+        end
     elseif not bufnr then
         -- delete_file: nothing is left to report against, and the old line
         -- claimed the project on the strength of whatever happened to be
@@ -2405,9 +2425,42 @@ local function finish_edit(bufnr, args, before, ledger_path, kind, first, last_o
         fields.control_characters = ("the written text holds %s; if that came from an escape "
             .. "in the request, the escape did not survive the round trip"):format(table.concat(odd, ", "))
     end
-    return vim.tbl_extend("error", fields,
-        post_edit_report(bufnr, before, args.root, args.headless, opts, args.full_diagnostics,
-            { label = edit_label(kind, bufnr), closure = cl }))
+    -- Does the file still parse? Every symbol edit locates its target with a
+    -- treesitter parser and then writes lines, and where the two disagree the
+    -- file is left invalid: a JSON pair's separating comma sat outside the
+    -- node, so replacing the pair ate it and the reply said "applied and
+    -- saved to disk" over a file json.load could no longer read. The parser
+    -- is already in hand; asking it again is the whole check. Only when the
+    -- tree is broken is the pre-edit text reconstructed and parsed too, so a
+    -- file that arrived invalid is not blamed on the edit that touched it.
+    local syntax = require("agent99.syntax")
+    local broke = syntax.first_error(bufnr)
+    if broke then
+        local whole = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+        local was = vim.list_slice(whole, 1, pfirst - 1)
+        vim.list_extend(was, old_lines)
+        vim.list_extend(was, vim.list_slice(whole, pfirst + #new_lines))
+        if syntax.error_in_lines(was, vim.bo[bufnr].filetype) then
+            broke = nil
+        end
+    end
+    local report = post_edit_report(bufnr, before, args.root, args.headless, opts,
+        args.full_diagnostics, { label = edit_label(kind, bufnr), closure = cl })
+    if broke then
+        -- The two things the old reply got wrong, in the two fields a reader
+        -- checks: the note called it done, and the verdict deferred to a
+        -- language server that no data format has.
+        fields.note = fields.note .. ", and the file no longer parses"
+        local said = report.diagnostics_after
+        -- A server's own verdict is kept beside the grammar's - the two
+        -- answer different questions - but "nothing checked" from a file
+        -- that has no server and never will is what this replaces.
+        local keep = type(said) == "string"
+            and #vim.lsp.get_clients({ bufnr = bufnr }) > 0
+        report.diagnostics_after = syntax.clause(bufnr, broke)
+            .. (keep and (". The language server's own answer: " .. said) or "")
+    end
+    return vim.tbl_extend("error", fields, report)
 end
 
 -- A unified diff of what an edit would do, for the dry_run of the tools that
@@ -2454,6 +2507,19 @@ local function replace_symbol_body(args)
     -- Only the final line terminator, not the blank lines before it.
     local new_lines = vim.split((args.body:gsub("\n$", "")), "\n", { plain = true })
     local old = vim.api.nvim_buf_get_lines(bufnr, entry.first - 1, entry.last, false)
+    -- What is on the declaration's own lines but not part of the declaration.
+    -- The tool replaced whole lines, so anything sharing the first or the last
+    -- of them went with the symbol: a JSON object's separating comma sits
+    -- after the pair the caller named and was eaten by every edit to it - the
+    -- file stopped parsing and the reply said "applied and saved to disk" -
+    -- and `package pkg; func OneLiner() int { ... }` lost its package clause.
+    -- Only treesitter entries carry columns; a language server's do not, and
+    -- those stay line-granular as before.
+    local head = entry.first_col and (old[1] or ""):sub(1, entry.first_col) or ""
+    -- Leading whitespace is the declaration's indentation, not something else
+    -- on the line; it is what the reindent below is for.
+    if head:match("^%s*$") then head = "" end
+    local tail = entry.last_col and (old[#old] or ""):sub(entry.last_col + 1) or ""
     -- Written at the declaration's own indentation, which is what the tool
     -- has always promised and did not do: a Python method replaced with a
     -- body starting at column 0 landed at column 0, so it and the method
@@ -2464,7 +2530,7 @@ local function replace_symbol_body(args)
     local reindented
     local want = (old[1] or ""):match("^[ \t]*") or ""
     local have = (new_lines[1] or ""):match("^[ \t]*") or ""
-    if want ~= have then
+    if want ~= have and head == "" then
         -- Shift by the difference rather than by rewriting a common prefix.
         -- Requiring every line to start with the first line's indentation
         -- meant one flush-left comment in an otherwise indented body
@@ -2487,9 +2553,21 @@ local function replace_symbol_body(args)
         reindented = ("the body was written at column %d and %s sits at column %d; "
             .. "every line was shifted by %d"):format(#have, entry.path, #want, #want - #have)
     end
+    local kept
+    if head ~= "" or tail ~= "" then
+        new_lines[1] = head .. new_lines[1]
+        new_lines[#new_lines] = new_lines[#new_lines] .. tail
+        kept = ("%s is not the whole of the line(s) it sits on; %s was left in place"):format(
+            entry.path,
+            head ~= "" and tail ~= ""
+                and ("%q before it and %q after it"):format(head, tail)
+                or (head ~= "" and ("%q before it"):format(head)
+                    or ("%q after it"):format(tail)))
+    end
     if args.dry_run then
         return vim.tbl_extend("force",
-            { file = rel_path(vim.api.nvim_buf_get_name(bufnr)), reindented = reindented },
+            { file = rel_path(vim.api.nvim_buf_get_name(bufnr)), reindented = reindented,
+                kept_on_the_line = kept },
             preview_diff(old, new_lines, entry.path))
     end
     local conflict = primary_region_conflict(bufnr, entry.first, entry.last)
@@ -2504,7 +2582,8 @@ local function replace_symbol_body(args)
     local before = diag_snapshot()
     vim.api.nvim_buf_set_lines(bufnr, entry.first - 1, entry.last, false, new_lines)
     return finish_edit(bufnr, args, before, entry.path, "replace", entry.first, entry.last,
-        old, #new_lines, { replaced = entry.path, reindented = reindented }, nil, cl)
+        old, #new_lines, { replaced = entry.path, reindented = reindented,
+            kept_on_the_line = kept }, nil, cl)
 end
 
 -- Join lines with each one's indentation dropped. Text that a format pass
@@ -3231,6 +3310,39 @@ local function blank_separator(bufnr)
     return vim.bo[bufnr].filetype == "python" and 2 or 1
 end
 
+-- Formats whose objects separate their members with a comma. YAML and TOML
+-- need nothing between two members, which is why the same bug was never seen
+-- in them.
+local JSON_LIKE = { json = true, jsonc = true, json5 = true }
+
+-- Where a comma has to go so that inserting next to `entry` leaves the object
+-- valid, or nil when the format needs none. `on_text` puts it after the
+-- inserted text (something already follows the anchor); `on_anchor` puts it
+-- after the anchor's own last line at row `row` (the anchor was the last
+-- member, so it is now followed by one).
+local function json_pair_separator(bufnr, entry, where)
+    if not JSON_LIKE[vim.bo[bufnr].filetype] or entry.kind ~= "pair" then
+        return nil
+    end
+    if where ~= "after" then
+        -- The anchor follows the new text, so the new text needs the comma
+        -- whatever else is around it.
+        return { on_text = true }
+    end
+    -- What is on the anchor's last line after the anchor itself. A comma
+    -- there means another member follows and the new text needs its own;
+    -- anything else (the object's closing brace, or nothing at all because
+    -- the brace is on the next line) means the anchor was the last member.
+    local rest = entry.last_col
+        and ((vim.api.nvim_buf_get_lines(bufnr, entry.last - 1, entry.last, false)[1] or "")
+            :sub(entry.last_col + 1))
+        or ""
+    if vim.trim(rest):sub(1, 1) == "," then
+        return { on_text = true }
+    end
+    return { on_anchor = true, row = entry.last }
+end
+
 local function insert_symbol_tool(where)
     return function(args)
         local bufnr, entry = resolve_symbol(args.file, args.name_path, nil, tonumber(args.line))
@@ -3238,6 +3350,7 @@ local function insert_symbol_tool(where)
             err("missing required argument: text")
         end
         local lines = vim.split((args.text:gsub("\n$", "")), "\n", { plain = true })
+        local ft = vim.bo[bufnr].filetype
         -- A blank line belongs between two functions and nowhere near two
         -- constants: inserting a sibling into a `const (...)` or `var (...)`
         -- block should not split the block in half. Single-line declarations
@@ -3249,11 +3362,27 @@ local function insert_symbol_tool(where)
         -- where PEP 8 and black want two between top-level definitions: an
         -- insert into black's own source produced one blank above the new
         -- function and two below it, which black would reformat in CI.
-        local spaced = (entry.last - entry.first) > 0
+        -- Never inside a data file: a blank line between two members of a
+        -- JSON object is not how anyone writes one, and the tool put one
+        -- there while also leaving the object unparseable.
+        local spaced = (entry.last - entry.first) > 0 and not JSON_LIKE[ft]
+            and ft ~= "yaml" and ft ~= "toml"
         -- The wider separator is a top-level rule: two blank lines between
         -- methods inside a Python class is one too many.
         local anchor = vim.api.nvim_buf_get_lines(bufnr, entry.first - 1, entry.first, false)[1] or ""
         local sep = anchor:match("^%s") == nil and blank_separator(bufnr) or 1
+        -- What a JSON object needs between two members and nothing else in
+        -- this tool ever supplied. Inserting after `"alpha": {...}` used to
+        -- put the new pair straight below it with no comma anywhere, and the
+        -- reply said "applied and saved to disk" over a file json.load could
+        -- no longer read.
+        local comma = json_pair_separator(bufnr, entry, where)
+        local separator
+        if comma and comma.on_text and not lines[#lines]:match(",%s*$") then
+            lines[#lines] = lines[#lines] .. ","
+            separator = "a comma was added after the inserted text: a JSON object "
+                .. "separates its members with one"
+        end
         local row -- 0-based insertion point
         if where == "after" then
             row = entry.last
@@ -3272,21 +3401,45 @@ local function insert_symbol_tool(where)
         end
         local conflict = primary_region_conflict(bufnr, row + 1, row + 1)
         if conflict then err(conflict) end
+        -- The anchor was the object's last member, so the comma goes after
+        -- it rather than after the new text. That rewrites the anchor's last
+        -- line, so the whole thing is written as one region and the ledger
+        -- holds it: an undo that gave back the inserted lines and left a
+        -- stray comma behind would be no undo at all.
+        local anchor_line, anchor_row
+        if comma and comma.on_anchor then
+            anchor_row = comma.row
+            anchor_line = vim.api.nvim_buf_get_lines(bufnr, anchor_row - 1, anchor_row, false)[1] or ""
+            separator = "a comma was added after " .. entry.path
+                .. ": it was the object's last member and now has one after it"
+        end
         -- Checked before it is written, like every other edit tool: files=
         -- probes each file with dry_run before it writes any of them, and a
         -- tool that ignores the flag inserted the text once for the probe
         -- and once for the edit, in every file it was given.
         if args.dry_run then
+            local preview, at = lines, ("+%d,%d"):format(row + 1, #lines)
+            if anchor_line then
+                preview = vim.list_extend({ anchor_line .. "," }, lines)
+                at = ("+%d,%d"):format(anchor_row, #preview)
+            end
             return vim.tbl_extend("force",
-                { file = rel_path(vim.api.nvim_buf_get_name(bufnr)) },
-                preview_diff({}, lines, ("%s %s"):format(where, entry.path),
-                    ("+%d,%d"):format(row + 1, #lines)))
+                { file = rel_path(vim.api.nvim_buf_get_name(bufnr)), separator = separator },
+                preview_diff(anchor_line and { anchor_line } or {}, preview,
+                    ("%s %s"):format(where, entry.path), at))
         end
         settle_before_edit(bufnr)
         local before = diag_snapshot()
+        if anchor_line then
+            local written = vim.list_extend({ anchor_line .. "," }, lines)
+            vim.api.nvim_buf_set_lines(bufnr, anchor_row - 1, anchor_row, false, written)
+            return finish_edit(bufnr, args, before, entry.path, "insert_" .. where,
+                anchor_row, anchor_row, { anchor_line }, #written,
+                { inserted = ("%s %s"):format(where, entry.path), separator = separator })
+        end
         vim.api.nvim_buf_set_lines(bufnr, row, row, false, lines)
         return finish_edit(bufnr, args, before, entry.path, "insert_" .. where, row + 1, row,
-            {}, #lines, { inserted = ("%s %s"):format(where, entry.path) })
+            {}, #lines, { inserted = ("%s %s"):format(where, entry.path), separator = separator })
     end
 end
 

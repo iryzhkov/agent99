@@ -19,6 +19,7 @@ at a time. AGENT99_TEST_JOBS caps how many; 1 runs them in order in this
 process, which reads better when something fails.
 """
 
+import json
 import os
 import re
 import shutil
@@ -353,8 +354,13 @@ def group_index(c):
               res.get("count") == 1 and body and body[0].endswith("[server]")
               and any("port = 8080" in l for l in body), res)
         big = os.path.join(root, "big.yml")
+        # A list of scalars, deliberately: it is the case this check is for,
+        # a long file whose whole outline is one line. A list of mappings is
+        # indexed item by item now, so its outline is not trivial and
+        # read_file answers with the structure, which is the right answer for
+        # a different file.
         with open(big, "w") as f:
-            f.write("items:\n" + "".join("  - name: item%d\n    value: %d\n" % (i, i) for i in range(300)))
+            f.write("items:\n" + "".join("  - item%d\n  - spare%d\n" % (i, i) for i in range(300)))
         r = b.rpc("tools/call", {"name": "read_file", "arguments": {"path": big}})
         text = r["result"]["content"][0]["text"]
         check("read_file returns text when the outline is trivial",
@@ -793,6 +799,99 @@ def group_index(c):
     names = [s["name"] for s in res.get("unreferenced", [])]
     check("unreferenced_symbols examines files under a leading-dot directory",
           any("vendored_only_symbol" in n for n in names), res)
+
+    # Setext headings ("Title" over "====") are valid CommonMark and the
+    # grammar opens no section for them, so the heading above them ran to the
+    # end of the document: a replace_symbol_body on what looked like a
+    # four-line preamble would have overwritten 5,261 lines.
+    doc = os.path.join(root, "setext.md")
+    with open(doc, "w") as f:
+        f.write("# Handbook\n\nIntro paragraph.\n\n"
+                "Setext Level One\n================\n\nBody under a setext H1.\n\n"
+                "Setext Level Two\n----------------\n\nBody under a setext H2.\n\n"
+                "## Paths\n\nTail.\n")
+    res = b.call("skim", {"files": [doc]})
+    outline = res["files"][0].get("outline", [])
+    check("skim indexes a setext heading",
+          any("Setext Level One" in line for line in outline), res)
+    check("and the ATX heading above it no longer runs to the end of the file",
+          any(line.startswith("1-3: ") and "# Handbook" in line for line in outline), res)
+    check("and the heading tree nests by level, not by what the grammar sectioned",
+          any(line.startswith("  10-13: ") and "Setext Level Two" in line
+              for line in outline), res)
+    res = b.call("find_symbol", {"file": doc, "name": "Setext Level One"})
+    check("find_symbol reaches a setext heading",
+          res.get("count") == 1 and res["matches"][0]["lines"] == "5-17", res)
+    os.remove(doc)
+
+    # YAML sequence items: 680 of a Kubernetes manifest's 1,600 keys were
+    # invisible because a sequence was opaque whatever it held. A list of
+    # mappings is most of what anyone edits in such a file; a list of
+    # scalars still has nothing worth an index entry.
+    manifest = os.path.join(root, "pod.yaml")
+    with open(manifest, "w") as f:
+        f.write("apiVersion: v1\nkind: Pod\nmetadata:\n  name: demo\nspec:\n"
+                "  containers:\n    - name: app\n      image: nginx:1.25\n"
+                "    - name: side\n      image: busybox\n"
+                "  args:\n    - -c\n    - --flag\n")
+    res = b.call("find_symbol", {"file": manifest, "name": "spec/containers/app",
+                                 "include_body": True})
+    body = res.get("matches", [{}])[0].get("body", [])
+    check("find_symbol reaches a yaml sequence item by its name",
+          res.get("count") == 1 and any("image: nginx:1.25" in line for line in body), res)
+    res = b.call("skim", {"files": [manifest]})
+    outline = res["files"][0].get("outline", [])
+    check("skim indexes the keys inside a sequence item",
+          any("image: busybox" in line for line in outline), res)
+    check("and leaves a list of scalars alone",
+          not any("--flag" in line for line in outline), res)
+    os.remove(manifest)
+
+    # An outline of a file that does not parse used to be shaped exactly like
+    # an outline of a healthy one: two siblings silently missing, a
+    # grandchild lifted to the top, no note of any kind.
+    broken = os.path.join(root, "broken.json")
+    with open(broken, "w") as f:
+        f.write('{\n  "a": {\n    "x": 1\n  }\n  "b": 2\n}\n')
+    res = b.call("skim", {"files": [broken]})
+    entry = res["files"][0]
+    check("skim says when the file it outlined does not parse",
+          entry.get("partial") is True and "cannot read" in (entry.get("parse_error") or ""),
+          res)
+    check("and says the outline may be missing entries",
+          "may be missing" in (entry.get("parse_error_note") or ""), res)
+    os.remove(broken)
+
+
+SMALL_JSON = ('{\n'
+              '  "alpha": {\n'
+              '    "one": 1,\n'
+              '    "two": 2\n'
+              '  },\n'
+              '  "beta": {\n'
+              '    "three": 3\n'
+              '  },\n'
+              '  "gamma": 4\n'
+              '}\n')
+
+
+def seed_json(root, name, text=SMALL_JSON):
+    """A JSON object with three members, written by the check that needs it
+    rather than kept in tests/testproj: the project's own shape stays as
+    every other check expects it."""
+    path = os.path.join(root, name)
+    with open(path, "w") as f:
+        f.write(text)
+    return path
+
+
+def json_state(path):
+    """Whether the file on disk is still JSON, and what it holds."""
+    try:
+        with open(path) as f:
+            return True, json.load(f)
+    except ValueError as e:
+        return False, str(e)
 
 
 def group_edit(c):
@@ -1416,6 +1515,98 @@ def group_edit(c):
     except RuntimeError as e:
         check("a missing file names its namesakes",
               "no such file" in str(e) and "lua/testproj/util.lua" in str(e), e)
+
+    # A JSON object is edited by its structure, not by the lines its members
+    # happen to sit on. The pair separator sits after the pair, so replacing
+    # or inserting next to one used to eat it or omit it, leave a file
+    # json.load could not read, and answer "applied and saved to disk". Every
+    # check below asserts on the reply's wording *and* on the file parsing,
+    # because the old reply was a clean, plausible success.
+    path = seed_json(root, "small.json")
+    res = b.call("replace_symbol_body", {
+        "file": path, "name_path": "alpha",
+        "body": '  "alpha": {\n    "one": 111\n  }'})
+    ok, data = json_state(path)
+    check("replace_symbol_body leaves the JSON file parseable", ok, data)
+    check("and the object still has all three members",
+          ok and sorted(data) == ["alpha", "beta", "gamma"], data)
+    check("and the reply says what it kept on the line",
+          '","' in (res.get("kept_on_the_line") or ""), res)
+    check("and does not claim the file no longer parses",
+          res.get("note") == "applied and saved to disk", res)
+    check("and the verdict answers with the grammar, not with the absent server",
+          "json grammar still parses it" in (res.get("diagnostics_after") or ""), res)
+
+    path = seed_json(root, "insert_mid.json")
+    res = b.call("insert_after_symbol", {
+        "file": path, "name_path": "alpha",
+        "text": '  "inserted": {\n    "x": 9\n  }'})
+    ok, data = json_state(path)
+    check("insert_after_symbol leaves the JSON file parseable", ok, data)
+    check("and both the new member and the old ones are there",
+          ok and sorted(data) == ["alpha", "beta", "gamma", "inserted"], data)
+    check("and the reply says a comma was added after the inserted text",
+          "comma was added after the inserted text" in (res.get("separator") or ""), res)
+    with open(path) as f:
+        text = f.read()
+    check("and no blank line was inserted inside the object",
+          "\n\n" not in text, text)
+
+    # The anchor was the last member, so the comma goes after the anchor
+    # instead - and the anchor's line is part of the edit, so an undo takes
+    # the comma back with it.
+    path = seed_json(root, "insert_last.json")
+    res = b.call("insert_after_symbol", {
+        "file": path, "name_path": "gamma", "text": '  "tail": 7'})
+    ok, data = json_state(path)
+    check("insert after the object's last member leaves it parseable", ok, data)
+    check("and the reply says the comma went after the anchor",
+          "comma was added after gamma" in (res.get("separator") or ""), res)
+    res = b.call("undo_edit", {})
+    ok, data = json_state(path)
+    check("undo takes back the inserted member and the comma with it",
+          ok and sorted(data) == ["alpha", "beta", "gamma"], (res, data))
+
+    # A one-line file where the declaration is not the whole of its line:
+    # replacing the function used to delete the package clause with it.
+    one = os.path.join(root, "oneline.go")
+    with open(one, "w") as f:
+        f.write("package pkg; func OneLiner() int { return 1 }\n")
+    res = b.call("replace_symbol_body", {
+        "file": one, "name_path": "OneLiner",
+        "body": "func OneLiner() int { return 2 }"})
+    with open(one) as f:
+        text = f.read()
+    # gofmt may well put the package clause on its own line afterwards, which
+    # is the point: it is still there to format.
+    check("replacing a declaration keeps what shares its line",
+          "package pkg" in text and "return 2" in text, text)
+    check("and the reply names what it kept",
+          "package pkg; " in (res.get("kept_on_the_line") or ""), res)
+    os.remove(one)
+
+    # An edit that really does break the file says so, in the note and in
+    # the verdict, instead of deferring to a language server JSON never has.
+    path = seed_json(root, "broken_by_edit.json")
+    res = b.call("insert_lines", {"file": path, "line": 2, "text": "  oops"})
+    ok, data = json_state(path)
+    check("an edit that breaks the file leaves it broken", not ok, data)
+    check("and the note no longer calls that done",
+          res.get("note") == "applied and saved to disk, and the file no longer parses", res)
+    check("and the verdict leads with the grammar",
+          (res.get("diagnostics_after") or "").startswith(
+              "the json grammar no longer parses this file"), res)
+    check("and it says the file did parse before the edit",
+          "and it did before this edit" in (res.get("diagnostics_after") or ""), res)
+
+    # A file that arrived broken is not blamed on the edit that touches it.
+    path = seed_json(root, "was_broken.json",
+                     '{\n  "a": {\n    "x": 1\n  }\n  "b": 2\n}\n')
+    res = b.call("insert_lines", {"file": path, "at": "end", "text": "  "})
+    check("an edit to an already broken file is not blamed for it",
+          res.get("note") == "applied and saved to disk", res)
+    check("though the verdict still says the file does not parse",
+          "does not parse it as it now stands" in (res.get("diagnostics_after") or ""), res)
     reset(c)
 
 

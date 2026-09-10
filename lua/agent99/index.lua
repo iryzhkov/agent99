@@ -158,7 +158,7 @@ local TS_CONTAINER = {
 -- JavaScript grammar is every object-literal member and would swamp the
 -- index of real code.
 local DATA_NODES = {
-    yaml = { block_mapping_pair = true },
+    yaml = { block_mapping_pair = true, block_sequence_item = true },
     json = { pair = true },
     jsonc = { pair = true },
     json5 = { pair = true },
@@ -166,15 +166,75 @@ local DATA_NODES = {
     dockerfile = { from_instruction = true },
 }
 
--- Lists are not descended into: 450 items of "name/value" would be the
--- whole index, and a list item has no name to address it by anyway.
+-- Lists of scalars are not descended into: 450 items of their own text would
+-- be the whole index, and such an item has no name to address it by anyway.
+-- A list of *mappings* is the opposite case, and it is most of a Kubernetes
+-- manifest: containers, volumes, env vars, ports. Leaving those out made 680
+-- of one manifest's 1,600 keys invisible to skim and find_symbol, which is
+-- most of what anyone edits in one. So the sequence itself is no longer
+-- opaque in YAML; each item is judged on whether it holds a mapping.
 local DATA_OPAQUE = {
-    yaml = { block_sequence = true, flow_sequence = true },
+    yaml = { flow_sequence = true },
     json = { array = true },
     jsonc = { array = true },
     json5 = { array = true },
     toml = { array = true },
 }
+
+-- The mapping inside a YAML sequence item, through the block_node/flow_node
+-- wrapper the grammar puts between them, or nil when the item is a scalar.
+local function yaml_item_mapping(node)
+    local function mapping_of(n)
+        local t = n:type()
+        if t == "block_mapping" or t == "flow_mapping" then
+            return n
+        end
+        return nil
+    end
+    for child in node:iter_children() do
+        if child:named() then
+            local direct = mapping_of(child)
+            if direct then return direct end
+            local t = child:type()
+            if t == "block_node" or t == "flow_node" then
+                for grand in child:iter_children() do
+                    local inner = mapping_of(grand)
+                    if inner then return inner end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- What to call a sequence item. Its own `name:` where it has one, because
+-- that is how a container, a volume or an env var is referred to everywhere
+-- else; otherwise its position, 0-based, the way every YAML path tool counts.
+local function yaml_item_name(node, bufnr)
+    local map = yaml_item_mapping(node)
+    if map then
+        for pair in map:iter_children() do
+            local key = pair:field("key")[1]
+            if key and vim.treesitter.get_node_text(key, bufnr) == "name" then
+                local value = pair:field("value")[1]
+                local text = value and vim.trim(vim.treesitter.get_node_text(value, bufnr)) or ""
+                if text ~= "" and not text:find("\n") then
+                    return (text:gsub('^"(.*)"$', "%1"):gsub("^'(.*)'$", "%1"))
+                end
+            end
+        end
+    end
+    local parent, index = node:parent(), 0
+    if parent then
+        for sibling in parent:iter_children() do
+            if sibling:equal(node) then break end
+            if sibling:type() == "block_sequence_item" then
+                index = index + 1
+            end
+        end
+    end
+    return ("[%d]"):format(index)
+end
 
 -- Two kinds of file whose declarations are not functions. A Makefile is
 -- rules and the variables above them, and both are addressable: `smoke` is
@@ -272,6 +332,12 @@ local function wanted_node(node, ft)
     if expression_bodied(node) then
         return false
     end
+    -- A YAML sequence item earns an index entry when it holds a mapping and
+    -- not when it is a scalar; see DATA_OPAQUE above for why the two are not
+    -- the same case.
+    if node:type() == "block_sequence_item" then
+        return yaml_item_mapping(node) ~= nil
+    end
     local rule = (FT_NODES[ft or ""] or {})[node:type()]
     if rule == "top" then
         local parent = node:parent()
@@ -293,6 +359,87 @@ local function last_written_line(bufnr, first, last)
     return last
 end
 
+-- Markdown headings, in document order, whatever they are written as.
+--
+-- The grammar opens a `section` node for an ATX heading and not for a setext
+-- one ("Title" over "====", which is valid CommonMark), so a document with
+-- setext headings indexed as if they were body text: `# Fixture Handbook`
+-- was reported as spanning 1-5261 when a setext H1 on line 5 closes it, and
+-- everything below it was reported as its child. A replace_symbol_body on
+-- what looked like a four-line preamble would have overwritten the whole
+-- document. Rather than trust the grammar's sections, take the headings and
+-- compute the spans here: a heading owns everything up to the next heading
+-- of its own level or higher.
+local MD_HEADINGS = { atx_heading = true, setext_heading = true }
+
+local function md_heading_level(node)
+    for child in node:iter_children() do
+        local level = child:type():match("^atx_h(%d)_marker$")
+            or child:type():match("^setext_h(%d)_underline$")
+        if level then return tonumber(level) end
+    end
+    return 1
+end
+
+local function md_heading_text(node, bufnr)
+    local srow = node:range()
+    local line = vim.api.nvim_buf_get_lines(bufnr, srow, srow + 1, false)[1] or ""
+    return vim.trim((line:gsub("^%s*#+%s*", ""):gsub("%s*#+%s*$", "")))
+end
+
+-- { path, name, first, last, depth } per heading. Shared by the index and by
+-- skim so the two cannot disagree about a document's shape.
+local function md_sections(bufnr)
+    local ok, parser = pcall(vim.treesitter.get_parser, bufnr)
+    if not ok or parser == nil then return nil end
+    local okp, trees = pcall(function() return parser:parse() end)
+    if not okp or not trees or not trees[1] then return nil end
+    local heads = {}
+    local stack = { trees[1]:root() }
+    while #stack > 0 do
+        local node = table.remove(stack)
+        if MD_HEADINGS[node:type()] then
+            local srow, _, erow, ecol = node:range()
+            if ecol == 0 and erow > srow then erow = erow - 1 end
+            heads[#heads + 1] = {
+                row = srow, last_row = erow,
+                level = md_heading_level(node),
+                name = md_heading_text(node, bufnr),
+            }
+        else
+            for child in node:iter_children() do
+                if child:named() then stack[#stack + 1] = child end
+            end
+        end
+    end
+    if #heads == 0 then return {} end
+    table.sort(heads, function(a, b) return a.row < b.row end)
+    local total = vim.api.nvim_buf_line_count(bufnr)
+    local out, open = {}, {}
+    for i, h in ipairs(heads) do
+        local stop = total
+        for j = i + 1, #heads do
+            if heads[j].level <= h.level then
+                stop = heads[j].row -- the line before the next heading, 1-based
+                break
+            end
+        end
+        stop = math.max(last_written_line(bufnr, h.row + 1, stop), h.last_row + 1)
+        while #open > 0 and open[#open].level >= h.level do
+            table.remove(open)
+        end
+        local name = h.name ~= "" and h.name or ("line" .. (h.row + 1))
+        local prefix = #open > 0 and (open[#open].path .. "/") or ""
+        local entry = {
+            path = prefix .. name, name = name, kind = "section",
+            first = h.row + 1, last = stop, depth = #open, level = h.level,
+        }
+        open[#open + 1] = entry
+        out[#out + 1] = entry
+    end
+    return out
+end
+
 local function ts_outline(bufnr)
     local ok, parser = pcall(vim.treesitter.get_parser, bufnr)
     if not ok or parser == nil then
@@ -306,6 +453,22 @@ local function ts_outline(bufnr)
     end
     local ft = vim.bo[bufnr].filetype
     local out = {}
+    if ft == "markdown" then
+        -- Headings, not the grammar's sections: see md_sections.
+        local sections = md_sections(bufnr) or {}
+        for i, s in ipairs(sections) do
+            if i > MAX_SKIM_ENTRIES then
+                out[#out + 1] = ("… +%d more declarations after line %d; find_symbol or "
+                    .. "read_file with offset reach them")
+                    :format(#sections - MAX_SKIM_ENTRIES, sections[MAX_SKIM_ENTRIES].first)
+                break
+            end
+            local span = s.last > s.first and ("%d-%d"):format(s.first, s.last) or tostring(s.first)
+            out[#out + 1] = ("%s%s: %s"):format(
+                string.rep("  ", s.depth), span, decl_line(bufnr, s.first))
+        end
+        return out
+    end
     local last_row = -1
     local extra, extra_last_row = 0, -1
     local function walk(node, depth)
@@ -538,6 +701,21 @@ local function skim(args)
                 else
                     entry.note = "no outline available for this file; read it instead"
                 end
+            end
+            -- An outline of a file that does not parse is a partial outline
+            -- shaped exactly like a whole one: a JSON object whose separator
+            -- was eaten skimmed as three healthy keys with two siblings
+            -- silently missing and a grandchild lifted to the top. Whatever
+            -- the grammar could still read is worth printing, but not
+            -- without saying what it could not.
+            local syntax = require("agent99.syntax")
+            local broken = syntax.first_error(bufnr)
+            if broken then
+                entry.parse_error = syntax.where(broken)
+                entry.partial = true
+                entry.parse_error_note = "this file does not parse, so the outline is "
+                    .. "whatever the grammar could still read: entries after the error may "
+                    .. "be missing, and one may be shown under the wrong parent"
             end
             out[#out + 1] = entry
         end
@@ -1541,6 +1719,9 @@ local function ts_node_name(node, bufnr)
         local heading = section_name(node, bufnr)
         if heading then return heading end
     end
+    if ntype == "block_sequence_item" then
+        return yaml_item_name(node, bufnr)
+    end
     -- Data files: a YAML or JSON pair is named by its key, a TOML table or
     -- pair by its first child (the key), a Dockerfile stage by its alias.
     local key = node:field("key")
@@ -1629,19 +1810,32 @@ local function ts_index(bufnr)
         return nil
     end
     local ft = vim.bo[bufnr].filetype
+    if ft == "markdown" then
+        -- Headings, not the grammar's sections: see md_sections.
+        return md_sections(bufnr)
+    end
     local entries = {}
     local function walk(node, prefix)
         for child in node:iter_children() do
             if child:named() then
                 if wanted_node(child, ft) then
-                    local srow, _, erow, ecol = child:range()
+                    local srow, scol, erow, ecol = child:range()
+                    -- Where the declaration actually ends on its last line.
                     -- A node ending at column 0 stopped at the previous
                     -- line's newline (a Markdown section runs up to the
-                    -- next heading): its last line is the one before.
+                    -- next heading): its last line is the one before, and it
+                    -- owns that line to the end.
+                    local end_col = ecol > 0 and ecol or nil
                     if ecol == 0 and erow > srow then
                         erow = erow - 1
                     end
-                    erow = last_written_line(bufnr, srow + 1, erow + 1) - 1
+                    local written = last_written_line(bufnr, srow + 1, erow + 1) - 1
+                    if written ~= erow then
+                        -- Trailing blank lines were dropped from the span, so
+                        -- the recorded end column no longer describes it.
+                        end_col = nil
+                    end
+                    erow = written
                     local name = ts_node_name(child, bufnr)
                     local path = prefix == "" and name or (prefix .. "/" .. name)
                     entries[#entries + 1] = {
@@ -1650,6 +1844,13 @@ local function ts_index(bufnr)
                         kind = child:type(),
                         first = srow + 1,
                         last = erow + 1,
+                        -- Byte columns of the declaration inside its first
+                        -- and last lines, so an edit can replace the node
+                        -- rather than the lines it happens to sit on. Only
+                        -- treesitter entries carry them; a language server's
+                        -- do not, and those stay line-granular.
+                        first_col = scol,
+                        last_col = end_col,
                     }
                     walk(child, path)
                 elseif not data_opaque(child:type(), ft) then

@@ -193,7 +193,7 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "replace_symbol_body",
-		Description: "Replace a whole symbol (function/class/method) by name path with new source, declaration line included, matching the file's indentation; doc comments above it are not part of the symbol. Applied to the editor buffer immediately and tracked; returns fresh diagnostics. Imports are organized, and the text lands as given unless format= asks for the server's formatter; the reply lists only new diagnostics. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
+		Description: "Replace a whole symbol (function/class/method) by name path with new source, declaration line included, matching the file's indentation; doc comments above it are not part of the symbol, and neither is anything else sharing its first or last line (a JSON object's separating comma, a package clause before a one-line function) - that is left in place and the reply says so under kept_on_the_line. Applied to the editor buffer immediately and tracked; returns fresh diagnostics. Imports are organized, and the text lands as given unless format= asks for the server's formatter; the reply lists only new diagnostics. Do not use this on the user's selected region; that region is changed only via the <replacement> reply.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -260,7 +260,7 @@ var lspTools = []tool{
 	},
 	{
 		Name:        "insert_after_symbol",
-		Description: "Insert source right after a symbol by name path (a blank line is added between multi-line symbols, and not between single-line ones such as the members of a const block). Applied to the editor buffer immediately and tracked.",
+		Description: "Insert source right after a symbol by name path (a blank line is added between multi-line symbols, and not between single-line ones such as the members of a const block, nor inside a data file). In JSON the comma an object needs between two members is supplied, after the inserted text or after the anchor depending on which of them the next member follows, and the reply says which under separator. Applied to the editor buffer immediately and tracked.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
