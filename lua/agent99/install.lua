@@ -62,8 +62,11 @@ local function guess_check_command(root)
     -- check_project silently covers only whichever language happened to be
     -- checked first.
     local guesses = {}
-    local function add(cmd, note)
-        guesses[#guesses + 1] = { cmd = cmd, note = note }
+    -- `files` is how much of the tree the command looks at, where that is
+    -- knowable: a guess covering 3 files out of 98 is not a project verdict
+    -- and the reply has to be able to say so.
+    local function add(cmd, note, covers)
+        guesses[#guesses + 1] = { cmd = cmd, note = note, files = covers }
     end
     -- `go build ./...` writes a binary named after a lone main package into
     -- the cwd, which fails when a directory of that name exists (a repo with
@@ -112,7 +115,7 @@ local function guess_check_command(root)
                     "compileall is a syntax check only: it byte-compiles each file and "
                     .. "catches what breaks parsing, not a wrong name or type. Install "
                     .. "pyright or mypy for more, or pass command= with the project's "
-                    .. "own check.")
+                    .. "own check.", count_ext(".py"))
             end
         end
     end
@@ -139,21 +142,42 @@ local function guess_check_command(root)
             "qmllint reports warnings but still exits 0, so read the new lines rather "
             .. "than the exit code. It also checks one import path: types it cannot "
             .. "resolve are reported as warnings that say nothing about your change, "
-            .. "which the baseline absorbs on the first call. Pass command= with your "
-            .. "own -I flags when that noise hides real findings.")
+                    .. "which the baseline absorbs on the first call. Pass command= with your "
+                    .. "own -I flags when that noise hides real findings.", count_ext(".qml"))
     end
     -- Lua has no project-wide type checker to shell out to (lua_ls, the LSP
     -- this plugin already drives, is not a CLI); luacheck is the real lint
     -- but is an optional install, so prefer it when present and fall back
     -- to luac's own syntax-only parse check, which ships with Lua itself
     -- and needs nothing installed.
+    -- A repository that is mostly shell has no compiler to run, and answering
+    -- one with another language's checker over three files out of ninety-eight
+    -- was a verdict of "clean" about a tree nothing had looked at. shellcheck
+    -- is the real gate; bash -n is what is always available.
+    if is_a_language_here(".sh", {}) then
+        local n = count_ext(".sh")
+        if vim.fn.executable("shellcheck") == 1 then
+            add("find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -r shellcheck -x",
+                "shellcheck reports style as well as errors and takes its severity from "
+                .. "directives in the scripts; pass command= with your own flags (-e to "
+                .. "silence a code) when its defaults hide real findings. It only sees "
+                .. "scripts named *.sh, so a shell entry point with no extension is "
+                .. "not checked.", n)
+        elseif vim.fn.executable("bash") == 1 then
+            add("find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -n1 bash -n",
+                "bash -n is a syntax check only: it parses each script and catches what "
+                .. "breaks parsing, not an unset variable or a wrong path. Install "
+                .. "shellcheck for more. It only sees scripts named *.sh, so a shell "
+                .. "entry point with no extension is not checked.", n)
+        end
+    end
     if is_a_language_here(".lua", { ".luacheckrc", ".luarc.json" }) then
         if vim.fn.executable("luacheck") == 1 then
             add("luacheck .",
                 "luacheck reads .luacheckrc if the project has one; without one it uses "
                 .. "its own defaults, which may flag style the project does not care "
                 .. "about. Pass command= with your own flags (e.g. --config path) when "
-                .. "that noise hides real findings.")
+                .. "that noise hides real findings.", count_ext(".lua"))
         else
             local luac = vim.fn.executable("luac") == 1 and "luac"
                 or vim.fn.executable("luac5.4") == 1 and "luac5.4"
@@ -167,7 +191,7 @@ local function guess_check_command(root)
                         .. "logic error. lua_ls's live diagnostics, already surfaced on every "
                         .. "edit through this server, cover more; this exists so a Lua project "
                         .. "still gets some check_project coverage where luacheck is not "
-                        .. "installed."):format(luac))
+                        .. "installed."):format(luac), count_ext(".lua"))
             end
         end
     end
@@ -203,7 +227,7 @@ local function guess_check_command(root)
                 .. "so read the new lines rather than the exit code.")
         end
     end
-    return guesses
+    return guesses, #files
 end
 
 -- A check command the caller has chosen for this project, replacing the guess
@@ -332,18 +356,29 @@ local function check_project(args)
     if not cmds and session_command[root] then
         cmds, from_session = session_command[root], true
     end
-    local guessed, guess_note = false, nil
+    local guessed, guess_note, guess_covers = false, nil, nil
     if not cmds then
-        local guesses = guess_check_command(root)
+        local guesses, total_files = guess_check_command(root)
         if #guesses > 0 then
             cmds = {}
-            local notes = {}
+            local notes, covered = {}, 0
             for _, g in ipairs(guesses) do
                 cmds[#cmds + 1] = g.cmd
                 if g.note then notes[#notes + 1] = g.note end
+                covered = covered + (g.files or 0)
             end
             guessed = true
             guess_note = #notes > 0 and table.concat(notes, "\n\n") or nil
+            -- A guess that reached 3 Lua files in a 98-file shell repository
+            -- returned "clean", and only `guessed: true` said otherwise. Where
+            -- the share is knowable and small, the reply states it.
+            if covered > 0 and total_files and total_files > 0
+                and covered / total_files < 0.5 then
+                guess_covers = ("this guess looks at %d of the %d files in this tree; the rest "
+                    .. "is not checked by it, so a clean result here is not a verdict on the "
+                    .. "project. Pass command= or commands=[...] with the project's own gate.")
+                    :format(covered, total_files)
+            end
         end
     end
     if not cmds then
@@ -353,13 +388,10 @@ local function check_project(args)
             .. "installed): pass command= or commands= (remember=true keeps it for this "
             .. "root), set AGENT99_CHECK, or post_edit.check in setup()", root)
     end
-    if explicit and args.remember then
-        check_override[root] = cmds
-        save_check_overrides(root)
-    end
-    if explicit then
-        session_command[root] = cmds
-    end
+    -- Both stores are written after the run, not before it: a command that
+    -- turned out not to exist on this machine was remembered for the root and
+    -- kept poisoning it in every later session.
+    local want_remember = explicit and args.remember == true
     -- A caveat that belongs to the command rather than to the guess: whoever
     -- chose qmllint needs to hear that its exit code is not the gate.
     if not guessed then
@@ -432,6 +464,28 @@ local function check_project(args)
     -- clean bill. Then, a clean check next to a server still holding errors
     -- is worth one line: the caller is about to be told to trust one of
     -- them and should know which.
+    -- A command that never started - not installed, a typo in an explicit
+    -- command= - says nothing about the project, and remembering it for the
+    -- root poisons every later call there, in this session and the next.
+    local unusable = nil
+    if exit == 127 then
+        unusable = "it was not found on this machine (exit 127)"
+    else
+        for _, l in ipairs(lines) do
+            local missing = l:match("([%w_%-%./]+): command not found")
+            if missing then
+                unusable = ("%s is not installed on this machine"):format(missing)
+                break
+            end
+        end
+    end
+    if explicit and not unusable then
+        session_command[root] = cmds
+        if want_remember then
+            check_override[root] = cmds
+            save_check_overrides(root)
+        end
+    end
     if #core.resync_open_buffers() > 0 then sleep(300) end
     local server_errors = {}
     if exit == 0 and not timed_out then
@@ -457,20 +511,42 @@ local function check_project(args)
             :format(#unsaved_buffers, #unsaved_buffers == 1 and "" or "s", #unsaved_buffers == 1 and "s" or "ve")
             or nil,
     }
-    if explicit and args.remember then
-        out.remembered = "later check_project calls in this root use this without arguments, "
-            .. "in this workspace and in later ones"
+    -- "Kept for this session" and "kept for this root in later sessions too"
+    -- are different promises, and one reply used to make both sound like the
+    -- second: an explicit commands=[...] with no remember=true became the
+    -- default for the next bare call and read as persistence.
+    if unusable and want_remember then
+        out.not_remembered = ("this command was not stored: %s, so it says nothing about "
+            .. "the project and a later bare call must not repeat it"):format(unusable)
+    elseif want_remember and not unusable then
+        out.remembered = "stored for this root on disk: later check_project calls here use "
+            .. "this without arguments, in this workspace and in later sessions"
+    elseif explicit and not unusable then
+        out.remembered = "kept as this session's default for this root; it is not stored on "
+            .. "disk, so a later session guesses again unless you pass remember=true"
     elseif not explicit and check_override[root] then
-        out.remembered = "using the command remembered for this root"
+        out.remembered = "using the command stored for this root on disk"
+    elseif not explicit and from_session then
+        out.remembered = "using the command this session's last check in this root used; it "
+            .. "is not stored on disk"
+    end
+    if unusable then
+        out.did_not_run = ("the check did not run: %s. Neither this exit code nor this "
+            .. "output says anything about the project, and no baseline was recorded or "
+            .. "compared"):format(unusable)
     end
     if guessed then
-        out.covers = "type and reference checking only: this does not run the tests, "
-            .. "and it checks one build configuration, so code behind another build tag "
-            .. "or feature flag is not analyzed. If that is the wrong gate for this "
-            .. "project, pass a better one: commands=[...] runs several (one per build "
-            .. "configuration), and remember=true makes it the default for this root "
-            .. "for the rest of the session."
+        -- What this command checks is the command's own business, and saying
+        -- "type and reference checking" here contradicted an
+        -- about_this_command that read "luac -p is a syntax check only".
+        out.covers = "a static check: it does not run the tests, and it checks one build "
+            .. "configuration, so code behind another build tag or feature flag is not "
+            .. "analyzed. How deep the check goes is the command's own business - see "
+            .. "about_this_command. If that is the wrong gate for this project, pass a "
+            .. "better one: commands=[...] runs several (one per build configuration), "
+            .. "and remember=true makes it the default for this root."
         out.about_this_command = guess_note
+        out.coverage = guess_covers
     end
     if #server_errors > 0 then
         local shown = vim.list_slice(server_errors, 1, 5)
@@ -488,7 +564,12 @@ local function check_project(args)
     end
     local key = root .. "\0" .. cmd
     local base = check_baseline[key]
-    if timed_out then
+    if unusable then
+        out.output = vim.list_slice(lines, 1, CHECK_MAX_LINES)
+        if #lines > CHECK_MAX_LINES then out.output_truncated = #lines - CHECK_MAX_LINES end
+        out.summary = out.did_not_run
+        out.baseline = base and "left as it was" or "not recorded"
+    elseif timed_out then
         out.timed_out = timed_out
         out.output = vim.list_slice(lines, 1, CHECK_MAX_LINES)
         if #lines > CHECK_MAX_LINES then out.output_truncated = #lines - CHECK_MAX_LINES end

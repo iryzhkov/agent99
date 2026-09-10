@@ -869,6 +869,10 @@ local function unreferenced_symbols(args)
     end
     local dead, unknown, methods, cache = {}, {}, {}, {}
     local checked = 0
+    -- What was left out and why. Without this the reply asserted that every
+    -- top-level symbol in a file was referenced when the file held nothing
+    -- but methods and not one symbol had been examined.
+    local skipped = {}
     -- First pass: load every file and pick its top-level symbols, so the
     -- names that need a text search are known before any search runs.
     -- Top-level names only. A method is reached through its receiver, and a
@@ -894,10 +898,19 @@ local function unreferenced_symbols(args)
                 end
             end
             for _, e in ipairs(symbol_index(bufnr)) do
-                if e.name and e.name ~= "" and not e.path:find("/", 1, true)
-                    and not entry_point(e, path) and not foreign_field(e, declared_here)
-                    and not anonymous(e)
-                    and checked < MAX_UNREFERENCED_SYMBOLS then
+                local why
+                if not e.name or e.name == "" or anonymous(e) then
+                    why = "anonymous"
+                elseif e.path:find("/", 1, true) then
+                    why = "nested"
+                elseif entry_point(e, path) then
+                    why = "entry_point"
+                elseif foreign_field(e, declared_here) then
+                    why = "method_or_field"
+                end
+                if why then
+                    skipped[why] = (skipped[why] or 0) + 1
+                elseif checked < MAX_UNREFERENCED_SYMBOLS then
                     checked = checked + 1
                     entries[#entries + 1] = e
                     local key = bare_name(e.name)
@@ -942,12 +955,34 @@ local function unreferenced_symbols(args)
     end
     local method_names = vim.tbl_keys(methods)
     table.sort(method_names)
+    -- The skipped set, in the order a reader wants it: the deliberate policy
+    -- exclusions first, the housekeeping ones after.
+    local SKIP_LABEL = {
+        method_or_field = "methods and fields on an object declared elsewhere",
+        nested = "declarations nested inside another symbol",
+        entry_point = "entry points and tests, which have no caller by construction",
+        anonymous = "anonymous declarations",
+    }
+    local skipped_total, skipped_parts = 0, {}
+    for _, k in ipairs({ "method_or_field", "nested", "entry_point", "anonymous" }) do
+        if skipped[k] then
+            skipped_total = skipped_total + skipped[k]
+            skipped_parts[#skipped_parts + 1] = ("%d %s"):format(skipped[k], SKIP_LABEL[k])
+        end
+    end
+    local skipped_text = table.concat(skipped_parts, ", ")
     local res = {
         symbols_checked = checked,
+        symbols_skipped = skipped_total > 0 and skipped_total or nil,
         count = #dead,
         unreferenced = #dead > 0 and dead or nil,
         method = #method_names > 0 and table.concat(method_names, " and ") or nil,
     }
+    if skipped_total > 0 then
+        res.symbols_skipped_note = ("not examined: %s. A method is reached through its receiver, "
+            .. "and a zero-reference answer for one says more about the server than about the "
+            .. "code, so this tool does not check them."):format(skipped_text)
+    end
     if #unknown > 0 then
         res.not_answered = unknown
         res.not_answered_note = "no reference answer for these; they are not a finding either way"
@@ -962,13 +997,27 @@ local function unreferenced_symbols(args)
     if capped > 0 then
         res.note = ("%d further files were not checked (cap: %d)"):format(capped, MAX_UNREFERENCED_FILES)
     end
-    if #dead > 0 then
+    if checked == 0 then
+        -- The reply used to say "every top-level symbol in these files is
+        -- referenced somewhere else" whenever nothing was found, including
+        -- when nothing had been looked at: a Go file of three methods came
+        -- back with that sentence and symbols_checked: 0.
+        res.summary = skipped_total > 0
+            and ("nothing was checked: all %d declarations in these files were skipped (%s), so "
+                .. "this reply is not evidence that they are used"):format(skipped_total, skipped_text)
+            or "nothing was checked: no declaration in these files was eligible"
+    elseif #dead > 0 then
         res.summary = "nothing outside its own body mentions these names. A symbol that is "
             .. "this file's public API, reached by reflection or a string, or used from a "
             .. "file the search cannot see (another build configuration, another language) "
             .. "lands here too, so read each one before deleting it."
     else
-        res.summary = "every top-level symbol in these files is referenced somewhere else"
+        res.summary = ("every one of the %d symbols checked in these files is referenced "
+            .. "somewhere else"):format(checked)
+        if skipped_total > 0 then
+            res.summary = res.summary
+                .. ("; %d further declarations were not checked (%s)"):format(skipped_total, skipped_text)
+        end
     end
     return res
 end

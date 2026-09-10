@@ -227,6 +227,43 @@ check("unittest: NO TESTS RAN is recognised",
 Ran 0 tests in 0.000s
 
 NO TESTS RAN]])) == true, "not matched")
+-- Go prints "testing: warning: no tests to run" only when the result did not
+-- come from the build cache. Every fixture above carries that line, so the
+-- case that actually reaches an agent - the second run of the same filter -
+-- was the one case never covered, and it reported "all passing".
+check("go: a cached filter miss with no warning line is recognised",
+    testrun.ran_nothing(lines([==[
+ok  	github.com/gin-gonic/gin	(cached) [no tests to run]
+?   	github.com/gin-gonic/gin/codec/json	[no test files]
+ok  	github.com/gin-gonic/gin/binding	(cached) [no tests to run]]==])) == true, "not matched")
+check("go: real results alongside packages without tests still count as a run",
+    testrun.ran_nothing(lines([==[
+ok  	github.com/x/internal/compat	0.004s
+?   	github.com/x/cmd/tool	[no test files]
+ok  	github.com/x/internal/policy	(cached) [no tests to run]]==])) == false, "matched")
+-- `%d+ passed` matches zero, so pytest's and jest's own report of an empty run
+-- was read as evidence that a test had run.
+check("pytest: a summary reading 0 passed is not evidence that a test ran",
+    testrun.ran_nothing(lines([[
+collected 0 items
+
+============================ 0 passed in 0.01s =============================]])) == true, "not matched")
+check("pytest: a non-zero summary still counts as a run",
+    testrun.ran_nothing(lines([[
+============================ 3 passed in 0.04s =============================]])) == false, "matched")
+check("node --test: a repository with no test files is recognised",
+    testrun.ran_nothing(lines([[
+ℹ tests 0
+ℹ suites 0
+ℹ pass 0
+ℹ fail 0]])) == true, "not matched")
+check("node --test: a real run is not read as empty",
+    testrun.ran_nothing(lines([[
+ℹ tests 7
+ℹ pass 7
+ℹ fail 0]])) == false, "matched")
+check("tap: the empty plan is recognised",
+    testrun.ran_nothing(lines("1..0")) == true, "not matched")
 
 if failures > 0 then
     io.stdout:write(("unit_testrun: %d failed\n"):format(failures))

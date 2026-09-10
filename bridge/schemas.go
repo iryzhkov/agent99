@@ -232,7 +232,7 @@ var lspTools = []tool{
 				"text":       map[string]any{"type": "string", "description": "Replacement for those lines."},
 				"expect": map[string]any{
 					"type":        "string",
-					"description": "The text those lines currently hold. Pass it whenever the line numbers came from an earlier call: an earlier edit can have moved them, and without this the edit silently lands on the wrong lines. Indentation is ignored when comparing, and a refusal names where the text sits now.",
+					"description": "The text those lines currently hold, or just the first of them. Pass it whenever the line numbers came from an earlier call: an earlier edit can have moved them, and without this the edit silently lands on the wrong lines. Text covering the whole range guards the whole range; shorter text anchors the start of it, the edit still replaces every line asked for, and the reply says how much was vouched for. Indentation is ignored when comparing, and a refusal names where the text sits now.",
 				},
 				"chunks": map[string]any{
 					"type":        "array",
@@ -518,7 +518,7 @@ var lspTools = []tool{
 	},
 	{
 		Name: "move_symbols",
-		Description: "Move whole symbols (functions, classes, constants) from one file to another, taking each one's doc comment with it and reorganizing the imports of both files afterwards. " +
+		Description: "Move whole symbols (functions, classes, constants) from one file to another, taking each one's doc comment with it and sorting and pruning the imports of both files afterwards. Adding an import the moved code now needs is something only some servers do on that pass (gopls does; pyright, tsserver and lua_ls do not), so read the reply's verdict for unresolved names before treating the move as finished. " +
 			"The way to split an oversized file: the destination is created if missing. Undoable with undo_edit.",
 		InputSchema: map[string]any{
 			"type": "object",
@@ -554,12 +554,14 @@ var lspTools = []tool{
 var fileTools = []tool{
 	{
 		Name:        "read_file",
-		Description: "Read a file with line numbers (offset/limit). A large file returns its skim instead.",
+		Description: fmt.Sprintf("Read a file with line numbers (offset/limit). A plain read of a "+
+			"file over %d lines returns its skim (the outline) instead of its text; pass "+
+			"offset/limit to read the text of one anyway.", autoSkimThreshold),
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path":   map[string]any{"type": "string", "description": "File path (absolute or relative to root)."},
-				"offset": map[string]any{"type": "integer", "description": "1-based first line to read (default 1)."},
+				"offset": map[string]any{"type": "integer", "description": fmt.Sprintf("1-based first line to read (default 1). Passing it also asks for the text rather than the skim, whatever the file's length; a plain read over %d lines is answered with the outline.", autoSkimThreshold)},
 				"limit":  map[string]any{"type": "integer", "description": fmt.Sprintf("Maximum number of lines (default %d).", maxReadLines)},
 			},
 			"required": []string{"path"},

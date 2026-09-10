@@ -14,6 +14,9 @@ local install = require("agent99.install")
 local err, await, rel_path, load_buf = core.err, core.await, core.rel_path, core.load_buf
 
 local OUTPUT_MAX_LINES = 80
+-- How much of a passing run's output comes back. Enough for a runner's counts
+-- line and the results around it, not enough to be a log dump.
+local SUCCESS_TAIL_LINES = 12
 local FAILURES_MAX = 40
 
 -- Commands remembered per root, shared with later sessions.
@@ -59,6 +62,18 @@ local function guess_test_command(root, path, filter)
                     add("make test", "make", "the Makefile's test target, whatever it runs")
                     break
                 end
+            end
+        end
+    end
+    -- A repository whose gate is a script of its own gets no language-native
+    -- guess at all, and the script is what its README tells a person to run.
+    -- Like the Makefile target it takes no path or filter, so it is offered
+    -- only for a call that asked for neither.
+    if not path and not filter then
+        for _, name in ipairs({ "test/run.sh", "tests/run.sh", "test.sh", "run_tests.sh" }) do
+            if exists(root, name) and vim.fn.executable(root .. "/" .. name) == 1 then
+                add("./" .. name, nil, ("the repository's own %s, whatever it runs"):format(name))
+                break
             end
         end
     end
@@ -291,26 +306,63 @@ local function ran_nothing(lines)
     -- passing suite as "no tests ran".
     local ran, none = false, false
     for _, l in ipairs(lines) do
-        -- `ok pkg 0.004s [no tests to run]` is a package that ran nothing;
-        -- counting it as evidence made a filter matching no test read as
-        -- "all passing" - the inverse of the bug this check is for.
-        if l:find("[no tests to run]", 1, true) or l:find("[no test files]", 1, true) then
+        -- A package that has no tests at all is normal in a large tree and
+        -- says nothing either way, so it is skipped before anything else.
+        if l:find("[no test files]", 1, true) then
+            goto next_line
+        end
+        -- `ok pkg 0.004s [no tests to run]` is a package that ran nothing
+        -- because the filter matched nothing, which is positive evidence of
+        -- an empty run. Go prints the separate "testing: warning: no tests
+        -- to run" line only when the result did not come from the build
+        -- cache, so this line is the only marker a cached filter miss has.
+        -- The `goto` keeps it from also counting as evidence that a test
+        -- ran, which is what the leading "ok" would otherwise mean.
+        if l:find("[no tests to run]", 1, true) then
+            none = true
             goto next_line
         end
         -- A bare "PASS" is printed by a Go test binary even when the filter
-        -- matched nothing, so it is not evidence that a test ran.
+        -- matched nothing, so it is not evidence that a test ran. The count
+        -- patterns need a non-zero number for the same reason: pytest and
+        -- jest both print "0 passed" for a run that executed nothing.
         if l:match("^ok%s+%S") or l:match("^%-%-%- PASS") or l:match("^%-%-%- FAIL")
             or l:match("^FAIL%s") or l:match("^Ran [1-9]%d* tests?")
-            or l:match("%d+ passed") or l:match("%d+ failed") or l:match("^OK$") then
+            or l:match("[1-9]%d* passed") or l:match("[1-9]%d* failed") or l:match("^OK$")
+            or l:match("^%D*tests%s+[1-9]") or l:match("^%D*pass%s+[1-9]") then
             ran = true
         end
+        -- `node --test` reports its counts as "tests 0" and "pass 0" behind a
+        -- multi-byte marker, and a TAP producer with nothing to run emits the
+        -- empty plan "1..0". The `%D*` prefix skips whatever marker is there.
         if l:match("no tests to run") or l:match("^Ran 0 tests") or l:match("NO TESTS RAN")
-            or l:match("no tests ran") or l:match("collected 0 items") then
+            or l:match("no tests ran") or l:match("collected 0 items")
+            or l:match("^%D*tests%s+0%s*$") or l:match("^%D*pass%s+0%s*$")
+            or l:match("^1%.%.0%s*$") then
             none = true
         end
         ::next_line::
     end
     return none and not ran
+end
+
+-- A command that never started - no runner installed, no interpreter, a typo
+-- in an explicit command= - tells us nothing at all about the tests. Its exit
+-- code looks like a failing suite and its empty output looks like a passing
+-- one, so it has to be recognised before either reading is offered, and a
+-- baseline recorded from it would make every later comparison meaningless.
+local function never_ran(lines, code)
+    for _, l in ipairs(lines) do
+        local missing = l:match("([%w_%-%./]+): command not found")
+            or l:match("No module named ([%w_%.]+)")
+        if missing then
+            return ("%s is not installed on this machine"):format(missing)
+        end
+    end
+    if code == 127 then
+        return "the command was not found on this machine (exit 127)"
+    end
+    return nil
 end
 
 -- A generic sweep for runners without a parser: any "path:line" on a line
@@ -546,12 +598,31 @@ local function run_tests(args)
     end
     local now_set = #failures > 0 and names_of(failures) or (result.code ~= 0 and lines or {})
     local base = baselines[key]
+    local unusable = never_ran(lines, result.code)
+    local empty = ran_nothing(lines)
     if timed_out then
         out.timed_out = true
         out.output = vim.list_slice(lines, 1, OUTPUT_MAX_LINES)
         if #lines > OUTPUT_MAX_LINES then out.output_truncated = #lines - OUTPUT_MAX_LINES end
         out.summary = ("timed out after %g s: the output is partial and no baseline was recorded "
             .. "or compared. Narrow with path= or filter=, or raise post_edit.test_timeout_ms."):format(timeout / 1000)
+    elseif unusable or empty then
+        -- Neither a pass nor a fail: this run verified nothing, so it must not
+        -- move the baseline. A green baseline recorded from a run that
+        -- executed no test makes every later comparison meaningless, which is
+        -- worse than having no baseline at all.
+        out.output = vim.list_slice(lines, 1, OUTPUT_MAX_LINES)
+        if #lines > OUTPUT_MAX_LINES then out.output_truncated = #lines - OUTPUT_MAX_LINES end
+        if unusable then
+            out.summary = ("the test command did not run: %s. Nothing was verified, and exit %d "
+                .. "here says nothing about the tests"):format(unusable, result.code)
+        else
+            out.summary = ("no tests ran: the command matched none (exit %d). A run that executes "
+                .. "no test is not a passing run"):format(result.code)
+        end
+        out.baseline = base
+            and "left as it was: this run verified nothing, so it was neither recorded nor compared"
+            or "not recorded: this run verified nothing"
     elseif base and not args.reset then
         local base_count, now_count = {}, {}
         for _, n in ipairs(base) do base_count[n] = (base_count[n] or 0) + 1 end
@@ -566,10 +637,7 @@ local function run_tests(args)
         out.baseline_failures = #base
         out.new_failures = new
         out.fixed = fixed
-        if result.code == 0 and ran_nothing(lines) then
-            out.summary = "no tests ran: the command matched none. A filter that matches nothing "
-                .. "exits 0, which is not the same as passing"
-        elseif result.code == 0 then
+        if result.code == 0 then
             out.summary = #fixed > 0 and ("all passing; %d fixed since the baseline"):format(#fixed) or "all passing"
         elseif #new == 0 and #fixed == 0 then
             out.summary = ("still failing as at the baseline (%d)"):format(#now_set)
@@ -588,15 +656,24 @@ local function run_tests(args)
             out.output = vim.list_slice(lines, 1, OUTPUT_MAX_LINES)
             if #lines > OUTPUT_MAX_LINES then out.output_truncated = #lines - OUTPUT_MAX_LINES end
             out.summary = #failures > 0 and ("%d failing"):format(#failures)
-                or ran_nothing(lines)
-                and ("no tests ran: the command matched none (exit %d). A run that executes no "
-                    .. "test is not a passing run"):format(result.code)
                 or ("exit %d; no failures parsed from the output, see output"):format(result.code)
-        elseif ran_nothing(lines) then
-            out.summary = "no tests ran: the command matched none. A filter that matches nothing "
-                .. "exits 0, which is not the same as passing"
         else
             out.summary = passed and ("all passing (%d)"):format(passed) or "all passing"
+        end
+    end
+    -- On a passing run the summary used to be the whole reply, so nothing said
+    -- what had actually been verified. The tail carries the runner's own counts
+    -- line where it prints one, and its last results where it does not.
+    if not out.output and result.code == 0 then
+        local last = #lines
+        while last > 0 and lines[last]:match("^%s*$") do last = last - 1 end
+        local first = math.max(1, last - SUCCESS_TAIL_LINES + 1)
+        if last > 0 then
+            out.output = vim.list_slice(lines, first, last)
+            if first > 1 then
+                out.output_note = ("the last %d lines of the output; %d earlier lines omitted")
+                    :format(last - first + 1, first - 1)
+            end
         end
     end
     if #failures > 0 then

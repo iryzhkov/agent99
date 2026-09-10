@@ -258,7 +258,9 @@ func resolveSession(name string, args map[string]any) (session, error) {
 			"workspaces are open (%s), so there is nothing to route it by - a relative path "+
 			"means \"in whichever workspace this lands in\". Pass workspace=<root>, or an "+
 			"absolute path. The server will not guess with several open, because the guess "+
-			"can be another agent's repository",
+			"can be another agent's repository. This count is not yours to cache: one server "+
+			"is shared by every agent on this machine, so a workspace can open between two "+
+			"of your calls",
 			name, len(roots), strings.Join(roots, ", "))
 	}
 	for _, root := range []string{stickyRoot(stickyFor(name)), stickyRoot(stickyActive), roots[0]} {

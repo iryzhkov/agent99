@@ -158,34 +158,18 @@ func standaloneTools(tools []tool) []tool {
 	return out
 }
 
-// Argument keys that name a path and so route the call by themselves.
-var requiredPathKeys = map[string]bool{
-	"file": true, "files": true, "from": true, "to": true, "path": true, "program": true,
-}
-
-// needsWorkspaceArg reports whether a tool can be called without naming any
-// path - check_project, undo_edit, a glob-only find_symbol, the debugger.
-// Those have nothing to route on once more than one workspace is open, so
-// they take the workspace explicitly.
+// needsWorkspaceArg reports whether a tool takes an explicit workspace.
+//
+// It used to exclude any tool with a required path argument, on the reasoning
+// that such a call routes itself. It does not: a relative path means "in the
+// workspace this call is routed to", so argPaths leaves it out and the call is
+// refused with advice to pass workspace= - a parameter skim, read_file,
+// diagnostics, references, definition and replace_symbol_lines did not have.
+// Those are the tools an agent calls most, and the friction arrived as a run
+// of consecutive failures none of which could be followed. Every tool takes it
+// now; an absolute path still wins, so nothing else changes.
 func needsWorkspaceArg(t tool) bool {
-	if t.Name == "open_workspace" || t.Name == "close_workspace" {
-		return false
-	}
-	switch req := t.InputSchema["required"].(type) {
-	case []string:
-		for _, r := range req {
-			if requiredPathKeys[r] {
-				return false
-			}
-		}
-	case []any:
-		for _, r := range req {
-			if s, ok := r.(string); ok && requiredPathKeys[s] {
-				return false
-			}
-		}
-	}
-	return true
+	return t.Name != "open_workspace" && t.Name != "close_workspace"
 }
 
 // withWorkspaceArg returns the schema with a "workspace" property added. The

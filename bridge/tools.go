@@ -754,12 +754,18 @@ func annotateGrepHits(ses session, lines []string, blame bool, kindFilter string
 	// Hits the classifier never saw cannot answer a kind= filter either
 	// way; under a filter they go, and the caller is told how many.
 	leaveUnclassified := func(files []string) {
-		for _, rest := range files {
-			unclassified += len(byFile[rest])
-			if kindFilter != "" {
-				for _, h := range byFile[rest] {
+		for _, file := range files {
+			unclassified += len(byFile[file])
+			for _, h := range byFile[file] {
+				if kindFilter != "" {
 					drop[h.idx] = true
+					continue
 				}
+				// One shape for every hit in a reply. An annotated hit has
+				// its raw column stripped, and an unannotated one used to
+				// keep `path:line:col:text`, so a single reply carried two
+				// formats and could not be parsed by one rule.
+				lines[h.idx] = fmt.Sprintf("%s:%d:%s", file, h.line, h.rest)
 			}
 		}
 	}

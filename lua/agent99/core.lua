@@ -719,6 +719,12 @@ local function make_position(bufnr, client, line, symbol, col)
     elseif type(symbol) == "string" and symbol ~= "" then
         local s = text:find(symbol, 1, true)
         if not s then
+            -- Ending on the quoted line reads as a truncated message when the
+            -- line is blank, and a blank line is exactly the case where the
+            -- caller's line number is off by a few.
+            if text:match("^%s*$") then
+                err("symbol %q not found on line %d, which is blank", symbol, line)
+            end
             err("symbol %q not found on line %d, which reads: %s", symbol, line, text)
         end
         byte0 = s - 1

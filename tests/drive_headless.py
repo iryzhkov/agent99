@@ -219,14 +219,27 @@ def group_workspace(c):
     # A remembered command outlives the workspace: close it, reopen the
     # same root, and a bare check_project still runs it.
     res = b.call("check_project", {"command": cmd, "remember": True})
-    check("check_project remember", "later ones" in res.get("remembered", ""), res)
+    # The reply has to say which store the command went into: "kept for this
+    # session" and "stored on disk" are different promises.
+    check("check_project remember", "later sessions" in res.get("remembered", ""), res)
     b.call("close_workspace", {})
     res = b.call("open_workspace", {"root": root})
     c.pid = res["pid"]
     res = b.call("check_project", {})
     check("remembered command survives a workspace restart",
-          res.get("remembered", "").startswith("using the command remembered")
+          res.get("remembered", "").startswith("using the command stored")
           and res.get("output") == ["one", "three"], res)
+    # A command that cannot run on this machine says nothing about the project
+    # and must not be stored for the root, where it would poison every later
+    # bare call in this session and the next.
+    res = b.call("check_project",
+                 {"command": "agent99-no-such-checker --all", "remember": True})
+    check("a command that is not installed is not remembered",
+          "not_remembered" in res and "did_not_run" in res
+          and "remembered" not in res, res)
+    res = b.call("check_project", {})
+    check("the failed command did not become this root's default",
+          res.get("command") == cmd, res)
 
     reset(c)
     # install_language under the minimal config has neither nvim-treesitter
@@ -704,7 +717,24 @@ def group_index(c):
     check("a setting on a foreign object is not reported as unreferenced",
           not any(n.startswith("vim.") for n in names)
           and any("orphan_helper" in n for n in names), res)
+    check("what was skipped is counted and named",
+          res.get("symbols_skipped", 0) >= 3
+          and "fields on an object declared elsewhere" in res.get("symbols_skipped_note", ""), res)
     os.remove(settings)
+    # A file holding nothing this tool checks used to come back with
+    # "every top-level symbol in these files is referenced somewhere else"
+    # and symbols_checked: 0 - an all-clear over a file nothing had looked
+    # at. The reply has to state that instead of asserting anything.
+    only_fields = os.path.join(root, "lua", "testproj", "only_fields.lua")
+    with open(only_fields, "w") as f:
+        f.write("vim.opt.number = true\n"
+                "vim.opt.tabstop = 4\n")
+    res = b.call("unreferenced_symbols", {"file": only_fields})
+    check("a file with nothing to check says nothing was checked",
+          res.get("symbols_checked") == 0
+          and res.get("summary", "").startswith("nothing was checked")
+          and "referenced somewhere else" not in res.get("summary", ""), res)
+    os.remove(only_fields)
 
 
 def group_edit(c):
@@ -772,7 +802,7 @@ def group_edit(c):
         })
         check("a partly stale chunked call is refused", False, "call succeeded")
     except RuntimeError as e:
-        token = re.search(r"token=(\d+)", str(e))
+        token = re.search(r'token="(\d+)"', str(e))
         check("the refusal offers to apply the chunks that matched",
               "apply only the 1 chunk(s) that matched" in str(e) and token is not None, e)
         if token:
@@ -934,65 +964,43 @@ def group_edit(c):
     os.remove(scratch)
 
     reset(c)
-    # An expect= that covers fewer lines than the range is a different
-    # mistake from a stale offset, and relocating it would apply the edit to
-    # those lines alone - the rest of the range would survive, below the new
-    # text. M.greet is three lines; guarding all three with only its first
-    # line is refused, and the narrowing is offered instead of being taken.
+    # An expect= shorter than the range anchors the start of it. Proving the
+    # numbers are not stale is the whole of what expect= is for, and the
+    # requested range starting with exactly the expected text proves it.
+    # Refusing here taught nobody: callers kept sending the first line of a
+    # long range with no way to comply, and it was the largest open friction
+    # cluster in the digest. The whole range is replaced, and the reply says
+    # how much of it the expect actually vouched for.
+    res = b.call("replace_symbol_lines", {
+        "file": util, "name_path": "M.greet", "first_line": 1, "last_line": 3,
+        "expect": "function M.greet(name)",
+        "text": 'function M.greet(name)\n    return "hi, " .. name\nend',
+    })
+    text_now = open(util).read()
+    check("a short expect anchors the range and the edit applies to all of it",
+          res.get("replaced") == "lines 1-3 of M.greet"
+          and 'return "hi, " .. name' in text_now
+          and 'return "hello, " .. name' not in text_now
+          and text_now.count("function M.greet(name)") == 1, res)
+    check("the reply says how much of the range the expect covered",
+          any("covered the first 1 of the 3 lines" in s
+              for s in res.get("expect_was_a_prefix", [])), res)
+
+    reset(c)
+    # An expect that is not what the range starts with is a stale offset
+    # still, and still refused with nothing written.
     before_short = open(util).read()
     try:
         b.call("replace_symbol_lines", {
             "file": util, "name_path": "M.greet", "first_line": 1, "last_line": 3,
-            "expect": "function M.greet(name)",
-            "text": 'function M.greet(name)\n    return "hi, " .. name\nend',
+            "expect": "nothing like this",
+            "text": "x",
         })
-        check("a short expect is refused, not narrowed", False, "call succeeded")
+        check("an expect the range does not start with is refused", False, "call succeeded")
     except RuntimeError as e:
-        token = re.search(r"token=(\d+)", str(e))
-        check("a short expect is refused, not narrowed",
+        check("an expect the range does not start with is refused",
               "expect covers 1 line(s)" in str(e) and "cover 3" in str(e)
-              and "do start with that text" in str(e)
-              and open(util).read() == before_short and token is not None, e)
-        # Text written for the whole range cannot go on the one line the
-        # expect covers without leaving the rest of the range below it, so
-        # the narrowing is not offered at all - only the requested lines.
-        check("narrowing is withheld when the text was written for the range",
-              "were written for the whole range" in str(e)
-              and "quote all 3 lines in expect=." in str(e)
-              and "1 = apply at the requested lines anyway" in str(e), e)
-        if token:
-            res = b.call("apply_code_action", {"token": token.group(1), "index": 1})
-            text_now = open(util).read()
-            check("the offered action applies the text to the whole range",
-                  res.get("replaced") == "lines 1-3 of M.greet"
-                  and 'return "hi, " .. name' in text_now
-                  and 'return "hello, " .. name' not in text_now
-                  and text_now.count("function M.greet(name)") == 1, res)
-
-    reset(c)
-    # A short expect whose replacement does fit the lines it covers is the
-    # honest miscount: the narrowing is offered there, and applying it
-    # leaves the rest of the range alone.
-    try:
-        b.call("replace_symbol_lines", {
-            "file": util, "name_path": "M.greet", "first_line": 1, "last_line": 3,
-            "expect": "function M.greet(name)",
-            "text": "function M.greet(name) -- greets",
-        })
-        check("a short expect with fitting text is refused too", False, "call succeeded")
-    except RuntimeError as e:
-        token = re.search(r"token=(\d+)", str(e))
-        check("a short expect with fitting text is refused too",
-              "expect covers 1 line(s)" in str(e)
-              and "or replace only the 1 it covers" in str(e)
-              and "1 = replace only the 1 line(s)" in str(e), e)
-        if token:
-            res = b.call("apply_code_action", {"token": token.group(1), "index": 1})
-            text_now = open(util).read()
-            check("the narrowing is offered when the text fits, and keeps the rest",
-                  res.get("replaced") == "lines 1-1 of M.greet"
-                  and "function M.greet(name) -- greets" in text_now
-                  and 'return "hello, " .. name' in text_now, res)
+              and open(util).read() == before_short, e)
 
     reset(c)
     # insert_lines: main.lua starts with a bare require, so there is no
@@ -1078,6 +1086,11 @@ def group_edit(c):
     check("rename applied",
           res.get("renamed_to") == "hello" and "M.hello(name)" in util_text
           and "M.greet" not in util_text, res)
+    # A rename that reached every reference must not warn that it did not:
+    # the scope check compares the rename's files against the server's
+    # references, and a false positive here would make the warning noise.
+    check("a complete rename carries no scope warning",
+          "references_not_renamed" not in res, res)
     res = b.call("undo_edit", {"all": True})
     with open(util) as f:
         util_text = f.read()
@@ -2021,7 +2034,18 @@ def group_files(c):
           res)
     check("move_symbols creates the destination and reports what moved",
           res.get("created") is True and res.get("moved") == ["M.shout"], res)
+    # The description used to promise that both files' imports are
+    # reorganized, which describes gopls and not the tool: pyright, tsserver
+    # and lua_ls sort and prune and add nothing, so three of four languages
+    # were left non-runnable by a reply that read clean. The reply says what
+    # was and was not done, and whether other files could be checked at all.
+    check("move_symbols says what its import pass did and did not do",
+          "sorted and pruned" in res.get("imports", "")
+          and "gopls does" in res.get("imports", "")
+          and res.get("also_checked_note", "") != "", res)
     check("the symbol that stayed is untouched", "function M.greet" in left_text, left_text)
+    check("the removal site is not left with a run of blank lines",
+          "\n\n\n" not in left_text, left_text)
     # One move is one undo step. Undoing it entry by entry restored the
     # destination while the symbol was still deleted from the source, so it
     # existed in neither file - and the reply said "no new errors".

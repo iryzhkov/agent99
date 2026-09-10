@@ -44,18 +44,26 @@ def main():
         b.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                              "clientInfo": {"name": "drive_multi", "version": "0"}})
 
-        # The workspace argument is advertised on the tools that can be
-        # called without naming a path, and only on those: a tool whose file
-        # is required routes itself.
+        # The workspace argument is advertised on every tool that can be
+        # routed. A required file= does not route the call by itself: a
+        # relative path means "in the workspace this lands in", so the call is
+        # refused with advice to pass workspace= - which those tools did not
+        # have. open_workspace and close_workspace name their own root.
         tools = {t["name"]: t for t in b.rpc("tools/list")["result"]["tools"]}
         props = lambda name: set(tools[name]["inputSchema"].get("properties", {}))
         check("workspace arg on pathless tools",
               "workspace" in props("check_project") and "workspace" in props("workspace_map")
               and "workspace" in props("undo_edit") and "workspace" in props("find_symbol"),
               sorted(props("check_project")))
-        check("no workspace arg where a path is required",
-              "workspace" not in props("read_file") and "workspace" not in props("definition")
-              and "workspace" not in props("open_workspace"), sorted(props("read_file")))
+        check("workspace arg on the file- and position-addressed tools too",
+              all("workspace" in props(name) for name in
+                  ("read_file", "skim", "diagnostics", "references", "definition",
+                   "replace_symbol_lines")),
+              sorted(props("read_file")))
+        check("no workspace arg where the tool names its own root",
+              "workspace" not in props("open_workspace")
+              and "workspace" not in props("close_workspace"),
+              sorted(props("open_workspace")))
 
         res = b.call("open_workspace", {"root": alpha})
         check("first workspace opens", res.get("root") == alpha, res)

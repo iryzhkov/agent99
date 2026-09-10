@@ -229,6 +229,9 @@ local function reindented_kept_line(before_lines, after_lines)
     return nil
 end
 
+-- Files whose import-polish refusal has already been explained this session.
+local imports_note_said = {}
+
 -- Run the server's source.organizeImports action on the buffer. Returns
 -- true when an action was applied.
 local function organize_imports(bufnr)
@@ -283,9 +286,18 @@ local function organize_imports(bufnr)
         local reindented = reindented_kept_line(before_lines, after_lines)
         if reindented then
             vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, before_lines)
+            -- This is a fact about the file and its server rather than about
+            -- the edit, so it is the same on every edit to that file: it went
+            -- out on nine consecutive replies, each quoting a different line
+            -- of the same import block, and none of them was a decision the
+            -- caller could act on twice.
+            local name = vim.api.nvim_buf_get_name(bufnr)
+            if imports_note_said[name] then return false end
+            imports_note_said[name] = true
             return false, ("the imports were left as they were: organizing them re-indented "
                 .. "lines it did not otherwise change (%q), which would have rewritten the "
-                .. "block in a width this file does not use"):format(reindented:sub(1, 40))
+                .. "block in a width this file does not use. This holds for every edit to "
+                .. "this file, and is said once per file per session"):format(reindented:sub(1, 40))
         end
         ledger_absorb(bufnr, before_lines, after_lines)
     end
@@ -681,6 +693,9 @@ end
 -- Pre-existing diagnostics in the edited file are listed rather than counted,
 -- up to this many; past it the rest become a tally.
 local PREEXISTING_LISTED = 10
+-- Hints in the edited files are named rather than dropped, but a server that
+-- hints on every unused local would fill a reply on its own.
+local HINTS_LISTED = 5
 
 -- A server saying it cannot analyze this file at all, rather than saying
 -- something about the code in it. Usually a build-tag or project-membership
@@ -762,6 +777,18 @@ end
 -- from one listener that outlives any single wait.
 local last_publish = {}    -- [bufnr] = { at = ms, by = { [client.name] = ms } }
 
+-- Which servers have ever published a diagnostic in this session, by name. A
+-- server that has produced none at all is one whose silence certifies
+-- nothing: bash-language-server is attached to every shell file, answers
+-- every request, and reported nothing for a file holding a deliberate syntax
+-- error. Silence from a server that has been reporting all session is
+-- evidence; silence from one that has never reported anything is not.
+local ever_published = {}  -- [client.name] = true
+-- How many edits each server has acknowledged, so that "it has reported
+-- nothing" is only said of a server that has had chances to.
+local edits_acked = {}     -- [client.name] = count
+local SILENT_AFTER = 3
+
 local function client_names_of(diags)
     local names = {}
     for _, d in ipairs(diags or {}) do
@@ -780,6 +807,7 @@ vim.api.nvim_create_autocmd("DiagnosticChanged", {
         last_publish[ev.buf] = rec
         rec.at = now
         local names = client_names_of(ev.data and ev.data.diagnostics)
+        for name in pairs(names) do ever_published[name] = true end
         if next(names) == nil then
             -- A cleared set names nobody; credit every attached server.
             for _, c in ipairs(vim.lsp.get_clients({ bufnr = ev.buf })) do
@@ -789,6 +817,27 @@ vim.api.nvim_create_autocmd("DiagnosticChanged", {
         for name in pairs(names) do rec.by[name] = now end
     end,
 })
+
+-- The servers attached to this buffer, named, when not one of them has ever
+-- published a diagnostic in this session; nil once any of them has.
+local function silent_server(bufnr, names)
+    if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then return nil end
+    local list = {}
+    for _, name in ipairs(names or {}) do list[#list + 1] = name end
+    if #list == 0 then
+        for _, c in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do list[#list + 1] = c.name end
+    end
+    if #list == 0 then return nil end
+    for _, name in ipairs(list) do
+        -- Silence on the first edit of a session says nothing: a server that
+        -- reports plenty has simply had nothing to report yet. Only once it
+        -- has acknowledged several edits and still produced nothing does its
+        -- silence stop being evidence.
+        if ever_published[name] or (edits_acked[name] or 0) < SILENT_AFTER then return nil end
+    end
+    table.sort(list)
+    return table.concat(list, " and ")
+end
 
 -- Publish lag learned over the session, per workspace root and server: the
 -- last few gaps between a server acknowledging a change and publishing
@@ -920,7 +969,11 @@ local function wait_for_diagnostics(bufnr, root, wait_ms, settle_ms, since, acks
         done, published = verdict_in(bufnr, since, acks, settle)
     end
     learn_from(bufnr, root, since, nil)
-    return published
+    -- `done` is the whole point of the second return: false means the budget
+    -- ran out before the servers had said all they will, so whatever the
+    -- diagnostics show now is provisional and the caller must say so rather
+    -- than report a clean verdict it never obtained.
+    return published, done
 end
 
 -- Reports not yet delivered: verdicts deferred by wait=false, and
@@ -1188,8 +1241,17 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
                 .. "(under deferred_verdicts); nothing was waited for",
         }
     end
+    -- Whether the wait actually obtained a verdict. `settled` false means the
+    -- budget expired first, and every "no new errors" below is then a guess
+    -- about a server that had not finished answering.
+    local settled = true
     if attached then
-        wait_for_diagnostics(bufnr, root, opts.wait_ms, opts.settle_ms, since, acks, names)
+        local _, done = wait_for_diagnostics(bufnr, root, opts.wait_ms, opts.settle_ms,
+            since, acks, names)
+        settled = done
+        for _, name in ipairs(names or {}) do
+            edits_acked[name] = (edits_acked[name] or 0) + 1
+        end
     end
     local report = {}
     -- AGENT99_LINT_<FILETYPE> in the environment (handy for `claude mcp add
@@ -1245,7 +1307,12 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
                 -- actually has, which is whether any of these are in the
                 -- code being edited, and which of them are new to the list.
                 prior_items[#prior_items + 1] = {
-                    sig = sig, here = d.bufnr == bufnr,
+                    -- "Here" is every file this call edited, not only the one
+                    -- it was addressed to: a glob replace_pattern touching
+                    -- five files reported four warnings as "none of them in
+                    -- this file" while three of them were in files it had
+                    -- just edited.
+                    sig = sig, here = d.bufnr == bufnr or (ctx.own and ctx.own[d.bufnr]) or false,
                     text = ("%s %s:%d: %s"):format(vim.diagnostic.severity[d.severity],
                         vim.fn.fnamemodify(vim.api.nvim_buf_get_name(d.bufnr), ":."),
                         d.lnum + 1, d.message),
@@ -1296,6 +1363,14 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         new_elsewhere = vim.list_slice(new_elsewhere, 1, 10)
         new_elsewhere[#new_elsewhere + 1] = ("… +%d more"):format(extra)
     end
+    -- A glob replace_pattern or a move edits several files at once, and
+    -- "this file" is then the wrong noun for what the reply is describing.
+    local also_touched = 0
+    for b in pairs(ctx.own or {}) do
+        if b ~= bufnr then also_touched = also_touched + 1 end
+    end
+    local scope = also_touched > 0 and "the files this call edited" or "this file"
+    local silent = attached and silent_server(bufnr, names) or nil
     local not_analyzed = bufnr and not_analyzed_reason(bufnr) or nil
     if not_analyzed then
         -- Reporting "no new errors" here would be a straight lie: the server
@@ -1314,6 +1389,22 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     elseif not bufnr then
         report.diagnostics_after = #new_elsewhere == 0
             and "no new errors elsewhere in the project" or nil
+    elseif #new_here == 0 and not settled then
+        -- The budget ran out before the servers had finished. Saying "no new
+        -- errors" here asserts a verdict that was never given; whatever the
+        -- server says next arrives under late_diagnostics on a later reply.
+        report.diagnostics_after = ("nothing new so far, but the server had not finished "
+            .. "answering within %d ms, so this verdict is provisional: anything that arrives "
+            .. "later comes with a later reply under late_diagnostics"):format(opts.wait_ms)
+    elseif #new_here == 0 and silent then
+        -- The servers on this file answered the barrier and then said nothing,
+        -- and none of them has published a single diagnostic anywhere in this
+        -- session. That is what bash-language-server does for a file holding a
+        -- deliberate syntax error, so the silence is not a verdict.
+        report.diagnostics_after = ("no new errors or warnings, but %s has published no "
+            .. "diagnostics at all in this session, so its silence is not yet evidence that "
+            .. "this file is clean; check_project runs the project's own build or check")
+            :format(silent)
     elseif #new_here == 0 then
         report.diagnostics_after = "no new errors or warnings"
     else
@@ -1323,6 +1414,57 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
         -- confirming rather than chasing.
         report.if_unexpected = "these come from the language server; check_project "
             .. "runs the project's own build or check for ground truth"
+    end
+    -- A multi-file edit takes its verdict from the buffer it was addressed to,
+    -- and the rest only ever reached the reply through `preexisting`: three Go
+    -- files behind a build tag, which the server had declined to analyze,
+    -- appeared there while the verdict line read "no new errors or warnings".
+    -- A file nothing looked at is a caveat on this edit, not a prior condition.
+    local unchecked = {}
+    for b in pairs(ctx.own or {}) do
+        if b ~= bufnr and vim.api.nvim_buf_is_valid(b) then
+            local why = not_analyzed_reason(b) or dialect_note(b)
+                or (#vim.lsp.get_clients({ bufnr = b }) == 0
+                    and "no language server attached to this file" or nil)
+            if why then
+                unchecked[#unchecked + 1] = ("%s: %s"):format(
+                    vim.fn.fnamemodify(vim.api.nvim_buf_get_name(b), ":."), why)
+            end
+        end
+    end
+    if #unchecked > 0 then
+        report.not_checked = unchecked
+        report.not_checked_note = "this call edited these files as well and nothing analyzed "
+            .. "them, so the verdict above does not cover them"
+    end
+    -- Everything above counts errors and warnings only. In a JavaScript file
+    -- with no tsconfig the server has nothing stronger than a hint to say
+    -- with, and the two hints dropped from one reply were the orphaned
+    -- constants a move had left behind - the whole of the evidence that the
+    -- file no longer ran. Hints in the files this call edited are named here
+    -- rather than silently discarded.
+    local hints, hint_bufs = {}, { [bufnr or -1] = true }
+    for b in pairs(ctx.own or {}) do hint_bufs[b] = true end
+    for b in pairs(hint_bufs) do
+        if vim.api.nvim_buf_is_valid(b) then
+            for _, d in ipairs(vim.diagnostic.get(b)) do
+                if d.severity > vim.diagnostic.severity.WARN then
+                    hints[#hints + 1] = ("%s:%d: %s"):format(
+                        vim.fn.fnamemodify(vim.api.nvim_buf_get_name(b), ":."),
+                        d.lnum + 1, d.message)
+                end
+            end
+        end
+    end
+    if #hints > 0 then
+        local total = #hints
+        if total > HINTS_LISTED then
+            hints = vim.list_slice(hints, 1, HINTS_LISTED)
+            hints[#hints + 1] = ("… +%d more"):format(total - HINTS_LISTED)
+        end
+        report.hints = hints
+        report.hints_note = ("%d hint-level diagnostics in %s; these are not errors or warnings "
+            .. "and are not counted above"):format(total, scope)
     end
     if #new_elsewhere > 0 then
         report.new_errors_elsewhere = new_elsewhere
@@ -1344,21 +1486,44 @@ function post_edit_report(bufnr, before, root, headless, opts, full, ctx)
     local seen_now = {}
     for _, item in ipairs(prior_items) do seen_now[item.sig] = (seen_now[item.sig] or 0) + 1 end
     if #prior > 0 then
-        local listed, here, entered = {}, 0, 0
+        local listed, here, entered, entered_here = {}, 0, 0, 0
         local budget = vim.deepcopy(last_prior_sigs)
         for _, item in ipairs(prior_items) do
             if item.here then here = here + 1 end
             local known = (budget[item.sig] or 0) > 0
-            if known then budget[item.sig] = budget[item.sig] - 1 else entered = entered + 1 end
+            if known then
+                budget[item.sig] = budget[item.sig] - 1
+            else
+                entered = entered + 1
+                if item.here then entered_here = entered_here + 1 end
+            end
             if full or not known then listed[#listed + 1] = item.text end
         end
         local elsewhere = #prior_items - here
-        local where = here == 0 and "none of them in this file"
-            or ("%d in this file, %d elsewhere"):format(here, elsewhere)
+        local where = here == 0 and ("none of them in %s"):format(scope)
+            or ("%d in %s, %d elsewhere"):format(here, scope, elsewhere)
+        -- "New to this list" read as "new because of you", and usually it is
+        -- not: the list grows as the language server is asked about more of
+        -- the project, and one edit brought in 61 entries from files it had
+        -- never opened. An entry in a file this call edited is the one that
+        -- deserves that reading, so it is counted apart from the rest.
+        local how_new
+        if full then
+            how_new = "all listed"
+        elseif entered_here == 0 then
+            how_new = ("%d entered this list since the last reply, none of them in %s: the "
+                .. "server has been asked about more of the project, which is not a change "
+                .. "this call made"):format(entered, scope)
+        elseif entered_here == entered then
+            how_new = ("%d new to this list since the last reply, all of them in %s")
+                :format(entered, scope)
+        else
+            how_new = ("%d entered this list since the last reply, %d of them in %s")
+                :format(entered, entered_here, scope)
+        end
         if full or entered > 0 then
             report.preexisting = ("%s were there before the edit (%s); %s"):format(
-                table.concat(prior, " and "), where,
-                full and "all listed" or ("%d new to this list since the last reply"):format(entered))
+                table.concat(prior, " and "), where, how_new)
             if #listed > PREEXISTING_LISTED then
                 local extra = #listed - PREEXISTING_LISTED
                 listed = vim.list_slice(listed, 1, PREEXISTING_LISTED)
@@ -2183,7 +2348,7 @@ local function replace_symbol_lines(args)
     -- also does the search the caller would do next: when the expected text
     -- sits in exactly one place, it offers the relocated edit as a code
     -- action, so the fix is one apply_code_action call and no re-read.
-    local stale, relocated, narrow = {}, {}, {}
+    local stale, relocated, narrow, anchored = {}, {}, {}, {}
     for _, c in ipairs(chunks) do
         if c.expect ~= nil and not args.force then
             local want = vim.trim((c.expect:gsub("\n+$", "")))
@@ -2206,19 +2371,31 @@ local function replace_symbol_lines(args)
                 local sized = #want_lines == #c.old
                 local head = not sized and #c.old > #want_lines
                     and indent_blind(vim.list_slice(c.old, 1, #want_lines)) == indent_blind(want_lines)
-                stale[#stale + 1] = { c = c, have = have, want = want, at = at, want_n = #want_lines,
-                    count = count, n = n, scope = scope, sized = sized, head = head,
-                    hint_line = hint_line, hint_text = hint_text }
-                if sized and at then
-                    -- The relocated range is as long as the expected text,
-                    -- which is also as long as the requested one.
-                    relocated[c] = { first_line = at, last_line = at + n - 1, scope = scope }
-                elseif head then
-                    -- The range does hold the expected text, at its start:
-                    -- the numbers are not stale, expect= is short.
-                    narrow[c] = { first_line = c.first, last_line = c.first + #want_lines - 1, scope = "symbol" }
-                elseif at then
-                    narrow[c] = { first_line = at, last_line = at + n - 1, scope = scope }
+                if head then
+                    -- The requested range starts with exactly the text the
+                    -- caller expected, so the offset is not stale, which is
+                    -- the only thing expect= exists to prove. Refusing here
+                    -- taught nobody: callers kept sending a short expect for a
+                    -- long range, and that refusal was the largest open
+                    -- friction cluster in the digest, six of sixteen leaving
+                    -- the caller stuck. A short expect is a prefix anchor on
+                    -- the first lines of the range from now on, and the reply
+                    -- says how much of the range it actually vouched for.
+                    anchored[#anchored + 1] = ("expect= covered the first %d of the %d lines "
+                        .. "replaced (lines %d-%d of %s), so it anchored the start of the range "
+                        .. "and said nothing about the rest of it. match= guards the whole of "
+                        .. "what it names."):format(#want_lines, #c.old, c.first, c.last, c.entry.path)
+                else
+                    stale[#stale + 1] = { c = c, have = have, want = want, at = at, want_n = #want_lines,
+                        count = count, n = n, scope = scope, sized = sized, head = head,
+                        hint_line = hint_line, hint_text = hint_text }
+                    if sized and at then
+                        -- The relocated range is as long as the expected text,
+                        -- which is also as long as the requested one.
+                        relocated[c] = { first_line = at, last_line = at + n - 1, scope = scope }
+                    elseif at then
+                        narrow[c] = { first_line = at, last_line = at + n - 1, scope = scope }
+                    end
                 end
             end
         end
@@ -2265,21 +2442,7 @@ local function replace_symbol_lines(args)
                         .. "cannot say what the rest of the range holds.\nexpect: %s\nfound:  %s")
                     :format(s.want_n, s.c.first, s.c.last, s.c.entry.path, #s.c.old,
                         vim.inspect(s.want), vim.inspect(s.have))
-                if s.head then
-                    local t = relocated[s.c] or narrow[s.c]
-                    local fits = t ~= nil and #s.c.new_lines <= (t.last_line - t.first_line + 1)
-                    lines[#lines + 1] = ("lines %d-%d do start with that text, so the numbers are right and "
-                            .. "expect= is short: quote all %d lines in expect=%s."):format(
-                            s.c.first, s.c.last, #s.c.old,
-                            fits and (", or replace only the %d it covers"):format(s.want_n) or "")
-                    if not fits then
-                        lines[#lines + 1] = ("the %d line(s) of text sent with this call were written for "
-                            .. "the whole range, so replacing only the %d line(s) the expect covers is not "
-                            .. "offered: it would leave the other %d below the new text, which is the "
-                            .. "duplication this refusal is for."):format(
-                            #s.c.new_lines, s.want_n, #s.c.old - s.want_n)
-                    end
-                elseif s.at then
+                if s.at then
                     local abs = s.c.entry.first + s.at - 1
                     lines[#lines + 1] = ("the expected text is %d line(s) at buffer lines %d-%d, which is not "
                             .. "the range that was asked for."):format(s.n, abs, abs + s.n - 1)
@@ -2396,12 +2559,20 @@ local function replace_symbol_lines(args)
         action_token = action_token + 1
         local token = tostring(action_token)
         action_cache[token] = { edit = "replace_symbol_lines", actions = actions }
-        local titles = {}
+        -- A literal `index=N` is not a call anybody can make, and when the
+        -- token is itself a short number the whole line reads as a template
+        -- with nothing filled in. Each action is printed as the call that
+        -- runs it, token quoted.
+        local calls = {}
         for i, a in ipairs(actions) do
-            titles[#titles + 1] = ("%d = %s"):format(i, a.title)
+            calls[#calls + 1] = ("apply_code_action(token=%q, index=%d) = %s")
+                :format(token, i, a.title)
         end
-        err("%s\napply_code_action(token=%s, index=N) continues without a re-read: %s",
-            table.concat(lines, "\n"), token, table.concat(titles, "; "))
+        -- The last action here is the destructive one: it writes at line
+        -- numbers that have already been shown to be wrong.
+        calls[#calls + 1] = "or read the region again (read_file, or find_symbol with "
+            .. "include_body) and send the edit with match= instead, which needs no line numbers"
+        err("%s\n%s", table.concat(lines, "\n"), table.concat(calls, "\n"))
     end
 
     if args.dry_run then
@@ -2455,6 +2626,9 @@ local function replace_symbol_lines(args)
     local result = finish_edit(bufnr, args, before, ledger_path,
         "replace_lines", span_first, span_last, span_old, #span_old + delta,
         { replaced = label }, symbols > 1 and regions or nil)
+    if #anchored > 0 then
+        result.expect_was_a_prefix = anchored
+    end
     -- Always echo what was there. Without `expect` this is the only way a
     -- caller finds out an offset had drifted, and it costs a few lines.
     if #chunks == 1 then
@@ -2490,6 +2664,12 @@ local function replace_symbol_lines(args)
     return result
 end
 
+-- How many blank lines separate two top-level declarations in this language.
+-- PEP 8 and black both require two in Python, and one everywhere else here.
+local function blank_separator(bufnr)
+    return vim.bo[bufnr].filetype == "python" and 2 or 1
+end
+
 local function insert_symbol_tool(where)
     return function(args)
         local bufnr, entry = resolve_symbol(args.file, args.name_path, nil, tonumber(args.line))
@@ -2504,18 +2684,30 @@ local function insert_symbol_tool(where)
         -- Text that already begins (or ends) with a blank line does not want
         -- another one: the two together left a double blank that gofmt then
         -- reported as dirty, with nothing said in the reply.
+        -- One blank line reads as the separator everywhere except Python,
+        -- where PEP 8 and black want two between top-level definitions: an
+        -- insert into black's own source produced one blank above the new
+        -- function and two below it, which black would reformat in CI.
         local spaced = (entry.last - entry.first) > 0
+        -- The wider separator is a top-level rule: two blank lines between
+        -- methods inside a Python class is one too many.
+        local anchor = vim.api.nvim_buf_get_lines(bufnr, entry.first - 1, entry.first, false)[1] or ""
+        local sep = anchor:match("^%s") == nil and blank_separator(bufnr) or 1
         local row -- 0-based insertion point
         if where == "after" then
             row = entry.last
-            if spaced and lines[1] ~= "" then table.insert(lines, 1, "") end
+            if spaced and lines[1] ~= "" then
+                for _ = 1, sep do table.insert(lines, 1, "") end
+            end
         else
             -- Above the whole declaration, its decorators and doc comment
             -- included, so a new sibling never lands between @Decorator (or
             -- a Rust #[attr], or a Python decorator) and the thing it
             -- annotates, which is a syntax error.
             row = decl_block_top(bufnr, entry.first) - 1
-            if spaced and lines[#lines] ~= "" then table.insert(lines, "") end
+            if spaced and lines[#lines] ~= "" then
+                for _ = 1, sep do table.insert(lines, "") end
+            end
         end
         local conflict = primary_region_conflict(bufnr, row + 1, row + 1)
         if conflict then err(conflict) end
@@ -2725,6 +2917,34 @@ local function summarize_workspace_edit(edit)
     return files, file_ops
 end
 
+-- Files that hold a reference to the symbol and are not in the rename's
+-- workspace edit. bash-language-server implements rename with document scope
+-- only: a rename of a function defined in one shell module and called from
+-- five others reported one file, one edit, no diagnostics, and left the five
+-- callers calling a name that no longer exists. The check asks the server the
+-- other question it can answer about the same position, so it needs to know
+-- nothing about any particular server to catch the mismatch.
+local function references_outside(client, bufnr, params, files)
+    if not client:supports_method("textDocument/references") then return nil end
+    local rp = vim.deepcopy(params)
+    rp.newName = nil
+    rp.context = { includeDeclaration = true }
+    local ok, refs = pcall(request, client, bufnr, "textDocument/references", rp)
+    if not ok or type(refs) ~= "table" then return nil end
+    local touched = {}
+    for _, f in ipairs(files) do touched[f.file] = true end
+    local extra, seen = {}, {}
+    for _, r in ipairs(refs) do
+        local file = r.uri and vim.uri_to_fname(r.uri)
+        if file and not touched[file] and not seen[file] then
+            seen[file] = true
+            extra[#extra + 1] = rel_path(file)
+        end
+    end
+    table.sort(extra)
+    return #extra > 0 and extra or nil
+end
+
 local function rename_symbol(args)
     local bufnr = load_buf(args.file)
     local new_name = args.new_name
@@ -2747,12 +2967,19 @@ local function rename_symbol(args)
     local files, file_ops = summarize_workspace_edit(edit)
     local total = 0
     for _, f in ipairs(files) do total = total + f.edits end
+    local untouched = references_outside(client, bufnr, params, files)
+    local scope_note = untouched and (("the server reports references to this symbol in %d "
+        .. "file(s) that the rename does not touch. Some servers - bash-language-server is "
+        .. "one - rename within a single document only, and the rest of the project keeps "
+        .. "calling the old name. replace_pattern with kind=code over those files renames "
+        .. "the rest; references(file, line) lists every one."):format(#untouched)) or nil
     if args.dry_run then
         -- The dry run is the call made to decide whether to trust the
         -- rename, so it is the one that most needs the caveat.
         local missing_dry = core.deps_missing(args.root or vim.fn.getcwd())
         return { dry_run = true, new_name = new_name, files = files,
             total_edits = total, file_operations = #file_ops > 0 and file_ops or nil,
+            references_not_renamed = untouched, references_not_renamed_note = scope_note,
             may_be_incomplete = missing_dry and ("the language server cannot resolve this "
                 .. "project's imports (" .. missing_dry .. ") so call sites in other packages "
                 .. "are missing from this list; grep for the name to see them") or nil,
@@ -2786,7 +3013,8 @@ local function rename_symbol(args)
         end
     end)
     local result = { renamed_to = new_name, files = files, total_edits = total,
-        file_operations = #file_ops > 0 and file_ops or nil }
+        file_operations = #file_ops > 0 and file_ops or nil,
+        references_not_renamed = untouched, references_not_renamed_note = scope_note }
     -- A rename reaches exactly as far as the server's references do.
     local missing = core.deps_missing(args.root)
     if missing then
@@ -3097,8 +3325,11 @@ local function replace_pattern(args)
                 end
                 if new[i] ~= line and #samples < 8 then
                     samples[#samples + 1] = ("%s:%d"):format(rel_path(path), i)
-                    samples[#samples + 1] = "- " .. line
-                    samples[#samples + 1] = "+ " .. new[i]
+                    -- No space after the marker: the space made the sample
+                    -- one byte different from the line in the file, so it
+                    -- could not be copied into a match= or an expect=.
+                    samples[#samples + 1] = "-" .. line
+                    samples[#samples + 1] = "+" .. new[i]
                 end
             end
             total = total + hits
@@ -3610,6 +3841,71 @@ local function trailing_return_row(bufnr)
     return srow
 end
 
+local MOVE_REFERRERS_MAX = 20
+
+
+-- Collapse the run of blank lines that meets at `row` (1-based, the first line
+-- after a removal) down to `keep`, and to nothing at the top or the bottom of
+-- the file. Every move left four consecutive blank lines at the removal site -
+-- the two that had surrounded the symbol, brought together - which in Python
+-- is source that black reformats rather than a cosmetic matter.
+local function collapse_blanks(bufnr, row, keep)
+    local function blank(i)
+        if i < 1 or i > vim.api.nvim_buf_line_count(bufnr) then return false end
+        return (vim.api.nvim_buf_get_lines(bufnr, i - 1, i, false)[1] or ""):match("^%s*$") ~= nil
+    end
+    local first, last = row, row - 1
+    while blank(first - 1) do first = first - 1 end
+    while blank(last + 1) do last = last + 1 end
+    if last < first then return end
+    -- A run at the very top or the very bottom of the file separates nothing.
+    local want = keep
+    if first == 1 or last >= vim.api.nvim_buf_line_count(bufnr) then want = 0 end
+    if last - first + 1 <= want then return end
+    vim.api.nvim_buf_set_lines(bufnr, first - 1 + want, last, false, {})
+end
+
+-- The files, other than the two this move edits, that reference the symbols
+-- about to move. move_symbols reorganizes the imports of the source and the
+-- destination and of nothing else, so a third file importing a moved name
+-- from its old module keeps a stale import and an ImportError at run time,
+-- and no diagnostic in either edited file says so. Asked before the move,
+-- while the declarations are still where the server expects them.
+local function referring_files(bufnr, moving, exclude)
+    local client = core.client_for(bufnr, "textDocument/references")
+    if not client then return nil end
+    local out, seen = {}, {}
+    for _, m in ipairs(moving) do
+        local name = m.path:match("[^%.:/]+$") or m.path
+        local line, col
+        for i = m.first, m.last do
+            local text = vim.api.nvim_buf_get_lines(bufnr, i - 1, i, false)[1] or ""
+            local s = text:find(name, 1, true)
+            if s then
+                line, col = i, s
+                break
+            end
+        end
+        if line then
+            local ok, refs = pcall(request, client, bufnr, "textDocument/references", {
+                textDocument = { uri = vim.uri_from_bufnr(bufnr) },
+                position = { line = line - 1, character = col - 1 },
+                context = { includeDeclaration = false },
+            })
+            for _, r in ipairs(ok and type(refs) == "table" and refs or {}) do
+                local file = r.uri and vim.uri_to_fname(r.uri)
+                if file and not exclude[file] and not seen[file]
+                    and #out < MOVE_REFERRERS_MAX then
+                    seen[file] = true
+                    out[#out + 1] = file
+                end
+            end
+        end
+    end
+    table.sort(out)
+    return out
+end
+
 -- Move whole symbols from one file to another.
 --
 -- Splitting an oversized file is a symbol operation that no symbol tool could
@@ -3722,6 +4018,23 @@ local function move_symbols(args)
             err("could not create the directory %s", rel_path(dir))
         end
         local seed = {}
+        -- A repository where every file opens with a licence or copyright
+        -- block expects the new file to carry it too; `package gin` alone is
+        -- not the header people mean by a header. The source file's own
+        -- leading comment block is the best available answer, and an explicit
+        -- header= still replaces it.
+        if args.header == nil then
+            for _, line in ipairs(from_before) do
+                if line:match("^%s*//") or line:match("^%s*#") or line:match("^%s*%-%-") then
+                    seed[#seed + 1] = line
+                elseif line:match("^%s*$") and #seed == 0 then
+                    -- a blank line before the block starts is not part of it
+                else
+                    break
+                end
+            end
+            if #seed > 0 then seed[#seed + 1] = "" end
+        end
         if header and header ~= "" then
             vim.list_extend(seed, vim.split(header, "\n", { plain = true }))
             seed[#seed + 1] = ""
@@ -3761,6 +4074,20 @@ local function move_symbols(args)
     -- The destination was loaded moments ago too; without its own wait the
     -- problems it already had would be charged to the move.
     settle_before_edit(to_buf)
+    -- Load the files that reference the moved symbols before the snapshot is
+    -- taken, so the problems they already have are in the baseline and only
+    -- what this move breaks in them is reported.
+    local referrers = referring_files(from_buf, moving,
+        { [vim.fn.fnamemodify(args.from, ":p")] = true, [to_path] = true })
+    local own, also_checked = { [from_buf] = true }, {}
+    for _, file in ipairs(referrers or {}) do
+        local okb, b = pcall(load_buf, file)
+        if okb then
+            settle_before_edit(b)
+            own[b] = true
+            also_checked[#also_checked + 1] = rel_path(file)
+        end
+    end
     local before = diag_snapshot()
 
     -- Append to the destination, then delete from the source bottom upwards so
@@ -3768,10 +4095,17 @@ local function move_symbols(args)
     -- loads as one empty line; that line is replaced, not appended to, and a
     -- separating blank goes in only after a line that has something on it.
     local empty_dest = #to_before == 0 or (#to_before == 1 and to_before[1] == "")
+    -- Python wants two blank lines between top-level definitions, not one:
+    -- moving a function into black's own source produced a file black would
+    -- have reformatted in CI, and pyright says nothing about it.
+    local sep = blank_separator(to_buf)
     local appended = {}
+    local function add_separator()
+        for _ = 1, sep do appended[#appended + 1] = "" end
+    end
     for _, block in ipairs(blocks) do
         if #appended > 0 or (not empty_dest and to_before[#to_before] ~= "") then
-            appended[#appended + 1] = ""
+            add_separator()
         end
         vim.list_extend(appended, block)
     end
@@ -3786,17 +4120,19 @@ local function move_symbols(args)
         at = tail_return
         appended = {}
         for _, block in ipairs(blocks) do
-            if #appended > 0 then appended[#appended + 1] = "" end
+            if #appended > 0 then add_separator() end
             vim.list_extend(appended, block)
         end
         if at > 0 and (to_before[at] or "") ~= "" then
-            table.insert(appended, 1, "")
+            for _ = 1, sep do table.insert(appended, 1, "") end
         end
-        appended[#appended + 1] = ""
+        add_separator()
     end
     vim.api.nvim_buf_set_lines(to_buf, at, empty_dest and #to_before or at, false, appended)
+    local from_sep = blank_separator(from_buf)
     for i = #moving, 1, -1 do
         vim.api.nvim_buf_set_lines(from_buf, moving[i].first - 1, moving[i].last, false, {})
+        collapse_blanks(from_buf, moving[i].first, from_sep)
     end
 
     local opts = post_edit_options(args)
@@ -3814,6 +4150,9 @@ local function move_symbols(args)
     -- that compiled, and retracted 115 ms later as late_diagnostics.
     settle_before_edit(to_buf)
     settle_before_edit(from_buf)
+    for b in pairs(own) do
+        if b ~= from_buf then settle_before_edit(b) end
+    end
 
     -- Whole-file entries for both, so undo_edit puts the split back. Both of
     -- them plus the destination's create belong to one undo step: undoing
@@ -3853,9 +4192,33 @@ local function move_symbols(args)
     if info.imports_note then
         result.imports_note = info.imports_note
     end
+    -- The tool description promised that the imports of both files are
+    -- reorganized, and that is a description of gopls rather than of the tool:
+    -- source.organizeImports sorts and prunes, and only goimports also adds
+    -- what is missing. pyright, tsserver and lua_ls implement the sorting
+    -- meaning alone, so the moved code can arrive in the destination with no
+    -- import for anything it uses, and a reply that reads clean over a tree
+    -- that no longer runs is worse than one that says what was not done.
+    result.imports = "the imports of both files were sorted and pruned. Adding an import the "
+        .. "moved code needs is something only some servers do on that pass (gopls does, "
+        .. "pyright, tsserver and lua_ls do not), so check the verdict below for unresolved "
+        .. "names in either file before treating this move as finished"
+    if #also_checked > 0 then
+        result.also_checked = also_checked
+        result.also_checked_note = "these files reference the moved symbols. They were loaded "
+            .. "so the server would check them, and anything this move broke in them is "
+            .. "reported below; their own imports were not rewritten"
+    elseif referrers then
+        result.also_checked_note = "the server reports no other file referencing the moved "
+            .. "symbols, so only the two files above needed changing"
+    else
+        result.also_checked_note = "the language server here answers no reference requests, so "
+            .. "nothing could be checked about other files that use the moved symbols; grep "
+            .. "for their names before treating this move as finished"
+    end
     return vim.tbl_extend("force", result,
         post_edit_report(to_buf, before, args.root, args.headless, opts, args.full_diagnostics,
-            { own = { [from_buf] = true } }))
+            { own = own }))
 end
 M.post_edit_options = post_edit_options
 M.organize_imports = organize_imports
